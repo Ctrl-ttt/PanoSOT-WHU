@@ -43,8 +43,13 @@ class TrackerConfig:
     refine_search_size: int = 160
     device: str = "cpu"
     use_amp: bool = False
-    # 搜索区域相对于目标的放大倍数（deep模式下用更大的search patch一次覆盖）
     deep_search_enlarge: float = 2.5
+
+    # --- 三模板记忆参数（Phase 2）---
+    num_templates: int = 3
+    template_max_age: int = 50  # 超过此帧数未匹配的模板被替换
+    template_update_ema: float = 0.08  # 匹配到的模板EMA更新率
+    template_update_background: float = 0.02  # 未匹配模板的微弱更新率
 
 
 def to_gray(image: np.ndarray) -> np.ndarray:
@@ -95,15 +100,26 @@ class PanoSOTTracker:
         self.initialized = False
         self.state: SphereState | None = None
         self.velocity = np.zeros(2, dtype=np.float32)
-        self.template: np.ndarray | None = None
-        self.template_descriptor: np.ndarray | None = None
         self.lost_frames = 0
         self.frame_shape: tuple[int, int] | None = None
 
-        # --- 深度特征相关 ---
+        # --- 多模板存储（列表，长度 ≤ num_templates）---
+        self._templates: list[np.ndarray] = []           # 图像模板
+        self._descriptors: list[np.ndarray] = []          # 手工特征描述子
+        self._template_feats: list[Any] = []               # 深度特征
+        self._template_ages: list[int] = []                # 各模板的存活帧数
+        self._template_scores: list[float] = []            # 最近一次匹配分数
+        self._frame_count: int = 0                         # 总帧数计数器
+        self.num_templates = self.config.num_templates
+
+        # --- 向后兼容别名（指向列表第一个元素）---
+        self.template: np.ndarray | None = None
+        self.template_descriptor: np.ndarray | None = None
+        self.template_feat: Any = None
+
+        # --- 深度特征提取器 ---
         self.deep_extractor = deep_extractor
         self.similarity_head = similarity_head
-        self.template_feat: Any = None  # torch.Tensor, 模板的深度特征
         self._deep_mode = False
         if self.config.use_deep_features and deep_extractor is not None and similarity_head is not None:
             self._deep_mode = True
@@ -112,19 +128,71 @@ class PanoSOTTracker:
         h, w = frame.shape[:2]
         self.frame_shape = (h, w)
         self.state = erp_bbox_to_state(init_bbox_xywh, w, h)
-        self.template = self._extract_template(frame, self.state)
-        self.template_descriptor = patch_descriptor(self.template)
-        if self._deep_mode:
-            self.template_feat = self._extract_template_feat(frame, self.state)
-        self.initialized = True
-        self.velocity[:] = 0.0
+        self._frame_count = 0
         self.lost_frames = 0
+        self.velocity[:] = 0.0
+
+        # 清空多模板存储
+        self._templates.clear()
+        self._descriptors.clear()
+        self._template_feats.clear()
+        self._template_ages.clear()
+        self._template_scores.clear()
+
+        # 生成 num_templates 个初始模板（轻微位置扰动）
+        offsets = self._template_offsets()
+        for off_lon, off_lat in offsets:
+            perturbed = SphereState(
+                lon=float(wrap_lon(self.state.lon + off_lon)),
+                lat=float(clamp_lat(self.state.lat + off_lat)),
+                equatorial_width=self.state.equatorial_width,
+                angular_height=self.state.angular_height,
+            )
+            self._add_template(frame, perturbed)
+
+        # 向后兼容别名
+        self._sync_aliases()
+        self.initialized = True
         return state_to_erp_bbox(self.state, w, h)
+
+    def _template_offsets(self) -> list[tuple[float, float]]:
+        """生成 num_templates 个模板的初始位置偏移（弧度）。"""
+        if self.num_templates <= 1:
+            return [(0.0, 0.0)]
+        offsets = [(0.0, 0.0)]
+        # 后续模板用目标尺寸的小比例偏移
+        step_lon = self.state.equatorial_width * 0.08
+        step_lat = self.state.angular_height * 0.08
+        for i in range(1, self.num_templates):
+            angle = 2.0 * math.pi * i / (self.num_templates - 1)
+            offsets.append((step_lon * math.cos(angle), step_lat * math.sin(angle)))
+        return offsets[: self.num_templates]
+
+    def _add_template(self, frame: np.ndarray, state: SphereState) -> None:
+        """提取并添加一个新模板（手工 + 深度特征）。"""
+        img_patch = self._extract_template(frame, state)
+        descriptor = patch_descriptor(img_patch)
+        self._templates.append(img_patch)
+        self._descriptors.append(descriptor)
+        self._template_ages.append(0)
+        self._template_scores.append(0.0)
+        if self._deep_mode:
+            feat = self._extract_template_feat(frame, state)
+            self._template_feats.append(feat)
+
+    def _sync_aliases(self) -> None:
+        """将列表内容同步到向后兼容的别名。"""
+        if self._templates:
+            self.template = self._templates[0]
+            self.template_descriptor = self._descriptors[0]
+        if self._template_feats:
+            self.template_feat = self._template_feats[0]
 
     def track(self, frame: np.ndarray) -> np.ndarray:
         if not self.initialized or self.state is None or self.frame_shape is None:
             raise RuntimeError("Tracker must be initialized before calling track().")
 
+        self._frame_count += 1
         h, w = self.frame_shape
         predicted = SphereState(
             lon=float(wrap_lon(self.state.lon + self.velocity[0])),
@@ -151,24 +219,85 @@ class PanoSOTTracker:
         )
         self.state = best_state
 
+        # --- 多模板更新 ---
         if best_score >= self.config.high_confidence:
-            new_template = self._extract_template(frame, self.state)
-            self.template = (
-                (1.0 - self.config.update_rate) * self.template
-                + self.config.update_rate * new_template
-            )
-            self.template_descriptor = patch_descriptor(self.template)
-            if self._deep_mode and self.template_feat is not None:
-                new_feat = self._extract_template_feat(frame, self.state)
-                self.template_feat = (
-                    (1.0 - self.config.update_rate) * self.template_feat
-                    + self.config.update_rate * new_feat
-                )
+            self._update_templates(frame, best_state, best_score)
             self.lost_frames = 0
         else:
+            # 低置信帧也增加所有模板年龄（后面可能被替换）
+            for i in range(len(self._template_ages)):
+                self._template_ages[i] += 1
             self.lost_frames += 1
 
+        self._sync_aliases()
         return state_to_erp_bbox(self.state, w, h)
+
+    def _find_best_template(self, frame: np.ndarray, state: SphereState) -> int:
+        """对给定状态评估所有模板，返回最佳匹配的索引。"""
+        best_idx = 0
+        best_score = -1.0
+        if self._deep_mode:
+            fov_x, fov_y = state_size_to_fov(state, enlarge=self.config.deep_search_enlarge)
+            for i, t_feat in enumerate(self._template_feats):
+                search_feat = self._extract_search_feat(
+                    frame, state.lon, state.lat, fov_x, fov_y, refine=True,
+                )
+                score, _ = self._deep_score_and_offset(t_feat, search_feat)
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+        else:
+            patch = self._extract_template(frame, state)
+            for i, desc in enumerate(self._descriptors):
+                score = float(np.mean(np.sum(desc * patch_descriptor(patch), axis=1)))
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+        return best_idx
+
+    def _update_templates(self, frame: np.ndarray, state: SphereState, score: float) -> None:
+        """多模板更新策略：EMA 更新最佳匹配模板，替换过期模板。"""
+        best_idx = self._find_best_template(frame, state)
+
+        # 定位最老模板（用于替换）
+        oldest_idx = int(np.argmax(self._template_ages))
+
+        # 如果最老模板太旧，替换为新模板
+        if self._template_ages[oldest_idx] > self.config.template_max_age:
+            self._templates.pop(oldest_idx)
+            self._descriptors.pop(oldest_idx)
+            self._template_ages.pop(oldest_idx)
+            self._template_scores.pop(oldest_idx)
+            if self._deep_mode:
+                self._template_feats.pop(oldest_idx)
+            # 重新添加新模板
+            self._add_template(frame, state)
+            # 重新定位最佳索引（列表已变）
+            best_idx = self._find_best_template(frame, state)
+
+        # EMA 更新：最佳匹配模板更新率最高，其他模板微弱更新
+        for i in range(len(self._templates)):
+            update_rate = (
+                self.config.template_update_ema if i == best_idx
+                else self.config.template_update_background
+            )
+            new_patch = self._extract_template(frame, state)
+            self._templates[i] = (1.0 - update_rate) * self._templates[i] + update_rate * new_patch
+            self._descriptors[i] = patch_descriptor(self._templates[i])
+            self._template_ages[i] = 0 if i == best_idx else self._template_ages[i] + 1
+            self._template_scores[i] = score if i == best_idx else self._template_scores[i]
+
+        if self._deep_mode:
+            for i in range(len(self._template_feats)):
+                update_rate = (
+                    self.config.template_update_ema if i == best_idx
+                    else self.config.template_update_background
+                )
+                new_feat = self._extract_template_feat(frame, state)
+                self._template_feats[i] = (
+                    (1.0 - update_rate) * self._template_feats[i]
+                    + update_rate * new_feat
+                )
 
     def track_sequence(
         self,
@@ -226,18 +355,26 @@ class PanoSOTTracker:
         offset_x = (peak_x - (w - 1) / 2.0) / ((w - 1) / 2.0) if w > 1 else 0.0
         return score, (offset_y, offset_x)
 
-    # ---------- 打分与搜索 ----------
+    # ---------- 打分 ----------
 
     def _score_patch(self, patch: np.ndarray) -> float:
-        descriptor = patch_descriptor(patch)
-        score = float(np.mean(np.sum(self.template_descriptor * descriptor, axis=1)))
-        return score
+        """使用所有模板描述子匹配，返回最高分数。"""
+        best = -1.0
+        for desc in self._descriptors:
+            score = float(np.mean(np.sum(desc * patch_descriptor(patch), axis=1)))
+            if score > best:
+                best = score
+        return best
 
     def _score_patch_deep(self, frame: np.ndarray, lon: float, lat: float, fov_x: float, fov_y: float) -> float:
-        """深度特征打分：提取搜索patch特征，与模板做 cross-correlation，返回峰值分数。"""
+        """深度特征打分：对所有模板做 cross-correlation，返回最高分数。"""
         search_feat = self._extract_search_feat(frame, lon, lat, fov_x, fov_y)
-        score, _ = self._deep_score_and_offset(self.template_feat, search_feat)
-        return score
+        best_score = -1.0
+        for t_feat in self._template_feats:
+            score, _ = self._deep_score_and_offset(t_feat, search_feat)
+            if score > best_score:
+                best_score = score
+        return best_score
 
     def _local_search(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
         if self._deep_mode:
@@ -285,10 +422,10 @@ class PanoSOTTracker:
         return best_state, best_score
 
     def _local_search_deep(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
-        """深度特征 coarse-to-fine 搜索。
+        """深度特征 coarse-to-fine 搜索（多模板版本）。
 
-        Coarse: 在预测位置提取大范围搜索patch，cross-correlation 一次得到候选位置。
-        Refine: 在候选位置附近，小范围高分辨率精修。
+        Coarse: 在预测位置提取大范围搜索patch，对所有模板做 cross-correlation，取最高分。
+        Refine: 在最佳候选位置附近小范围高分辨率精修。
         """
         best_state = predicted
         best_score = -1.0
@@ -301,39 +438,51 @@ class PanoSOTTracker:
                 enlarge=self.config.deep_search_enlarge,
             )
 
-            # --- Coarse stage ---
-            search_feat = self._extract_search_feat(
-                frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
-            )
-            score, (off_y, off_x) = self._deep_score_and_offset(self.template_feat, search_feat)
+            # 每个 scale 对所有模板尝试匹配
+            scale_best_score = -1.0
+            scale_best_state = predicted
+            scale_best_template_idx = 0
 
-            # 将 offset 映射回球面坐标
-            coarse_lon = wrap_lon(predicted.lon + off_x * (0.5 * fov_x))
-            coarse_lat = clamp_lat(predicted.lat + off_y * (0.5 * fov_y))
-
-            # --- Refine stage: 在 coarse 位置周围做高分辨率精修 ---
-            refine_fov_x = fov_x * 0.5
-            refine_fov_y = fov_y * 0.5
-            refine_feat = self._extract_search_feat(
-                frame, coarse_lon, coarse_lat, refine_fov_x, refine_fov_y, refine=True,
-            )
-            refine_score, (roff_y, roff_x) = self._deep_score_and_offset(self.template_feat, refine_feat)
-
-            refined_lon = wrap_lon(coarse_lon + roff_x * (0.5 * refine_fov_x))
-            refined_lat = clamp_lat(coarse_lat + roff_y * (0.5 * refine_fov_y))
-
-            # 综合 coarse + refine 分数
-            combined_score = 0.3 * score + 0.7 * refine_score
-            # 轻微惩罚尺度变化
-            combined_score -= 0.02 * abs(scale - 1.0)
-
-            if combined_score > best_score:
-                best_score = combined_score
-                best_state = SphereState(
-                    lon=float(refined_lon), lat=float(refined_lat),
-                    equatorial_width=float(candidate_width),
-                    angular_height=float(candidate_height),
+            for t_idx, t_feat in enumerate(self._template_feats):
+                # --- Coarse stage ---
+                search_feat = self._extract_search_feat(
+                    frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
                 )
+                score, (off_y, off_x) = self._deep_score_and_offset(t_feat, search_feat)
+
+                # 将 offset 映射回球面坐标
+                coarse_lon = wrap_lon(predicted.lon + off_x * (0.5 * fov_x))
+                coarse_lat = clamp_lat(predicted.lat + off_y * (0.5 * fov_y))
+
+                # --- Refine stage ---
+                refine_fov_x = fov_x * 0.5
+                refine_fov_y = fov_y * 0.5
+                refine_feat = self._extract_search_feat(
+                    frame, coarse_lon, coarse_lat, refine_fov_x, refine_fov_y, refine=True,
+                )
+                refine_score, (roff_y, roff_x) = self._deep_score_and_offset(t_feat, refine_feat)
+
+                refined_lon = wrap_lon(coarse_lon + roff_x * (0.5 * refine_fov_x))
+                refined_lat = clamp_lat(coarse_lat + roff_y * (0.5 * refine_fov_y))
+
+                combined_score = 0.3 * score + 0.7 * refine_score
+                combined_score -= 0.02 * abs(scale - 1.0)
+
+                if combined_score > scale_best_score:
+                    scale_best_score = combined_score
+                    scale_best_state = SphereState(
+                        lon=float(refined_lon), lat=float(refined_lat),
+                        equatorial_width=float(candidate_width),
+                        angular_height=float(candidate_height),
+                    )
+                    scale_best_template_idx = t_idx
+
+            if scale_best_score > best_score:
+                best_score = scale_best_score
+                best_state = scale_best_state
+                # 更新最佳匹配模板的分数
+                self._template_scores[scale_best_template_idx] = scale_best_score
+
         return best_state, best_score
 
     def _global_relocalize(
