@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
+import os
+import warnings
 from typing import Any
 
 import numpy as np
@@ -31,6 +34,7 @@ class FeatureConfig:
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)
     pretrained: bool = True
+    cache_dir: str | None = None
 
 
 class DeepFeatureExtractor:
@@ -40,13 +44,34 @@ class DeepFeatureExtractor:
         self.config = config
         self._torch = _require_torch()
         self.device = self._resolve_device(config.device)
-        self.model = build_backbone(config.backbone_name, pretrained=config.pretrained)
+        self._configure_cache_dir(config.cache_dir)
+        self.model = self._build_model_with_fallback()
         self.model.to(self.device)
         self.model.eval()
 
         torch = self._torch
         self._mean = torch.tensor(config.mean, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
         self._std = torch.tensor(config.std, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+
+    def _configure_cache_dir(self, cache_dir: str | None) -> None:
+        if not cache_dir:
+            return
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("TORCH_HOME", str(cache_path))
+        self._torch.hub.set_dir(str(cache_path))
+
+    def _build_model_with_fallback(self) -> Any:
+        try:
+            return build_backbone(self.config.backbone_name, pretrained=self.config.pretrained)
+        except Exception as exc:
+            if not self.config.pretrained:
+                raise
+            warnings.warn(
+                f"Falling back to pretrained=False for {self.config.backbone_name}: {exc}",
+                RuntimeWarning,
+            )
+            return build_backbone(self.config.backbone_name, pretrained=False)
 
     def _resolve_device(self, requested_device: str) -> Any:
         torch = self._torch

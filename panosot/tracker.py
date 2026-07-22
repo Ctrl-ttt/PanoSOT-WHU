@@ -5,6 +5,7 @@ import math
 from typing import Any, Iterable, List
 
 import numpy as np
+from PIL import Image
 
 from .geometry import (
     SphereState,
@@ -23,6 +24,7 @@ class TrackerConfig:
     # --- 手工特征参数（baseline，始终可用）---
     template_size: int = 48
     search_enlarge: float = 3.0
+    handcrafted_match_enlarge: float = 1.25
     local_grid_radius: int = 2
     local_step_factor: float = 0.35
     scale_factors: tuple[float, ...] = (0.93, 1.0, 1.08)
@@ -41,6 +43,8 @@ class TrackerConfig:
     deep_template_size: int = 112
     coarse_search_size: int = 224
     refine_search_size: int = 160
+    deep_motion_momentum: float = 0.5
+    deep_template_rotations_deg: tuple[float, ...] = (0.0, -45.0, 45.0, 90.0)
     device: str = "cpu"
     use_amp: bool = False
     deep_search_enlarge: float = 2.5
@@ -110,6 +114,7 @@ class PanoSOTTracker:
         self._template_ages: list[int] = []                # 各模板的存活帧数
         self._template_scores: list[float] = []            # 最近一次匹配分数
         self._frame_count: int = 0                         # 总帧数计数器
+        self._template_feat_banks: list[list[Any]] = []
         self.num_templates = self.config.num_templates
 
         # --- 向后兼容别名（指向列表第一个元素）---
@@ -138,6 +143,7 @@ class PanoSOTTracker:
         self._template_feats.clear()
         self._template_ages.clear()
         self._template_scores.clear()
+        self._template_feat_banks.clear()
 
         # 生成 num_templates 个初始模板（轻微位置扰动）
         offsets = self._template_offsets()
@@ -177,8 +183,9 @@ class PanoSOTTracker:
         self._template_ages.append(0)
         self._template_scores.append(0.0)
         if self._deep_mode:
-            feat = self._extract_template_feat(frame, state)
-            self._template_feats.append(feat)
+            feat_bank = self._extract_template_feat_bank(frame, state)
+            self._template_feats.append(feat_bank[0])
+            self._template_feat_banks.append(feat_bank)
 
     def _sync_aliases(self) -> None:
         """将列表内容同步到向后兼容的别名。"""
@@ -209,14 +216,9 @@ class PanoSOTTracker:
 
         lon_delta = lon_distance(best_state.lon, self.state.lon)
         lat_delta = best_state.lat - self.state.lat
-        self.velocity[0] = (
-            self.config.motion_momentum * self.velocity[0]
-            + (1.0 - self.config.motion_momentum) * lon_delta
-        )
-        self.velocity[1] = (
-            self.config.motion_momentum * self.velocity[1]
-            + (1.0 - self.config.motion_momentum) * lat_delta
-        )
+        momentum = self.config.deep_motion_momentum if self._deep_mode else self.config.motion_momentum
+        self.velocity[0] = momentum * self.velocity[0] + (1.0 - momentum) * lon_delta
+        self.velocity[1] = momentum * self.velocity[1] + (1.0 - momentum) * lat_delta
         self.state = best_state
 
         # --- 多模板更新 ---
@@ -239,10 +241,11 @@ class PanoSOTTracker:
         if self._deep_mode:
             fov_x, fov_y = state_size_to_fov(state, enlarge=self.config.deep_search_enlarge)
             for i, t_feat in enumerate(self._template_feats):
+                template_bank = self._template_feat_banks[i] if i < len(self._template_feat_banks) else [t_feat]
                 search_feat = self._extract_search_feat(
                     frame, state.lon, state.lat, fov_x, fov_y, refine=True,
                 )
-                score, _ = self._deep_score_and_offset(t_feat, search_feat)
+                score, _ = self._score_template_bank(template_bank, search_feat)
                 if score > best_score:
                     best_score = score
                     best_idx = i
@@ -270,6 +273,7 @@ class PanoSOTTracker:
             self._template_scores.pop(oldest_idx)
             if self._deep_mode:
                 self._template_feats.pop(oldest_idx)
+                self._template_feat_banks.pop(oldest_idx)
             # 重新添加新模板
             self._add_template(frame, state)
             # 重新定位最佳索引（列表已变）
@@ -293,11 +297,17 @@ class PanoSOTTracker:
                     self.config.template_update_ema if i == best_idx
                     else self.config.template_update_background
                 )
-                new_feat = self._extract_template_feat(frame, state)
-                self._template_feats[i] = (
-                    (1.0 - update_rate) * self._template_feats[i]
-                    + update_rate * new_feat
+                new_feat_bank = self._extract_template_feat_bank(frame, state)
+                old_feat_bank = (
+                    self._template_feat_banks[i]
+                    if i < len(self._template_feat_banks)
+                    else [self._template_feats[i]]
                 )
+                updated_bank = []
+                for old_feat, new_feat in zip(old_feat_bank, new_feat_bank):
+                    updated_bank.append((1.0 - update_rate) * old_feat + update_rate * new_feat)
+                self._template_feat_banks[i] = updated_bank
+                self._template_feats[i] = updated_bank[0]
 
     def track_sequence(
         self,
@@ -316,8 +326,12 @@ class PanoSOTTracker:
 
     def _extract_template(self, frame: np.ndarray, state: SphereState) -> np.ndarray:
         size = self.config.template_size
-        fov_x, fov_y = state_size_to_fov(state, enlarge=1.25)
+        fov_x, fov_y = self._handcrafted_match_fov(state)
         return tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
+
+    def _handcrafted_match_fov(self, state: SphereState) -> tuple[float, float]:
+        """Return the target-scale FoV used by the handcrafted branch."""
+        return state_size_to_fov(state, enlarge=self.config.handcrafted_match_enlarge)
 
     # ---------- 深度特征方法 ----------
 
@@ -327,6 +341,23 @@ class PanoSOTTracker:
         fov_x, fov_y = state_size_to_fov(state, enlarge=1.25)
         patch = tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
         return self.deep_extractor.extract_template_feature(patch)
+
+    def _rotate_patch(self, patch: np.ndarray, angle_deg: float) -> np.ndarray:
+        if abs(angle_deg) < 1e-6:
+            return patch
+        image = Image.fromarray(np.clip(patch * 255.0, 0.0, 255.0).astype(np.uint8))
+        rotated = image.rotate(float(angle_deg), resample=Image.BILINEAR)
+        return np.asarray(rotated, dtype=np.float32) / 255.0
+
+    def _extract_template_feat_bank(self, frame: np.ndarray, state: SphereState) -> list[Any]:
+        size = self.config.deep_template_size
+        fov_x, fov_y = state_size_to_fov(state, enlarge=1.25)
+        patch = tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
+        feat_bank: list[Any] = []
+        for angle_deg in self.config.deep_template_rotations_deg:
+            rotated_patch = self._rotate_patch(patch, angle_deg)
+            feat_bank.append(self.deep_extractor.extract_template_feature(rotated_patch))
+        return feat_bank
 
     def _extract_search_feat(
         self, frame: np.ndarray, lon: float, lat: float, fov_x: float, fov_y: float, refine: bool = False
@@ -353,9 +384,27 @@ class PanoSOTTracker:
         score = float(response_np[peak_y, peak_x])
 
         # 归一化偏移：中心为 (0,0)，范围 [-1, 1]
-        offset_y = (peak_y - (h - 1) / 2.0) / ((h - 1) / 2.0) if h > 1 else 0.0
-        offset_x = (peak_x - (w - 1) / 2.0) / ((w - 1) / 2.0) if w > 1 else 0.0
+        template_h, template_w = int(template_feat.shape[-2]), int(template_feat.shape[-1])
+        search_h, search_w = int(search_feat.shape[-2]), int(search_feat.shape[-1])
+        max_offset_y = max(search_h - template_h, 0) / (2.0 * max(search_h, 1))
+        max_offset_x = max(search_w - template_w, 0) / (2.0 * max(search_w, 1))
+        offset_y = ((peak_y / (h - 1)) - 0.5) * 2.0 * max_offset_y if h > 1 else 0.0
+        offset_x = ((peak_x / (w - 1)) - 0.5) * 2.0 * max_offset_x if w > 1 else 0.0
         return score, (offset_y, offset_x)
+
+    def _score_template_bank(
+        self,
+        template_bank: list[Any],
+        search_feat: Any,
+    ) -> tuple[float, tuple[float, float]]:
+        best_score = -1.0
+        best_offset = (0.0, 0.0)
+        for template_feat in template_bank:
+            score, offset = self._deep_score_and_offset(template_feat, search_feat)
+            if score > best_score:
+                best_score = score
+                best_offset = offset
+        return best_score, best_offset
 
     # ---------- 打分 ----------
 
@@ -372,8 +421,13 @@ class PanoSOTTracker:
         """深度特征打分：对所有模板做 cross-correlation，返回最高分数。"""
         search_feat = self._extract_search_feat(frame, lon, lat, fov_x, fov_y)
         best_score = -1.0
-        for t_feat in self._template_feats:
-            score, _ = self._deep_score_and_offset(t_feat, search_feat)
+        for i, t_feat in enumerate(self._template_feats):
+            template_bank = (
+                self._template_feat_banks[i]
+                if i < len(self._template_feat_banks)
+                else [t_feat]
+            )
+            score, _ = self._score_template_bank(template_bank, search_feat)
             if score > best_score:
                 best_score = score
         return best_score
@@ -402,7 +456,7 @@ class PanoSOTTracker:
                 equatorial_width=candidate_width,
                 angular_height=candidate_height,
             )
-            fov_x, fov_y = state_size_to_fov(candidate, enlarge=self.config.search_enlarge)
+            fov_x, fov_y = self._handcrafted_match_fov(candidate)
 
             for dx in range(-self.config.local_grid_radius, self.config.local_grid_radius + 1):
                 for dy in range(-self.config.local_grid_radius, self.config.local_grid_radius + 1):
@@ -446,15 +500,20 @@ class PanoSOTTracker:
             scale_best_template_idx = 0
 
             for t_idx, t_feat in enumerate(self._template_feats):
+                template_bank = (
+                    self._template_feat_banks[t_idx]
+                    if t_idx < len(self._template_feat_banks)
+                    else [t_feat]
+                )
                 # --- Coarse stage ---
                 search_feat = self._extract_search_feat(
                     frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
                 )
-                score, (off_y, off_x) = self._deep_score_and_offset(t_feat, search_feat)
+                score, (off_y, off_x) = self._score_template_bank(template_bank, search_feat)
 
                 # 将 offset 映射回球面坐标
-                coarse_lon = wrap_lon(predicted.lon + off_x * (0.5 * fov_x))
-                coarse_lat = clamp_lat(predicted.lat + off_y * (0.5 * fov_y))
+                coarse_lon = wrap_lon(predicted.lon + off_x * fov_x)
+                coarse_lat = clamp_lat(predicted.lat + off_y * fov_y)
 
                 # --- Refine stage ---
                 refine_fov_x = fov_x * 0.5
@@ -462,10 +521,10 @@ class PanoSOTTracker:
                 refine_feat = self._extract_search_feat(
                     frame, coarse_lon, coarse_lat, refine_fov_x, refine_fov_y, refine=True,
                 )
-                refine_score, (roff_y, roff_x) = self._deep_score_and_offset(t_feat, refine_feat)
+                refine_score, (roff_y, roff_x) = self._score_template_bank(template_bank, refine_feat)
 
-                refined_lon = wrap_lon(coarse_lon + roff_x * (0.5 * refine_fov_x))
-                refined_lat = clamp_lat(coarse_lat + roff_y * (0.5 * refine_fov_y))
+                refined_lon = wrap_lon(coarse_lon + roff_x * refine_fov_x)
+                refined_lat = clamp_lat(coarse_lat + roff_y * refine_fov_y)
 
                 combined_score = 0.3 * score + 0.7 * refine_score
                 combined_score -= 0.02 * abs(scale - 1.0)
@@ -500,7 +559,10 @@ class PanoSOTTracker:
         )
         candidates: list[tuple[float, SphereState]] = []
 
-        fov_x, fov_y = state_size_to_fov(predicted, enlarge=self.config.search_enlarge)
+        if self._deep_mode:
+            fov_x, fov_y = state_size_to_fov(predicted, enlarge=self.config.deep_search_enlarge)
+        else:
+            fov_x, fov_y = self._handcrafted_match_fov(predicted)
         for lon in lon_values:
             for lat in lat_values:
                 lat = clamp_lat(float(lat))

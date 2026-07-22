@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         default="cpu",
         help="Device for deep feature extraction (cpu or cuda).",
     )
+    parser.add_argument(
+        "--cache-dir",
+        default=str(PROJECT_ROOT / ".cache" / "torch"),
+        help="Writable cache directory for torch/torchvision weights.",
+    )
     return parser.parse_args()
 
 
@@ -60,6 +65,7 @@ def main() -> None:
             backbone_name=args.backbone,
             device=args.device,
             use_amp=(args.device.startswith("cuda")),
+            cache_dir=args.cache_dir,
         )
         deep_extractor = DeepFeatureExtractor(feat_config)
         similarity_head = build_similarity_head("depthwise_xcorr")
