@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Iterable, List
+from typing import Any, Iterable, List
 
 import numpy as np
 
@@ -20,6 +20,7 @@ from .geometry import (
 
 @dataclass
 class TrackerConfig:
+    # --- 手工特征参数（baseline，始终可用）---
     template_size: int = 48
     search_enlarge: float = 3.0
     local_grid_radius: int = 2
@@ -33,6 +34,17 @@ class TrackerConfig:
     relocalize_lat_stride_deg: float = 18.0
     relocalize_topk: int = 3
     motion_momentum: float = 0.7
+
+    # --- 深度特征参数（Phase 1 新增）---
+    use_deep_features: bool = False
+    backbone_name: str = "mobilenet_v3_small"
+    deep_template_size: int = 112
+    coarse_search_size: int = 224
+    refine_search_size: int = 160
+    device: str = "cpu"
+    use_amp: bool = False
+    # 搜索区域相对于目标的放大倍数（deep模式下用更大的search patch一次覆盖）
+    deep_search_enlarge: float = 2.5
 
 
 def to_gray(image: np.ndarray) -> np.ndarray:
@@ -66,9 +78,19 @@ def patch_descriptor(patch: np.ndarray) -> np.ndarray:
 
 
 class PanoSOTTracker:
-    """A light-weight 360 tracking baseline with spherical search and re-detection."""
+    """A light-weight 360 tracking baseline with spherical search and re-detection.
 
-    def __init__(self, config: TrackerConfig | None = None) -> None:
+    支持两种模式：
+    - 手工特征模式（默认）：使用灰度+梯度手工描述子
+    - 深度特征模式（use_deep_features=True）：使用轻量 backbone + cross-correlation
+    """
+
+    def __init__(
+        self,
+        config: TrackerConfig | None = None,
+        deep_extractor: Any = None,
+        similarity_head: Any = None,
+    ) -> None:
         self.config = config or TrackerConfig()
         self.initialized = False
         self.state: SphereState | None = None
@@ -78,12 +100,22 @@ class PanoSOTTracker:
         self.lost_frames = 0
         self.frame_shape: tuple[int, int] | None = None
 
+        # --- 深度特征相关 ---
+        self.deep_extractor = deep_extractor
+        self.similarity_head = similarity_head
+        self.template_feat: Any = None  # torch.Tensor, 模板的深度特征
+        self._deep_mode = False
+        if self.config.use_deep_features and deep_extractor is not None and similarity_head is not None:
+            self._deep_mode = True
+
     def initialize(self, frame: np.ndarray, init_bbox_xywh: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
         self.frame_shape = (h, w)
         self.state = erp_bbox_to_state(init_bbox_xywh, w, h)
         self.template = self._extract_template(frame, self.state)
         self.template_descriptor = patch_descriptor(self.template)
+        if self._deep_mode:
+            self.template_feat = self._extract_template_feat(frame, self.state)
         self.initialized = True
         self.velocity[:] = 0.0
         self.lost_frames = 0
@@ -126,6 +158,12 @@ class PanoSOTTracker:
                 + self.config.update_rate * new_template
             )
             self.template_descriptor = patch_descriptor(self.template)
+            if self._deep_mode and self.template_feat is not None:
+                new_feat = self._extract_template_feat(frame, self.state)
+                self.template_feat = (
+                    (1.0 - self.config.update_rate) * self.template_feat
+                    + self.config.update_rate * new_feat
+                )
             self.lost_frames = 0
         else:
             self.lost_frames += 1
@@ -150,12 +188,64 @@ class PanoSOTTracker:
         fov_x, fov_y = state_size_to_fov(state, enlarge=1.25)
         return tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
 
+    # ---------- 深度特征方法 ----------
+
+    def _extract_template_feat(self, frame: np.ndarray, state: SphereState) -> Any:
+        """提取模板的深度特征（归一化球面 patch → backbone 前向）。"""
+        size = self.config.deep_template_size
+        fov_x, fov_y = state_size_to_fov(state, enlarge=1.25)
+        patch = tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
+        return self.deep_extractor.extract_template_feature(patch)
+
+    def _extract_search_feat(
+        self, frame: np.ndarray, lon: float, lat: float, fov_x: float, fov_y: float, refine: bool = False
+    ) -> Any:
+        """提取搜索区域的深度特征。"""
+        out_size = self.config.refine_search_size if refine else self.config.coarse_search_size
+        patch = tangent_patch(frame, lon, lat, fov_x, fov_y, out_size, out_size)
+        return self.deep_extractor.extract_search_feature(patch, refine=refine)
+
+    def _deep_score_and_offset(
+        self, template_feat: Any, search_feat: Any
+    ) -> tuple[float, tuple[float, float]]:
+        """对 template 和 search 特征做 cross-correlation，返回峰值分数和偏移。
+
+        Returns:
+            score: 响应图峰值（0~1 之间归一化）
+            (offset_y, offset_x): 峰值相对于响应图中心的偏移（归一化到 [-1, 1]）
+        """
+        response = self.similarity_head(template_feat, search_feat)
+        response_np = response.squeeze().detach().cpu().numpy()
+        max_idx = response_np.argmax()
+        h, w = response_np.shape
+        peak_y, peak_x = max_idx // w, max_idx % w
+        score = float(response_np[peak_y, peak_x])
+
+        # 归一化偏移：中心为 (0,0)，范围 [-1, 1]
+        offset_y = (peak_y - (h - 1) / 2.0) / ((h - 1) / 2.0) if h > 1 else 0.0
+        offset_x = (peak_x - (w - 1) / 2.0) / ((w - 1) / 2.0) if w > 1 else 0.0
+        return score, (offset_y, offset_x)
+
+    # ---------- 打分与搜索 ----------
+
     def _score_patch(self, patch: np.ndarray) -> float:
         descriptor = patch_descriptor(patch)
         score = float(np.mean(np.sum(self.template_descriptor * descriptor, axis=1)))
         return score
 
+    def _score_patch_deep(self, frame: np.ndarray, lon: float, lat: float, fov_x: float, fov_y: float) -> float:
+        """深度特征打分：提取搜索patch特征，与模板做 cross-correlation，返回峰值分数。"""
+        search_feat = self._extract_search_feat(frame, lon, lat, fov_x, fov_y)
+        score, _ = self._deep_score_and_offset(self.template_feat, search_feat)
+        return score
+
     def _local_search(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
+        if self._deep_mode:
+            return self._local_search_deep(frame, predicted)
+        return self._local_search_handcrafted(frame, predicted)
+
+    def _local_search_handcrafted(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
+        """原始手工特征局部搜索（保持不变）。"""
         step_lon = max(
             predicted.equatorial_width * self.config.local_step_factor / max(math.cos(predicted.lat), 1e-3),
             math.radians(2.0),
@@ -180,24 +270,70 @@ class PanoSOTTracker:
                     lon = wrap_lon(predicted.lon + dx * step_lon)
                     lat = clamp_lat(predicted.lat + dy * step_lat)
                     patch = tangent_patch(
-                        frame,
-                        lon,
-                        lat,
-                        fov_x,
-                        fov_y,
-                        self.config.template_size,
-                        self.config.template_size,
+                        frame, lon, lat, fov_x, fov_y,
+                        self.config.template_size, self.config.template_size,
                     )
                     score = self._score_patch(patch)
                     score -= 0.015 * (abs(dx) + abs(dy))
                     if score > best_score:
                         best_score = score
                         best_state = SphereState(
-                            lon=float(lon),
-                            lat=float(lat),
+                            lon=float(lon), lat=float(lat),
                             equatorial_width=float(candidate_width),
                             angular_height=float(candidate_height),
                         )
+        return best_state, best_score
+
+    def _local_search_deep(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
+        """深度特征 coarse-to-fine 搜索。
+
+        Coarse: 在预测位置提取大范围搜索patch，cross-correlation 一次得到候选位置。
+        Refine: 在候选位置附近，小范围高分辨率精修。
+        """
+        best_state = predicted
+        best_score = -1.0
+
+        for scale in self.config.scale_factors:
+            candidate_height = predicted.angular_height * scale
+            candidate_width = predicted.equatorial_width * scale
+            fov_x, fov_y = state_size_to_fov(
+                SphereState(predicted.lon, predicted.lat, candidate_width, candidate_height),
+                enlarge=self.config.deep_search_enlarge,
+            )
+
+            # --- Coarse stage ---
+            search_feat = self._extract_search_feat(
+                frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
+            )
+            score, (off_y, off_x) = self._deep_score_and_offset(self.template_feat, search_feat)
+
+            # 将 offset 映射回球面坐标
+            coarse_lon = wrap_lon(predicted.lon + off_x * (0.5 * fov_x))
+            coarse_lat = clamp_lat(predicted.lat + off_y * (0.5 * fov_y))
+
+            # --- Refine stage: 在 coarse 位置周围做高分辨率精修 ---
+            refine_fov_x = fov_x * 0.5
+            refine_fov_y = fov_y * 0.5
+            refine_feat = self._extract_search_feat(
+                frame, coarse_lon, coarse_lat, refine_fov_x, refine_fov_y, refine=True,
+            )
+            refine_score, (roff_y, roff_x) = self._deep_score_and_offset(self.template_feat, refine_feat)
+
+            refined_lon = wrap_lon(coarse_lon + roff_x * (0.5 * refine_fov_x))
+            refined_lat = clamp_lat(coarse_lat + roff_y * (0.5 * refine_fov_y))
+
+            # 综合 coarse + refine 分数
+            combined_score = 0.3 * score + 0.7 * refine_score
+            # 轻微惩罚尺度变化
+            combined_score -= 0.02 * abs(scale - 1.0)
+
+            if combined_score > best_score:
+                best_score = combined_score
+                best_state = SphereState(
+                    lon=float(refined_lon), lat=float(refined_lat),
+                    equatorial_width=float(candidate_width),
+                    angular_height=float(candidate_height),
+                )
         return best_state, best_score
 
     def _global_relocalize(
@@ -217,21 +353,18 @@ class PanoSOTTracker:
         for lon in lon_values:
             for lat in lat_values:
                 lat = clamp_lat(float(lat))
-                patch = tangent_patch(
-                    frame,
-                    float(lon),
-                    float(lat),
-                    fov_x,
-                    fov_y,
-                    self.config.template_size,
-                    self.config.template_size,
-                )
-                score = self._score_patch(patch)
+                if self._deep_mode:
+                    score = self._score_patch_deep(frame, float(lon), float(lat), fov_x, fov_y)
+                else:
+                    patch = tangent_patch(
+                        frame, float(lon), float(lat), fov_x, fov_y,
+                        self.config.template_size, self.config.template_size,
+                    )
+                    score = self._score_patch(patch)
                 score -= 0.01 * abs(lon_distance(float(lon), predicted.lon))
                 score -= 0.02 * abs(float(lat) - predicted.lat)
                 candidate = SphereState(
-                    lon=float(lon),
-                    lat=float(lat),
+                    lon=float(lon), lat=float(lat),
                     equatorial_width=predicted.equatorial_width,
                     angular_height=predicted.angular_height,
                 )
