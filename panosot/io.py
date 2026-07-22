@@ -10,17 +10,22 @@ from PIL import Image
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-def load_image(path: str | Path) -> np.ndarray:
+def load_image(path: str | Path, max_size: int | None = None) -> np.ndarray:
     image = Image.open(path).convert("RGB")
+    if max_size is not None:
+        w, h = image.size
+        if max(w, h) > max_size:
+            scale = max_size / max(w, h)
+            image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     return np.asarray(image, dtype=np.float32) / 255.0
 
 
-def load_sequence(sequence_dir: str | Path) -> List[np.ndarray]:
+def load_sequence(sequence_dir: str | Path, max_size: int | None = 960) -> List[np.ndarray]:
     sequence_dir = Path(sequence_dir)
     frame_paths = sorted(
         path for path in sequence_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES
     )
-    return [load_image(path) for path in frame_paths]
+    return [load_image(path, max_size=max_size) for path in frame_paths]
 
 
 def load_boxes(path: str | Path) -> np.ndarray:

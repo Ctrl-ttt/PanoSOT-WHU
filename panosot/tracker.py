@@ -304,11 +304,13 @@ class PanoSOTTracker:
         frames: Iterable[np.ndarray],
         init_bbox_xywh: np.ndarray,
     ) -> List[np.ndarray]:
-        frames = list(frames)
-        if not frames:
+        it = iter(frames)
+        try:
+            first = next(it)
+        except StopIteration:
             return []
-        outputs = [self.initialize(frames[0], init_bbox_xywh)]
-        for frame in frames[1:]:
+        outputs = [self.initialize(first, init_bbox_xywh)]
+        for frame in it:
             outputs.append(self.track(frame))
         return outputs
 

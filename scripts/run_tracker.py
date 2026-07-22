@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from panosot.io import load_boxes, load_sequence, save_boxes
+from panosot.io import IMAGE_SUFFIXES, load_boxes, load_image, save_boxes
 from panosot.tracker import PanoSOTTracker, TrackerConfig
 
 
@@ -41,7 +41,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    frames = load_sequence(args.sequence)
+    seq_dir = Path(args.sequence)
+    frame_paths = sorted(
+        p for p in seq_dir.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES
+    )
+    frames = (load_image(p) for p in frame_paths)  # 流式加载，不一次读入内存
     init_box = load_boxes(args.init_box)[0]
 
     config = TrackerConfig(use_deep_features=args.deep, backbone_name=args.backbone, device=args.device)
