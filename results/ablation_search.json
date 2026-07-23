@@ -1,0 +1,62 @@
+[
+  {
+    "label": "search×2.0",
+    "num_frames": 50,
+    "elapsed_sec": 27.510449900000822,
+    "fps": 1.8174911781431282,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.01904762163758278,
+    "mean_iou": 0.02,
+    "error": null
+  },
+  {
+    "label": "search×2.5",
+    "num_frames": 50,
+    "elapsed_sec": 27.513281000006828,
+    "fps": 1.8173041593980592,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.01904762163758278,
+    "mean_iou": 0.02,
+    "error": null
+  },
+  {
+    "label": "search×3.0 (baseline)",
+    "num_frames": 50,
+    "elapsed_sec": 28.018670400007977,
+    "fps": 1.7845243648672837,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.01904762163758278,
+    "mean_iou": 0.02,
+    "error": null
+  },
+  {
+    "label": "search×3.5",
+    "num_frames": 50,
+    "elapsed_sec": 27.964930900008767,
+    "fps": 1.7879536401781106,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.01904762163758278,
+    "mean_iou": 0.02,
+    "error": null
+  },
+  {
+    "label": "search×4.0",
+    "num_frames": 50,
+    "elapsed_sec": 27.73119370000495,
+    "fps": 1.803023719097641,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.01904762163758278,
+    "mean_iou": 0.02,
+    "error": null
+  },
+  {
+    "label": "search×5.0",
+    "num_frames": 50,
+    "elapsed_sec": 27.786836700004642,
+    "fps": 1.799413173216354,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.01904762163758278,
+    "mean_iou": 0.02,
+    "error": null
+  }
+]

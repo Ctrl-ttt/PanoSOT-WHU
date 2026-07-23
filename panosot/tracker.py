@@ -55,6 +55,10 @@ class TrackerConfig:
     template_update_ema: float = 0.08  # 匹配到的模板EMA更新率
     template_update_background: float = 0.02  # 未匹配模板的微弱更新率
 
+    # --- 遮挡/异常帧抑制参数（P1）---
+    confirmation_frames: int = 2        # 连续高分帧数达到此值才更新模板
+    update_quality_threshold: float = 0.65  # 高于此分才计入"确认"计数（比 high_confidence 更严格）
+
 
 def to_gray(image: np.ndarray) -> np.ndarray:
     return (
@@ -117,6 +121,9 @@ class PanoSOTTracker:
         self._template_feat_banks: list[list[Any]] = []
         self.num_templates = self.config.num_templates
 
+        # --- 遮挡抑制状态 ---
+        self._consecutive_good: int = 0  # 连续高质量帧计数器
+
         # --- 向后兼容别名（指向列表第一个元素）---
         self.template: np.ndarray | None = None
         self.template_descriptor: np.ndarray | None = None
@@ -135,6 +142,7 @@ class PanoSOTTracker:
         self.state = erp_bbox_to_state(init_bbox_xywh, w, h)
         self._frame_count = 0
         self.lost_frames = 0
+        self._consecutive_good = 0
         self.velocity[:] = 0.0
 
         # 清空多模板存储
@@ -221,15 +229,26 @@ class PanoSOTTracker:
         self.velocity[1] = momentum * self.velocity[1] + (1.0 - momentum) * lat_delta
         self.state = best_state
 
-        # --- 多模板更新 ---
+        # --- 多模板更新（含遮挡/异常帧抑制）---
+        # 高质量帧：增加"确认"计数；否则清零
+        if best_score >= self.config.update_quality_threshold:
+            self._consecutive_good += 1
+        else:
+            self._consecutive_good = 0
+
+        # 高置信帧：解除丢失状态
         if best_score >= self.config.high_confidence:
-            self._update_templates(frame, best_state, best_score)
             self.lost_frames = 0
         else:
-            # 低置信帧也增加所有模板年龄（后面可能被替换）
+            self.lost_frames += 1
+
+        # 只有连续确认达标才更新模板（防止在错误帧上学习）
+        if self._consecutive_good >= self.config.confirmation_frames:
+            self._update_templates(frame, best_state, best_score)
+        else:
+            # 低质量帧：模板仅年龄增长，不更新内容
             for i in range(len(self._template_ages)):
                 self._template_ages[i] += 1
-            self.lost_frames += 1
 
         self._sync_aliases()
         return state_to_erp_bbox(self.state, w, h)
