@@ -217,5 +217,11 @@ __marimo__/
 # Data files
 data/
 
+# Results
+results/
+
+# Output videos
+*.mp4
+
 # Streamlit
 .streamlit/secrets.toml
