@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+from typing import Any
+
+from .deep_features import DeepFeatureExtractor, FeatureConfig
+from .models import build_similarity_head
+from .tracker import PanoSOTTracker, TrackerConfig
+
+
+def build_tracker(
+    use_deep_features: bool = False,
+    backbone_name: str = "mobilenet_v3_small",
+    device: str = "auto",
+    **kwargs: Any,
+) -> PanoSOTTracker:
+    config = TrackerConfig(use_deep_features=use_deep_features, backbone_name=backbone_name, device=device)
+
+    for key, value in kwargs.items():
+        if hasattr(config, key):
+            setattr(config, key, value)
+
+    deep_extractor = None
+    similarity_head = None
+    if use_deep_features:
+        resolved_device = device
+        if device == "auto":
+            try:
+                import torch
+
+                resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                resolved_device = "cpu"
+
+        feat_config = FeatureConfig(
+            backbone_name=backbone_name,
+            device=resolved_device,
+            use_amp=(resolved_device.startswith("cuda")),
+        )
+        deep_extractor = DeepFeatureExtractor(feat_config)
+        similarity_head = build_similarity_head("depthwise_xcorr")
+        config.device = resolved_device
+
+    return PanoSOTTracker(config=config, deep_extractor=deep_extractor, similarity_head=similarity_head)

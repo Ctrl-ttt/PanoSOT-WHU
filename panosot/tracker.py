@@ -52,9 +52,23 @@ class TrackerConfig:
 
     # --- 三模板记忆参数（Phase 2）---
     num_templates: int = 3
-    template_max_age: int = 50  # 超过此帧数未匹配的模板被替换
-    template_update_ema: float = 0.08  # 匹配到的模板EMA更新率
-    template_update_background: float = 0.02  # 未匹配模板的微弱更新率
+    template_max_age: int = 50
+    template_update_ema: float = 0.08
+    template_update_background: float = 0.02
+
+    # --- 三模板加权融合参数 ---
+    template_weight_init: float = 0.40
+    template_weight_short: float = 0.35
+    template_weight_long: float = 0.25
+
+    # --- 遮挡/异常帧抑制参数 ---
+    occlusion_threshold: float = 0.35
+    occlusion_suppress_frames: int = 3
+    max_score_drop: float = 0.20
+
+    # --- 全局重定位优化参数 ---
+    relocalize_min_interval: int = 10
+    relocalize_confidence_threshold: float = 0.35
 
     # --- 遮挡/异常帧抑制参数（P1）---
     confirmation_frames: int = 2        # 连续高分帧数达到此值才更新模板
@@ -113,17 +127,20 @@ class PanoSOTTracker:
         self.frame_shape: tuple[int, int] | None = None
 
         # --- 多模板存储（列表，长度 ≤ num_templates）---
-        self._templates: list[np.ndarray] = []           # 图像模板
-        self._descriptors: list[np.ndarray] = []          # 手工特征描述子
-        self._template_feats: list[Any] = []               # 深度特征
-        self._template_ages: list[int] = []                # 各模板的存活帧数
-        self._template_scores: list[float] = []            # 最近一次匹配分数
-        self._frame_count: int = 0                         # 总帧数计数器
+        self._templates: list[np.ndarray] = []
+        self._descriptors: list[np.ndarray] = []
+        self._template_feats: list[Any] = []
+        self._template_ages: list[int] = []
+        self._template_scores: list[float] = []
+        self._frame_count: int = 0
         self._template_feat_banks: list[list[Any]] = []
         self.num_templates = self.config.num_templates
 
+# --- 三模板类型标记 ---
+        self._template_types: list[str] = []
+
         # --- 遮挡抑制状态 ---
-        self._consecutive_good: int = 0  # 连续高质量帧计数器
+        self._consecutive_good: int = 0
 
         # --- 向后兼容别名（指向列表第一个元素）---
         self.template: np.ndarray | None = None
@@ -137,6 +154,13 @@ class PanoSOTTracker:
         if self.config.use_deep_features and deep_extractor is not None and similarity_head is not None:
             self._deep_mode = True
 
+        # --- 遮挡/异常帧抑制状态 ---
+        self._occlusion_frames = 0
+        self._last_high_conf_score = 0.0
+
+        # --- 全局重定位冷却状态 ---
+        self._last_relocalize_frame = -self.config.relocalize_min_interval
+
     def initialize(self, frame: np.ndarray, init_bbox_xywh: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
         self.frame_shape = (h, w)
@@ -146,26 +170,32 @@ class PanoSOTTracker:
         self._consecutive_good = 0
         self.velocity[:] = 0.0
 
-        # 清空多模板存储
         self._templates.clear()
         self._descriptors.clear()
         self._template_feats.clear()
         self._template_ages.clear()
         self._template_scores.clear()
         self._template_feat_banks.clear()
+        self._template_types.clear()
 
-        # 生成 num_templates 个初始模板（轻微位置扰动）
-        offsets = self._template_offsets()
-        for off_lon, off_lat in offsets:
-            perturbed = SphereState(
-                lon=float(wrap_lon(self.state.lon + off_lon)),
-                lat=float(clamp_lat(self.state.lat + off_lat)),
-                equatorial_width=self.state.equatorial_width,
-                angular_height=self.state.angular_height,
-            )
-            self._add_template(frame, perturbed)
+        self._occlusion_frames = 0
+        self._last_high_conf_score = 0.0
+        self._last_relocalize_frame = -self.config.relocalize_min_interval
 
-        # 向后兼容别名
+        self._add_template(frame, self.state, template_type="init")
+
+        if self.num_templates > 1:
+            offsets = self._template_offsets()[1:]
+            for i, (off_lon, off_lat) in enumerate(offsets):
+                perturbed = SphereState(
+                    lon=float(wrap_lon(self.state.lon + off_lon)),
+                    lat=float(clamp_lat(self.state.lat + off_lat)),
+                    equatorial_width=self.state.equatorial_width,
+                    angular_height=self.state.angular_height,
+                )
+                t_type = "short" if i == 0 else "long"
+                self._add_template(frame, perturbed, template_type=t_type)
+
         self._sync_aliases()
         self.initialized = True
         return state_to_erp_bbox(self.state, w, h)
@@ -183,7 +213,7 @@ class PanoSOTTracker:
             offsets.append((step_lon * math.cos(angle), step_lat * math.sin(angle)))
         return offsets[: self.num_templates]
 
-    def _add_template(self, frame: np.ndarray, state: SphereState) -> None:
+    def _add_template(self, frame: np.ndarray, state: SphereState, template_type: str = "short") -> None:
         """提取并添加一个新模板（手工 + 深度特征）。"""
         img_patch = self._extract_template(frame, state)
         descriptor = patch_descriptor(img_patch)
@@ -191,6 +221,7 @@ class PanoSOTTracker:
         self._descriptors.append(descriptor)
         self._template_ages.append(0)
         self._template_scores.append(0.0)
+        self._template_types.append(template_type)
         if self._deep_mode:
             feat_bank = self._extract_template_feat_bank(frame, state)
             self._template_feats.append(feat_bank[0])
@@ -218,36 +249,55 @@ class PanoSOTTracker:
         )
 
         best_state, best_score = self._local_search(frame, predicted)
-        if best_score < self.config.low_confidence or self.lost_frames >= self.config.max_lost_frames:
+
+        score_drop = self._last_high_conf_score - best_score
+        is_abnormal = score_drop > self.config.max_score_drop and self._last_high_conf_score > 0.0
+
+        if best_score >= self.config.high_confidence:
+            self._occlusion_frames = 0
+            self._last_high_conf_score = best_score
+        elif best_score < self.config.occlusion_threshold or is_abnormal:
+            self._occlusion_frames += 1
+        else:
+            self._occlusion_frames = max(0, self._occlusion_frames - 1)
+
+        should_relocalize = False
+        if best_score < self.config.relocalize_confidence_threshold:
+            frames_since_relocalize = self._frame_count - self._last_relocalize_frame
+            if frames_since_relocalize >= self.config.relocalize_min_interval:
+                should_relocalize = True
+
+        if should_relocalize:
             relocalized, relocalized_score = self._global_relocalize(frame, predicted)
             if relocalized_score > best_score:
                 best_state, best_score = relocalized, relocalized_score
+                self._last_relocalize_frame = self._frame_count
 
         lon_delta = lon_distance(best_state.lon, self.state.lon)
         lat_delta = best_state.lat - self.state.lat
         momentum = self.config.deep_motion_momentum if self._deep_mode else self.config.motion_momentum
+
+        if self._occlusion_frames > self.config.occlusion_suppress_frames:
+            momentum = min(momentum, 0.1)
+
         self.velocity[0] = momentum * self.velocity[0] + (1.0 - momentum) * lon_delta
         self.velocity[1] = momentum * self.velocity[1] + (1.0 - momentum) * lat_delta
         self.state = best_state
 
-        # --- 多模板更新（含遮挡/异常帧抑制）---
-        # 高质量帧：增加"确认"计数；否则清零
+# --- 多模板更新（含遮挡/异常帧抑制）---
         if best_score >= self.config.update_quality_threshold:
             self._consecutive_good += 1
         else:
             self._consecutive_good = 0
 
-        # 高置信帧：解除丢失状态
         if best_score >= self.config.high_confidence:
             self.lost_frames = 0
         else:
             self.lost_frames += 1
 
-        # 只有连续确认达标才更新模板（防止在错误帧上学习）
         if self._consecutive_good >= self.config.confirmation_frames:
             self._update_templates(frame, best_state, best_score)
         else:
-            # 低质量帧：模板仅年龄增长，不更新内容
             for i in range(len(self._template_ages)):
                 self._template_ages[i] += 1
 
@@ -279,28 +329,32 @@ class PanoSOTTracker:
         return best_idx
 
     def _update_templates(self, frame: np.ndarray, state: SphereState, score: float) -> None:
-        """多模板更新策略：EMA 更新最佳匹配模板，替换过期模板。"""
+        """三模板更新策略：保护init模板，EMA更新short/long模板。"""
         best_idx = self._find_best_template(frame, state)
 
-        # 定位最老模板（用于替换）
         oldest_idx = int(np.argmax(self._template_ages))
-
-        # 如果最老模板太旧，替换为新模板
         if self._template_ages[oldest_idx] > self.config.template_max_age:
-            self._templates.pop(oldest_idx)
-            self._descriptors.pop(oldest_idx)
-            self._template_ages.pop(oldest_idx)
-            self._template_scores.pop(oldest_idx)
-            if self._deep_mode:
-                self._template_feats.pop(oldest_idx)
-                self._template_feat_banks.pop(oldest_idx)
-            # 重新添加新模板
-            self._add_template(frame, state)
-            # 重新定位最佳索引（列表已变）
-            best_idx = self._find_best_template(frame, state)
+            t_type = self._template_types[oldest_idx] if oldest_idx < len(self._template_types) else "short"
+            if t_type != "init":
+                self._templates.pop(oldest_idx)
+                self._descriptors.pop(oldest_idx)
+                self._template_ages.pop(oldest_idx)
+                self._template_scores.pop(oldest_idx)
+                self._template_types.pop(oldest_idx)
+                if self._deep_mode:
+                    self._template_feats.pop(oldest_idx)
+                    self._template_feat_banks.pop(oldest_idx)
 
-        # EMA 更新：最佳匹配模板更新率最高，其他模板微弱更新
+                new_type = "long" if t_type == "short" else "short"
+                self._add_template(frame, state, template_type=new_type)
+                best_idx = self._find_best_template(frame, state)
+
         for i in range(len(self._templates)):
+            t_type = self._template_types[i] if i < len(self._template_types) else "short"
+            if t_type == "init":
+                self._template_ages[i] = 0
+                continue
+
             update_rate = (
                 self.config.template_update_ema if i == best_idx
                 else self.config.template_update_background
@@ -313,6 +367,10 @@ class PanoSOTTracker:
 
         if self._deep_mode:
             for i in range(len(self._template_feats)):
+                t_type = self._template_types[i] if i < len(self._template_types) else "short"
+                if t_type == "init":
+                    continue
+
                 update_rate = (
                     self.config.template_update_ema if i == best_idx
                     else self.config.template_update_background
@@ -429,28 +487,51 @@ class PanoSOTTracker:
     # ---------- 打分 ----------
 
     def _score_patch(self, patch: np.ndarray) -> float:
-        """使用所有模板描述子匹配，返回最高分数。"""
-        best = -1.0
-        for desc in self._descriptors:
-            score = float(np.mean(np.sum(desc * patch_descriptor(patch), axis=1)))
-            if score > best:
-                best = score
-        return best
+        """使用三模板加权融合打分。"""
+        patch_desc = patch_descriptor(patch)
+        scores = []
+        weights = []
+        for i, desc in enumerate(self._descriptors):
+            t_type = self._template_types[i] if i < len(self._template_types) else "short"
+            score = float(np.mean(np.sum(desc * patch_desc, axis=1)))
+            scores.append(score)
+            if t_type == "init":
+                weights.append(self.config.template_weight_init)
+            elif t_type == "short":
+                weights.append(self.config.template_weight_short)
+            else:
+                weights.append(self.config.template_weight_long)
+        if not scores:
+            return -1.0
+        total_weight = sum(weights) if sum(weights) > 0 else len(weights)
+        weighted_score = sum(s * w for s, w in zip(scores, weights)) / total_weight
+        return float(weighted_score)
 
     def _score_patch_deep(self, frame: np.ndarray, lon: float, lat: float, fov_x: float, fov_y: float) -> float:
-        """深度特征打分：对所有模板做 cross-correlation，返回最高分数。"""
+        """深度特征三模板加权融合打分。"""
         search_feat = self._extract_search_feat(frame, lon, lat, fov_x, fov_y)
-        best_score = -1.0
+        scores = []
+        weights = []
         for i, t_feat in enumerate(self._template_feats):
+            t_type = self._template_types[i] if i < len(self._template_types) else "short"
             template_bank = (
                 self._template_feat_banks[i]
                 if i < len(self._template_feat_banks)
                 else [t_feat]
             )
             score, _ = self._score_template_bank(template_bank, search_feat)
-            if score > best_score:
-                best_score = score
-        return best_score
+            scores.append(score)
+            if t_type == "init":
+                weights.append(self.config.template_weight_init)
+            elif t_type == "short":
+                weights.append(self.config.template_weight_short)
+            else:
+                weights.append(self.config.template_weight_long)
+        if not scores:
+            return -1.0
+        total_weight = sum(weights) if sum(weights) > 0 else len(weights)
+        weighted_score = sum(s * w for s, w in zip(scores, weights)) / total_weight
+        return float(weighted_score)
 
     def _local_search(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
         if self._deep_mode:
@@ -498,11 +579,7 @@ class PanoSOTTracker:
         return best_state, best_score
 
     def _local_search_deep(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
-        """深度特征 coarse-to-fine 搜索（多模板版本）。
-
-        Coarse: 在预测位置提取大范围搜索patch，对所有模板做 cross-correlation，取最高分。
-        Refine: 在最佳候选位置附近小范围高分辨率精修。
-        """
+        """深度特征 coarse-to-fine 搜索（三模板加权融合版本）。"""
         best_state = predicted
         best_score = -1.0
 
@@ -514,28 +591,32 @@ class PanoSOTTracker:
                 enlarge=self.config.deep_search_enlarge,
             )
 
-            # 每个 scale 对所有模板尝试匹配
             scale_best_score = -1.0
             scale_best_state = predicted
-            scale_best_template_idx = 0
 
             for t_idx, t_feat in enumerate(self._template_feats):
+                t_type = self._template_types[t_idx] if t_idx < len(self._template_types) else "short"
+                if t_type == "init":
+                    weight = self.config.template_weight_init
+                elif t_type == "short":
+                    weight = self.config.template_weight_short
+                else:
+                    weight = self.config.template_weight_long
+
                 template_bank = (
                     self._template_feat_banks[t_idx]
                     if t_idx < len(self._template_feat_banks)
                     else [t_feat]
                 )
-                # --- Coarse stage ---
+
                 search_feat = self._extract_search_feat(
                     frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
                 )
                 score, (off_y, off_x) = self._score_template_bank(template_bank, search_feat)
 
-                # 将 offset 映射回球面坐标
                 coarse_lon = wrap_lon(predicted.lon + off_x * fov_x)
                 coarse_lat = clamp_lat(predicted.lat + off_y * fov_y)
 
-                # --- Refine stage ---
                 refine_fov_x = fov_x * 0.5
                 refine_fov_y = fov_y * 0.5
                 refine_feat = self._extract_search_feat(
@@ -546,7 +627,7 @@ class PanoSOTTracker:
                 refined_lon = wrap_lon(coarse_lon + roff_x * refine_fov_x)
                 refined_lat = clamp_lat(coarse_lat + roff_y * refine_fov_y)
 
-                combined_score = 0.3 * score + 0.7 * refine_score
+                combined_score = (0.3 * score + 0.7 * refine_score) * weight
                 combined_score -= 0.02 * abs(scale - 1.0)
 
                 if combined_score > scale_best_score:
@@ -556,13 +637,10 @@ class PanoSOTTracker:
                         equatorial_width=float(candidate_width),
                         angular_height=float(candidate_height),
                     )
-                    scale_best_template_idx = t_idx
 
             if scale_best_score > best_score:
                 best_score = scale_best_score
                 best_state = scale_best_state
-                # 更新最佳匹配模板的分数
-                self._template_scores[scale_best_template_idx] = scale_best_score
 
         return best_state, best_score
 
@@ -571,20 +649,27 @@ class PanoSOTTracker:
         frame: np.ndarray,
         predicted: SphereState,
     ) -> tuple[SphereState, float]:
-        lon_values = np.deg2rad(
-            np.arange(-180.0, 180.0, self.config.relocalize_stride_deg, dtype=np.float32)
+        coarse_stride_lon = self.config.relocalize_stride_deg
+        coarse_stride_lat = self.config.relocalize_lat_stride_deg
+        fine_stride_lon = coarse_stride_lon * 0.5
+        fine_stride_lat = coarse_stride_lat * 0.5
+
+        lon_values_coarse = np.deg2rad(
+            np.arange(-180.0, 180.0, coarse_stride_lon, dtype=np.float32)
         )
-        lat_values = np.deg2rad(
-            np.arange(-72.0, 72.1, self.config.relocalize_lat_stride_deg, dtype=np.float32)
+        lat_values_coarse = np.deg2rad(
+            np.arange(-72.0, 72.1, coarse_stride_lat, dtype=np.float32)
         )
+
         candidates: list[tuple[float, SphereState]] = []
 
         if self._deep_mode:
             fov_x, fov_y = state_size_to_fov(predicted, enlarge=self.config.deep_search_enlarge)
         else:
             fov_x, fov_y = self._handcrafted_match_fov(predicted)
-        for lon in lon_values:
-            for lat in lat_values:
+
+        for lon in lon_values_coarse:
+            for lat in lat_values_coarse:
                 lat = clamp_lat(float(lat))
                 if self._deep_mode:
                     score = self._score_patch_deep(frame, float(lon), float(lat), fov_x, fov_y)
@@ -594,21 +679,62 @@ class PanoSOTTracker:
                         self.config.template_size, self.config.template_size,
                     )
                     score = self._score_patch(patch)
-                score -= 0.01 * abs(lon_distance(float(lon), predicted.lon))
-                score -= 0.02 * abs(float(lat) - predicted.lat)
-                candidate = SphereState(
+                dist_lon = abs(lon_distance(float(lon), predicted.lon))
+                dist_lat = abs(float(lat) - predicted.lat)
+                score -= 0.01 * dist_lon + 0.02 * dist_lat
+                candidates.append((score, SphereState(
                     lon=float(lon), lat=float(lat),
                     equatorial_width=predicted.equatorial_width,
                     angular_height=predicted.angular_height,
-                )
-                candidates.append((score, candidate))
+                )))
 
         candidates.sort(key=lambda item: item[0], reverse=True)
         best_state = predicted
         best_score = -1.0
+
         for coarse_score, coarse_state in candidates[: self.config.relocalize_topk]:
-            refined_state, refined_score = self._local_search(frame, coarse_state)
-            if refined_score > best_score:
+            if coarse_score < self.config.occlusion_threshold:
+                continue
+
+            lon_range = np.deg2rad(np.arange(
+                -fine_stride_lon, fine_stride_lon + 1e-6, fine_stride_lon, dtype=np.float32
+            ))
+            lat_range = np.deg2rad(np.arange(
+                -fine_stride_lat, fine_stride_lat + 1e-6, fine_stride_lat, dtype=np.float32
+            ))
+
+            fine_candidates: list[tuple[float, SphereState]] = []
+            for dlon in lon_range:
+                for dlat in lat_range:
+                    lon = wrap_lon(coarse_state.lon + dlon)
+                    lat = clamp_lat(coarse_state.lat + dlat)
+                    if self._deep_mode:
+                        score = self._score_patch_deep(frame, float(lon), float(lat), fov_x, fov_y)
+                    else:
+                        patch = tangent_patch(
+                            frame, float(lon), float(lat), fov_x, fov_y,
+                            self.config.template_size, self.config.template_size,
+                        )
+                        score = self._score_patch(patch)
+                    fine_candidates.append((score, SphereState(
+                        lon=float(lon), lat=float(lat),
+                        equatorial_width=coarse_state.equatorial_width,
+                        angular_height=coarse_state.angular_height,
+                    )))
+
+            if fine_candidates:
+                fine_candidates.sort(key=lambda item: item[0], reverse=True)
+                best_fine_state = fine_candidates[0][1]
+                best_fine_score = fine_candidates[0][0]
+            else:
+                best_fine_state = coarse_state
+                best_fine_score = coarse_score
+
+            refined_state, refined_score = self._local_search(frame, best_fine_state)
+            final_score = max(refined_score, best_fine_score)
+
+            if final_score > best_score:
                 best_state = refined_state
-                best_score = max(refined_score, coarse_score)
+                best_score = final_score
+
         return best_state, best_score

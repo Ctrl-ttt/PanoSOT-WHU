@@ -70,9 +70,12 @@ def state_to_erp_bbox(
     image_width: int,
     image_height: int,
 ) -> np.ndarray:
-    angular_width = state.equatorial_width / max(math.cos(state.lat), 1e-3)
+    cos_lat = max(math.cos(state.lat), 0.01)
+    angular_width = state.equatorial_width / cos_lat
     width_px = angular_width / TWO_PI * image_width
     height_px = state.angular_height / PI * image_height
+    width_px = min(max(width_px, 10.0), float(image_width))
+    height_px = min(max(height_px, 10.0), float(image_height))
     cx_px = (state.lon + PI) / TWO_PI * image_width
     cy_px = (HALF_PI - state.lat) / PI * image_height
     x = (cx_px - 0.5 * width_px) % image_width
