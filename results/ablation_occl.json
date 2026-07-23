@@ -1,0 +1,178 @@
+[
+  {
+    "confirmation_frames": 1,
+    "update_quality_threshold": 0.58,
+    "label": "确认1帧_阈值0.58",
+    "num_frames": 50,
+    "elapsed_sec": 37.12,
+    "fps": 1.35,
+    "success_rate": 0.03999999910593033,
+    "auc": 0.0657142773270607,
+    "mean_iou": 0.06368691827236207
+  },
+  {
+    "confirmation_frames": 1,
+    "update_quality_threshold": 0.65,
+    "label": "确认1帧_阈值0.65",
+    "num_frames": 50,
+    "elapsed_sec": 37.09,
+    "fps": 1.35,
+    "success_rate": 0.03999999910593033,
+    "auc": 0.0657142773270607,
+    "mean_iou": 0.06368691827236207
+  },
+  {
+    "confirmation_frames": 1,
+    "update_quality_threshold": 0.72,
+    "label": "确认1帧_阈值0.72",
+    "num_frames": 50,
+    "elapsed_sec": 38.35,
+    "fps": 1.3,
+    "success_rate": 0.03999999910593033,
+    "auc": 0.0657142773270607,
+    "mean_iou": 0.06368691827236207
+  },
+  {
+    "confirmation_frames": 1,
+    "update_quality_threshold": 0.78,
+    "label": "确认1帧_阈值0.78",
+    "num_frames": 50,
+    "elapsed_sec": 38.53,
+    "fps": 1.3,
+    "success_rate": 0.03999999910593033,
+    "auc": 0.0657142773270607,
+    "mean_iou": 0.06368691827236207
+  },
+  {
+    "confirmation_frames": 2,
+    "update_quality_threshold": 0.58,
+    "label": "确认2帧_阈值0.58",
+    "num_frames": 50,
+    "elapsed_sec": 38.18,
+    "fps": 1.31,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.0714285746216774,
+    "mean_iou": 0.061608525049709754
+  },
+  {
+    "confirmation_frames": 2,
+    "update_quality_threshold": 0.65,
+    "label": "确认2帧_阈值0.65",
+    "num_frames": 50,
+    "elapsed_sec": 38.17,
+    "fps": 1.31,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.0714285746216774,
+    "mean_iou": 0.061608525049709754
+  },
+  {
+    "confirmation_frames": 2,
+    "update_quality_threshold": 0.72,
+    "label": "确认2帧_阈值0.72",
+    "num_frames": 50,
+    "elapsed_sec": 38.12,
+    "fps": 1.31,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.0714285746216774,
+    "mean_iou": 0.061608525049709754
+  },
+  {
+    "confirmation_frames": 2,
+    "update_quality_threshold": 0.78,
+    "label": "确认2帧_阈值0.78",
+    "num_frames": 50,
+    "elapsed_sec": 38.41,
+    "fps": 1.3,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.0714285746216774,
+    "mean_iou": 0.061608525049709754
+  },
+  {
+    "confirmation_frames": 3,
+    "update_quality_threshold": 0.58,
+    "label": "确认3帧_阈值0.58",
+    "num_frames": 50,
+    "elapsed_sec": 37.84,
+    "fps": 1.32,
+    "success_rate": 0.03999999910593033,
+    "auc": 0.0657142773270607,
+    "mean_iou": 0.06368691827236207
+  },
+  {
+    "confirmation_frames": 3,
+    "update_quality_threshold": 0.65,
+    "label": "确认3帧_阈值0.65",
+    "num_frames": 50,
+    "elapsed_sec": 37.2,
+    "fps": 1.34,
+    "success_rate": 0.03999999910593033,
+    "auc": 0.0657142773270607,
+    "mean_iou": 0.06368691827236207
+  },
+  {
+    "confirmation_frames": 3,
+    "update_quality_threshold": 0.72,
+    "label": "确认3帧_阈值0.72",
+    "num_frames": 50,
+    "elapsed_sec": 37.02,
+    "fps": 1.35,
+    "success_rate": 0.03999999910593033,
+    "auc": 0.0657142773270607,
+    "mean_iou": 0.06368691827236207
+  },
+  {
+    "confirmation_frames": 3,
+    "update_quality_threshold": 0.78,
+    "label": "确认3帧_阈值0.78",
+    "num_frames": 50,
+    "elapsed_sec": 37.02,
+    "fps": 1.35,
+    "success_rate": 0.03999999910593033,
+    "auc": 0.0657142773270607,
+    "mean_iou": 0.06368691827236207
+  },
+  {
+    "confirmation_frames": 4,
+    "update_quality_threshold": 0.58,
+    "label": "确认4帧_阈值0.58",
+    "num_frames": 50,
+    "elapsed_sec": 36.68,
+    "fps": 1.36,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.06476189941167831,
+    "mean_iou": 0.06049788095170542
+  },
+  {
+    "confirmation_frames": 4,
+    "update_quality_threshold": 0.65,
+    "label": "确认4帧_阈值0.65",
+    "num_frames": 50,
+    "elapsed_sec": 37.2,
+    "fps": 1.34,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.06476189941167831,
+    "mean_iou": 0.06049788095170542
+  },
+  {
+    "confirmation_frames": 4,
+    "update_quality_threshold": 0.72,
+    "label": "确认4帧_阈值0.72",
+    "num_frames": 50,
+    "elapsed_sec": 37.27,
+    "fps": 1.34,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.06476189941167831,
+    "mean_iou": 0.06049788095170542
+  },
+  {
+    "confirmation_frames": 4,
+    "update_quality_threshold": 0.78,
+    "label": "确认4帧_阈值0.78",
+    "num_frames": 50,
+    "elapsed_sec": 37.26,
+    "fps": 1.34,
+    "success_rate": 0.019999999552965164,
+    "auc": 0.06476189941167831,
+    "mean_iou": 0.06049788095170542
+  }
+]

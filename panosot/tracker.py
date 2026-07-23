@@ -48,6 +48,7 @@ class TrackerConfig:
     device: str = "cpu"
     use_amp: bool = False
     deep_search_enlarge: float = 2.5
+    deep_template_enlarge: float = 2.0  # 模板提取时的上下文扩展倍率（小目标加大可获取更多背景）
 
     # --- 三模板记忆参数（Phase 2）---
     num_templates: int = 3
@@ -357,7 +358,7 @@ class PanoSOTTracker:
     def _extract_template_feat(self, frame: np.ndarray, state: SphereState) -> Any:
         """提取模板的深度特征（归一化球面 patch → backbone 前向）。"""
         size = self.config.deep_template_size
-        fov_x, fov_y = state_size_to_fov(state, enlarge=1.25)
+        fov_x, fov_y = state_size_to_fov(state, enlarge=self.config.deep_template_enlarge)
         patch = tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
         return self.deep_extractor.extract_template_feature(patch)
 
@@ -370,7 +371,7 @@ class PanoSOTTracker:
 
     def _extract_template_feat_bank(self, frame: np.ndarray, state: SphereState) -> list[Any]:
         size = self.config.deep_template_size
-        fov_x, fov_y = state_size_to_fov(state, enlarge=1.25)
+        fov_x, fov_y = state_size_to_fov(state, enlarge=self.config.deep_template_enlarge)
         patch = tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
         feat_bank: list[Any] = []
         for angle_deg in self.config.deep_template_rotations_deg:
