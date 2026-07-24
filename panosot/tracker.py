@@ -111,6 +111,15 @@ class TrackerConfig:
     debug_frame_stride: int = 1
     debug_save_response_maps: bool = True
 
+    # --- 重定位守门 ---
+    relocalize_min_start_frame_override: int = 25
+    relocalize_min_lost_frames_override: int = 8
+    relocalize_score_margin: float = 0.08
+    relocalize_jump_gate_frames: int = 30
+    relocalize_jump_gate_lost_frames: int = 10
+    relocalize_max_lon_jump_deg: float = 40.0
+    relocalize_max_lat_jump_deg: float = 18.0
+
 
 @dataclass
 class TrackerRuntimeStats:
@@ -439,14 +448,22 @@ class PanoSOTTracker:
             self._occlusion_frames = max(0, self._occlusion_frames - 1)
 
         should_relocalize = False
-        if self._frame_count >= self.config.relocalize_start_frame:
+        relocalize_start_frame = max(
+            self.config.relocalize_start_frame,
+            self.config.relocalize_min_start_frame_override,
+        )
+        relocalize_lost_trigger = max(
+            self.config.relocalize_lost_trigger,
+            self.config.relocalize_min_lost_frames_override,
+        )
+        if self._frame_count >= relocalize_start_frame:
             if best_score < relocalize_threshold:
                 frames_since_relocalize = self._frame_count - self._last_relocalize_frame
                 if frames_since_relocalize >= self.config.relocalize_min_interval:
                     should_relocalize = True
 
             # P4: 连续丢失帧数过多时强制触发重定位
-            if not should_relocalize and self.lost_frames >= self.config.relocalize_lost_trigger:
+            if not should_relocalize and self.lost_frames >= relocalize_lost_trigger:
                 frames_since_relocalize = self._frame_count - self._last_relocalize_frame
                 if frames_since_relocalize >= self.config.relocalize_min_interval:
                     should_relocalize = True
@@ -455,7 +472,18 @@ class PanoSOTTracker:
         if should_relocalize:
             self.runtime_stats.relocalizations += 1
             relocalized, relocalized_score = self._global_relocalize(frame, predicted)
-            if relocalized_score > best_score:
+            lon_jump_deg = abs(math.degrees(lon_distance(relocalized.lon, predicted.lon)))
+            lat_jump_deg = abs(math.degrees(relocalized.lat - predicted.lat))
+            large_jump_early = (
+                self._frame_count <= self.config.relocalize_jump_gate_frames
+                and self.lost_frames < self.config.relocalize_jump_gate_lost_frames
+                and (
+                    lon_jump_deg > self.config.relocalize_max_lon_jump_deg
+                    or lat_jump_deg > self.config.relocalize_max_lat_jump_deg
+                )
+            )
+            score_improved = relocalized_score > best_score + self.config.relocalize_score_margin
+            if score_improved and not large_jump_early:
                 best_state, best_score = relocalized, relocalized_score
                 self._last_relocalize_frame = self._frame_count
                 relocalize_applied = True
