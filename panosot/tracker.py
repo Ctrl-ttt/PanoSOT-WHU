@@ -120,6 +120,18 @@ class TrackerConfig:
     relocalize_max_lon_jump_deg: float = 40.0
     relocalize_max_lat_jump_deg: float = 18.0
 
+    # --- 低置信局部更新守门 ---
+    deep_local_jump_gate_confidence: float = 0.54
+    deep_state_trust_low: float = 0.46
+    deep_state_trust_high: float = 0.58
+    deep_state_trust_min: float = 0.12
+    deep_local_min_lon_jump_deg: float = 2.5
+    deep_local_min_lat_jump_deg: float = 2.0
+    deep_local_max_lon_jump_deg: float = 7.0
+    deep_local_max_lat_jump_deg: float = 5.0
+    deep_local_lon_jump_size_ratio: float = 0.90
+    deep_local_lat_jump_size_ratio: float = 0.25
+
 
 @dataclass
 class TrackerRuntimeStats:
@@ -227,6 +239,8 @@ class PanoSOTTracker:
         self._last_relocalize_frame = -self.config.relocalize_min_interval
         self.runtime_stats = TrackerRuntimeStats()
         self._debug_payload: dict[str, np.ndarray] | None = None
+        self._last_state_trust = 1.0
+        self._last_local_jump_gated = False
         self._debug_recorder: TrackerDebugRecorder | None = None
         if self.config.debug_dir:
             self._debug_recorder = TrackerDebugRecorder(
@@ -273,6 +287,83 @@ class PanoSOTTracker:
         if self._deep_mode:
             return self.config.deep_update_quality_threshold
         return self.config.update_quality_threshold
+
+    def _state_trust(self, score: float) -> float:
+        if not self._deep_mode:
+            return 1.0
+
+        low = min(self.config.deep_state_trust_low, self.config.deep_state_trust_high - 1e-4)
+        high = max(self.config.deep_state_trust_high, low + 1e-4)
+        if score <= low:
+            return self.config.deep_state_trust_min
+        if score >= high:
+            return 1.0
+
+        alpha = (score - low) / (high - low)
+        return self.config.deep_state_trust_min + alpha * (1.0 - self.config.deep_state_trust_min)
+
+    def _blend_state_position(
+        self,
+        anchor: SphereState,
+        candidate: SphereState,
+        trust: float,
+    ) -> SphereState:
+        trust = float(np.clip(trust, 0.0, 1.0))
+        lon = wrap_lon(anchor.lon + trust * lon_distance(candidate.lon, anchor.lon))
+        lat = clamp_lat(anchor.lat + trust * (candidate.lat - anchor.lat))
+        return SphereState(
+            lon=float(lon),
+            lat=float(lat),
+            equatorial_width=candidate.equatorial_width,
+            angular_height=candidate.angular_height,
+        )
+
+    def _guard_low_confidence_state(
+        self,
+        predicted: SphereState,
+        candidate: SphereState,
+        score: float,
+    ) -> SphereState:
+        self._last_state_trust = 1.0
+        self._last_local_jump_gated = False
+        if not self._deep_mode:
+            return candidate
+
+        trust = self._state_trust(score)
+        self._last_state_trust = trust
+        if score >= self.config.deep_local_jump_gate_confidence and trust >= 0.999:
+            return candidate
+
+        angular_width = candidate.equatorial_width / max(math.cos(candidate.lat), 1e-3)
+        max_lon_jump = max(
+            math.radians(self.config.deep_local_min_lon_jump_deg),
+            angular_width * self.config.deep_local_lon_jump_size_ratio,
+        )
+        max_lat_jump = max(
+            math.radians(self.config.deep_local_min_lat_jump_deg),
+            candidate.angular_height * self.config.deep_local_lat_jump_size_ratio,
+        )
+        max_lon_jump = min(max_lon_jump, math.radians(self.config.deep_local_max_lon_jump_deg))
+        max_lat_jump = min(max_lat_jump, math.radians(self.config.deep_local_max_lat_jump_deg))
+
+        lon_jump = lon_distance(candidate.lon, predicted.lon)
+        lat_jump = candidate.lat - predicted.lat
+        clipped_lon_jump = float(np.clip(lon_jump, -max_lon_jump, max_lon_jump))
+        clipped_lat_jump = float(np.clip(lat_jump, -max_lat_jump, max_lat_jump))
+        gated = (
+            abs(clipped_lon_jump - lon_jump) > 1e-6
+            or abs(clipped_lat_jump - lat_jump) > 1e-6
+        )
+        if gated:
+            candidate = SphereState(
+                lon=float(wrap_lon(predicted.lon + clipped_lon_jump)),
+                lat=float(clamp_lat(predicted.lat + clipped_lat_jump)),
+                equatorial_width=candidate.equatorial_width,
+                angular_height=candidate.angular_height,
+            )
+
+        self._last_local_jump_gated = gated
+        return self._blend_state_position(predicted, candidate, trust)
 
     def initialize(self, frame: np.ndarray, init_bbox_xywh: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
@@ -421,6 +512,8 @@ class PanoSOTTracker:
         self._frame_count += 1
         self.runtime_stats.frames += 1
         self._debug_payload = None
+        self._last_state_trust = 1.0
+        self._last_local_jump_gated = False
         h, w = self.frame_shape
         predicted = SphereState(
             lon=float(wrap_lon(self.state.lon + self.velocity[0])),
@@ -501,6 +594,7 @@ class PanoSOTTracker:
                 equatorial_width=self.state.equatorial_width,
                 angular_height=self.state.angular_height,
             )
+        best_state = self._guard_low_confidence_state(predicted, best_state, best_score)
         lon_delta = lon_distance(best_state.lon, self.state.lon)
         lat_delta = best_state.lat - self.state.lat
         momentum = self.config.deep_motion_momentum if self._deep_mode else self.config.motion_momentum
@@ -708,6 +802,8 @@ class PanoSOTTracker:
                 "last_peak": f"{self.runtime_stats.last_peak:.6f}",
                 "last_psr": f"{self.runtime_stats.last_psr:.6f}",
                 "last_apce": f"{self.runtime_stats.last_apce:.6f}",
+                "state_trust": f"{self._last_state_trust:.6f}",
+                "local_jump_gated": self._last_local_jump_gated,
                 "velocity_lat": f"{self.velocity[1]:.6f}",
                 "velocity_lon": f"{self.velocity[0]:.6f}",
             },
