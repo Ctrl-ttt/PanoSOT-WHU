@@ -31,7 +31,9 @@ init_box = load_boxes(str(INIT_BOX))[0]
 
 cfg = TrackerConfig(
     use_deep_features=True,
-    deep_template_enlarge=4.0,  # 小目标模板扩大4倍上下文
+    deep_template_enlarge=4.0,
+    confirmation_frames=2,
+    update_quality_threshold=0.65,
 )
 
 fe = DeepFeatureExtractor(FeatureConfig())

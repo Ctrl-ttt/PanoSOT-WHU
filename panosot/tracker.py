@@ -353,12 +353,13 @@ class PanoSOTTracker:
             t_type = self._template_types[i] if i < len(self._template_types) else "short"
             if t_type == "init":
                 self._template_ages[i] = 0
-                continue
 
             update_rate = (
                 self.config.template_update_ema if i == best_idx
                 else self.config.template_update_background
             )
+            if t_type == "init":
+                update_rate = self.config.template_update_background  # init 缓慢更新
             new_patch = self._extract_template(frame, state)
             self._templates[i] = (1.0 - update_rate) * self._templates[i] + update_rate * new_patch
             self._descriptors[i] = patch_descriptor(self._templates[i])
@@ -368,13 +369,13 @@ class PanoSOTTracker:
         if self._deep_mode:
             for i in range(len(self._template_feats)):
                 t_type = self._template_types[i] if i < len(self._template_types) else "short"
-                if t_type == "init":
-                    continue
 
                 update_rate = (
                     self.config.template_update_ema if i == best_idx
                     else self.config.template_update_background
                 )
+                if t_type == "init":
+                    update_rate = self.config.template_update_background
                 new_feat_bank = self._extract_template_feat_bank(frame, state)
                 old_feat_bank = (
                     self._template_feat_banks[i]
