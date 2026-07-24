@@ -7,6 +7,7 @@ from typing import Any, Iterable, List
 import numpy as np
 from PIL import Image
 
+from .debug import TrackerDebugRecorder
 from .geometry import (
     SphereState,
     clamp_lat,
@@ -102,6 +103,13 @@ class TrackerConfig:
 
     # --- 尺度更新控制 ---
     deep_scale_update_confidence: float = 0.6  # 深度模式低于此分冻结尺度更新
+
+    # --- 可视化调试 ---
+    debug_dir: str | None = None
+    debug_start_frame: int = 0
+    debug_max_frames: int = 20
+    debug_frame_stride: int = 1
+    debug_save_response_maps: bool = True
 
 
 @dataclass
@@ -209,6 +217,16 @@ class PanoSOTTracker:
         # --- 全局重定位冷却状态 ---
         self._last_relocalize_frame = -self.config.relocalize_min_interval
         self.runtime_stats = TrackerRuntimeStats()
+        self._debug_payload: dict[str, np.ndarray] | None = None
+        self._debug_recorder: TrackerDebugRecorder | None = None
+        if self.config.debug_dir:
+            self._debug_recorder = TrackerDebugRecorder(
+                debug_dir=self.config.debug_dir,
+                start_frame=self.config.debug_start_frame,
+                max_frames=self.config.debug_max_frames,
+                frame_stride=self.config.debug_frame_stride,
+                save_response_maps=self.config.debug_save_response_maps,
+            )
 
     def reset_runtime_stats(self) -> None:
         forward_calls = getattr(self.deep_extractor, "forward_calls", 0)
@@ -289,7 +307,19 @@ class PanoSOTTracker:
 
         self._sync_aliases()
         self.initialized = True
-        return self._state_to_output_bbox(self.state, w, h)
+        init_bbox = self._state_to_output_bbox(self.state, w, h)
+        if self._debug_recorder is not None:
+            self._debug_recorder.record_initialize(
+                frame=frame,
+                init_bbox_xywh=init_bbox,
+                template_patch=self._templates[0] if self._templates else None,
+                metadata={
+                    "branch": "deep" if self._deep_mode else "handcrafted",
+                    "lat": f"{self.state.lat:.6f}",
+                    "lon": f"{self.state.lon:.6f}",
+                },
+            )
+        return init_bbox
 
     def _template_offsets(self) -> list[tuple[float, float]]:
         """生成 num_templates 个模板的初始位置偏移（弧度）。"""
@@ -381,6 +411,7 @@ class PanoSOTTracker:
 
         self._frame_count += 1
         self.runtime_stats.frames += 1
+        self._debug_payload = None
         h, w = self.frame_shape
         predicted = SphereState(
             lon=float(wrap_lon(self.state.lon + self.velocity[0])),
@@ -420,12 +451,14 @@ class PanoSOTTracker:
                 if frames_since_relocalize >= self.config.relocalize_min_interval:
                     should_relocalize = True
 
+        relocalize_applied = False
         if should_relocalize:
             self.runtime_stats.relocalizations += 1
             relocalized, relocalized_score = self._global_relocalize(frame, predicted)
             if relocalized_score > best_score:
                 best_state, best_score = relocalized, relocalized_score
                 self._last_relocalize_frame = self._frame_count
+                relocalize_applied = True
 
                 # P4: 高置信重定位成功后重置模板
                 if (self.config.relocalize_reset_on_success
@@ -470,7 +503,15 @@ class PanoSOTTracker:
                 self._template_ages[i] += 1
 
         self._sync_aliases()
-        return self._state_to_output_bbox(self.state, w, h)
+        result_bbox = self._state_to_output_bbox(self.state, w, h)
+        self._record_debug_frame(
+            frame=frame,
+            predicted=predicted,
+            result_bbox=result_bbox,
+            score=best_score,
+            relocalize_applied=relocalize_applied,
+        )
+        return result_bbox
 
     def _find_best_template(self, frame: np.ndarray, state: SphereState) -> int:
         """对给定状态评估所有模板，返回最佳匹配的索引。"""
@@ -606,6 +647,45 @@ class PanoSOTTracker:
         fov_x, fov_y = self._handcrafted_match_fov(state)
         return tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
 
+    def _should_capture_debug(self) -> bool:
+        return self._debug_recorder is not None and self._debug_recorder.wants_frame(self._frame_count)
+
+    def _record_debug_frame(
+        self,
+        frame: np.ndarray,
+        predicted: SphereState,
+        result_bbox: np.ndarray,
+        score: float,
+        relocalize_applied: bool,
+    ) -> None:
+        if self._debug_recorder is None or self.frame_shape is None:
+            return
+
+        predicted_bbox = self._state_to_output_bbox(predicted, self.frame_shape[1], self.frame_shape[0])
+        artifacts = dict(self._debug_payload or {})
+        if self._templates:
+            artifacts.setdefault("template_patch", self._templates[0])
+
+        self._debug_recorder.record_step(
+            frame_index=self._frame_count,
+            frame=frame,
+            predicted_bbox_xywh=predicted_bbox,
+            result_bbox_xywh=result_bbox,
+            score=score,
+            metadata={
+                "branch": "deep" if self._deep_mode else "handcrafted",
+                "lost_frames": self.lost_frames,
+                "occlusion_frames": self._occlusion_frames,
+                "relocalized": relocalize_applied,
+                "last_peak": f"{self.runtime_stats.last_peak:.6f}",
+                "last_psr": f"{self.runtime_stats.last_psr:.6f}",
+                "last_apce": f"{self.runtime_stats.last_apce:.6f}",
+                "velocity_lat": f"{self.velocity[1]:.6f}",
+                "velocity_lon": f"{self.velocity[0]:.6f}",
+            },
+            artifacts=artifacts,
+        )
+
     def _handcrafted_match_fov(self, state: SphereState) -> tuple[float, float]:
         """Return the target-scale FoV used by the handcrafted branch."""
         return state_size_to_fov(state, enlarge=self.config.handcrafted_match_enlarge)
@@ -666,8 +746,22 @@ class PanoSOTTracker:
     ) -> Any:
         """提取搜索区域的深度特征。"""
         out_size = self.config.refine_search_size if refine else self.config.coarse_search_size
-        patch = tangent_patch(frame, lon, lat, fov_x, fov_y, out_size, out_size)
+        patch = self._extract_search_patch(frame, lon, lat, fov_x, fov_y, refine=refine)
         return self.deep_extractor.extract_search_feature(patch, refine=refine)
+
+    def _extract_search_patch(
+        self, frame: np.ndarray, lon: float, lat: float, fov_x: float, fov_y: float, refine: bool = False
+    ) -> np.ndarray:
+        out_size = self.config.refine_search_size if refine else self.config.coarse_search_size
+        return tangent_patch(frame, lon, lat, fov_x, fov_y, out_size, out_size)
+
+    def _response_to_numpy(self, response: Any) -> np.ndarray:
+        response_np = response.squeeze().detach().float().cpu().numpy()
+        if response_np.ndim == 0:
+            response_np = response_np.reshape(1, 1)
+        elif response_np.ndim == 1:
+            response_np = response_np.reshape(1, -1)
+        return response_np
 
     def _deep_score_and_offset(
         self, template_feat: Any, search_feat: Any
@@ -833,6 +927,8 @@ class PanoSOTTracker:
         step_lat = max(predicted.angular_height * self.config.local_step_factor, math.radians(2.0))
         best_state = predicted
         best_score = -1.0
+        best_patch: np.ndarray | None = None
+        capture_debug = self._should_capture_debug()
 
         for scale in self.config.scale_factors:
             candidate_width, candidate_height = self._clamp_target_size(
@@ -859,11 +955,17 @@ class PanoSOTTracker:
                     score -= 0.015 * (abs(dx) + abs(dy))
                     if score > best_score:
                         best_score = score
+                        if capture_debug:
+                            best_patch = patch.copy()
                         best_state = SphereState(
                             lon=float(lon), lat=float(lat),
                             equatorial_width=float(candidate_width),
                             angular_height=float(candidate_height),
                         )
+        if capture_debug:
+            self._debug_payload = {}
+            if best_patch is not None:
+                self._debug_payload["match_patch"] = best_patch
         return best_state, best_score
 
     def _local_search_deep(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
@@ -871,6 +973,8 @@ class PanoSOTTracker:
         self.runtime_stats.local_searches += 1
         best_state = predicted
         best_score = -1.0
+        best_debug_payload: dict[str, np.ndarray] | None = None
+        capture_debug = self._should_capture_debug()
 
         for scale in self.config.scale_factors:
             candidate_width, candidate_height = self._clamp_target_size(
@@ -884,27 +988,44 @@ class PanoSOTTracker:
 
             scale_best_score = -1.0
             scale_best_state = predicted
+            scale_best_debug_payload: dict[str, np.ndarray] | None = None
 
-            search_feat = self._extract_search_feat(
-                frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
-            )
+            coarse_patch = None
+            if capture_debug:
+                coarse_patch = self._extract_search_patch(
+                    frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
+                )
+                search_feat = self.deep_extractor.extract_search_feature(coarse_patch, refine=False)
+            else:
+                search_feat = self._extract_search_feat(
+                    frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
+                )
             response, reference_template = self._fused_template_response(search_feat)
             score, (off_y, off_x), _ = self._response_score_offset(
                 response, reference_template, search_feat,
             )
+            coarse_response = self._response_to_numpy(response) if capture_debug else None
 
             coarse_lon = wrap_lon(predicted.lon + off_x * fov_x)
             coarse_lat = clamp_lat(predicted.lat + off_y * fov_y)
 
             refine_fov_x = fov_x * 0.5
             refine_fov_y = fov_y * 0.5
-            refine_feat = self._extract_search_feat(
-                frame, coarse_lon, coarse_lat, refine_fov_x, refine_fov_y, refine=True,
-            )
+            refine_patch = None
+            if capture_debug:
+                refine_patch = self._extract_search_patch(
+                    frame, coarse_lon, coarse_lat, refine_fov_x, refine_fov_y, refine=True,
+                )
+                refine_feat = self.deep_extractor.extract_search_feature(refine_patch, refine=True)
+            else:
+                refine_feat = self._extract_search_feat(
+                    frame, coarse_lon, coarse_lat, refine_fov_x, refine_fov_y, refine=True,
+                )
             refine_response, refine_reference = self._fused_template_response(refine_feat)
             refine_score, (roff_y, roff_x), refine_meta = self._response_score_offset(
                 refine_response, refine_reference, refine_feat,
             )
+            refine_response_np = self._response_to_numpy(refine_response) if capture_debug else None
 
             refined_lon = wrap_lon(coarse_lon + roff_x * refine_fov_x)
             refined_lat = clamp_lat(coarse_lat + roff_y * refine_fov_y)
@@ -919,6 +1040,16 @@ class PanoSOTTracker:
                     equatorial_width=float(candidate_width),
                     angular_height=float(candidate_height),
                 )
+                if capture_debug:
+                    scale_best_debug_payload = {}
+                    if coarse_patch is not None:
+                        scale_best_debug_payload["coarse_patch"] = coarse_patch
+                    if coarse_response is not None:
+                        scale_best_debug_payload["coarse_response"] = coarse_response
+                    if refine_patch is not None:
+                        scale_best_debug_payload["refine_patch"] = refine_patch
+                    if refine_response_np is not None:
+                        scale_best_debug_payload["refine_response"] = refine_response_np
 
             if scale_best_score > best_score:
                 best_score = scale_best_score
@@ -927,7 +1058,11 @@ class PanoSOTTracker:
                 self.runtime_stats.last_peak = refine_meta["peak"]
                 self.runtime_stats.last_psr = refine_meta["psr"]
                 self.runtime_stats.last_apce = refine_meta["apce"]
+                if capture_debug:
+                    best_debug_payload = scale_best_debug_payload
 
+        if capture_debug:
+            self._debug_payload = best_debug_payload or {}
         return best_state, best_score
 
     def _global_relocalize(

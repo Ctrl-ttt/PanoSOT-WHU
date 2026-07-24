@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deep", action="store_true", help="Use deep features.")
     parser.add_argument("--backbone", default="mobilenet_v3_small", help="Backbone name.")
     parser.add_argument("--device", default="auto", help="Device (auto, cpu, cuda).")
+    parser.add_argument("--max-frames", type=int, default=0, help="Limit the run to the first N frames (0 = all).")
     parser.add_argument("--cache-dir", default=str(PROJECT_ROOT / ".cache" / "torch"), help="Weight cache directory.")
     parser.add_argument("--num-templates", type=int, default=3, help="Number of templates (1-5).")
     parser.add_argument("--template-weight-init", type=float, default=0.40, help="Weight for init template.")
@@ -29,6 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--occlusion-threshold", type=float, default=0.35, help="Occlusion confidence threshold.")
     parser.add_argument("--relocalize-threshold", type=float, default=0.35, help="Relocalize confidence threshold.")
     parser.add_argument("--relocalize-interval", type=int, default=10, help="Min frames between relocalizations.")
+    parser.add_argument("--debug-dir", default="", help="Directory for per-frame debug artifacts.")
+    parser.add_argument("--debug-start-frame", type=int, default=0, help="First tracked frame index to capture.")
+    parser.add_argument("--debug-max-frames", type=int, default=20, help="Maximum number of tracked frames to capture.")
+    parser.add_argument("--debug-frame-stride", type=int, default=1, help="Capture every Nth tracked frame.")
     return parser.parse_args()
 
 
@@ -36,6 +41,8 @@ def main() -> None:
     args = parse_args()
     seq_dir = Path(args.sequence)
     frame_paths = sorted(p for p in seq_dir.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+    if args.max_frames > 0:
+        frame_paths = frame_paths[: args.max_frames]
     init_box = load_boxes(args.init_box)[0]
 
     print(f"Loading {len(frame_paths)} frames from {seq_dir}")
@@ -52,6 +59,10 @@ def main() -> None:
         occlusion_threshold=args.occlusion_threshold,
         relocalize_confidence_threshold=args.relocalize_threshold,
         relocalize_min_interval=args.relocalize_interval,
+        debug_dir=args.debug_dir or None,
+        debug_start_frame=args.debug_start_frame,
+        debug_max_frames=args.debug_max_frames,
+        debug_frame_stride=args.debug_frame_stride,
     )
 
     if args.deep:
@@ -63,6 +74,8 @@ def main() -> None:
     print(f"  - init: {tracker.config.template_weight_init}")
     print(f"  - short: {tracker.config.template_weight_short}")
     print(f"  - long: {tracker.config.template_weight_long}")
+    if tracker.config.debug_dir:
+        print(f"Debug artifacts: {tracker.config.debug_dir}")
 
     start_time = time.time()
     frames = (load_image(p) for p in frame_paths)
