@@ -186,8 +186,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        default="cpu",
-        help="计算设备 (cpu / cuda)。",
+        default="auto",
+        help="计算设备 (auto / cpu / cuda)。",
     )
     parser.add_argument(
         "--output",
@@ -235,11 +235,14 @@ def main() -> None:
 
     print(f"发现 {len(sequences)} 条序列，开始评测...\n")
 
-    # 配置
+    # 配置（使用调优后的参数）
     config = TrackerConfig(
         use_deep_features=args.deep,
         backbone_name=args.backbone,
         device=args.device,
+        deep_template_enlarge=4.0,
+        confirmation_frames=2,
+        update_quality_threshold=0.65,
     )
 
     deep_extractor = None
@@ -248,14 +251,20 @@ def main() -> None:
         from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
         from panosot.models import build_similarity_head
 
+        resolved_device = args.device
+        if resolved_device == "auto":
+            import torch
+            resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+
         feat_config = FeatureConfig(
             backbone_name=args.backbone,
-            device=args.device,
-            use_amp=args.device.startswith("cuda"),
+            device=resolved_device,
+            use_amp=resolved_device.startswith("cuda"),
         )
+        config.device = resolved_device
         deep_extractor = DeepFeatureExtractor(feat_config)
         similarity_head = build_similarity_head("depthwise_xcorr")
-        print(f"深度特征模式: backbone={args.backbone}, device={args.device}")
+        print(f"深度特征模式: backbone={args.backbone}, device={resolved_device}")
 
     # 逐条评测
     results: list[SeqResult] = []
