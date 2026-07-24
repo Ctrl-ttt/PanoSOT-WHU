@@ -25,30 +25,36 @@ class DepthwiseXCorrHead:
 
     def _channelwise_conv(self, template_feat: Any, search_feat: Any) -> Any:
         torch = self._torch
+        batch = int(template_feat.shape[0])
         channels = int(template_feat.shape[1])
-        kernel = template_feat.reshape(channels, 1, template_feat.shape[-2], template_feat.shape[-1])
-        search = search_feat.reshape(1, channels, search_feat.shape[-2], search_feat.shape[-1])
-        response = torch.nn.functional.conv2d(search, kernel, groups=channels)
-        return response
+        kernel_h = int(template_feat.shape[-2])
+        kernel_w = int(template_feat.shape[-1])
+        search_h = int(search_feat.shape[-2])
+        search_w = int(search_feat.shape[-1])
+
+        kernel = template_feat.reshape(batch * channels, 1, kernel_h, kernel_w)
+        search = search_feat.reshape(1, batch * channels, search_h, search_w)
+        response = torch.nn.functional.conv2d(search, kernel, groups=batch * channels)
+        return response.reshape(batch, channels, response.shape[-2], response.shape[-1])
 
     def forward(self, template_feat: Any, search_feat: Any) -> Any:
         if template_feat.ndim != 4 or search_feat.ndim != 4:
             raise ValueError("Expected template and search features to have shape [B, C, H, W].")
-        if template_feat.shape[0] != search_feat.shape[0]:
-            raise ValueError("Template and search batches must have the same batch size.")
         if template_feat.shape[1] != search_feat.shape[1]:
             raise ValueError("Template and search features must have the same channel count.")
+        if search_feat.shape[0] == 1 and template_feat.shape[0] > 1:
+            search_feat = search_feat.expand(template_feat.shape[0], -1, -1, -1)
+        if template_feat.shape[0] != search_feat.shape[0]:
+            raise ValueError("Template and search batches must have the same batch size.")
 
-        responses = []
-        for template_item, search_item in zip(template_feat, search_feat):
-            response = self._channelwise_conv(template_item.unsqueeze(0), search_item.unsqueeze(0))
-            responses.append(response.mean(dim=1, keepdim=True))
-        return self._torch.cat(responses, dim=0)
+        response = self._channelwise_conv(template_feat, search_feat)
+        area = max(int(template_feat.shape[-2]) * int(template_feat.shape[-1]), 1)
+        return response.mean(dim=1, keepdim=True) / area
 
     __call__ = forward
 
 
-def build_backbone(name: str, pretrained: bool = True) -> Any:
+def build_backbone(name: str, pretrained: bool = True, feature_layer: int | None = 12) -> Any:
     torch, nn = _require_torch()
     normalized_name = name.strip().lower()
 
@@ -62,7 +68,13 @@ def build_backbone(name: str, pretrained: bool = True) -> Any:
 
         weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
         model = mobilenet_v3_small(weights=weights)
-        return model.features
+        features = model.features
+        if feature_layer is None:
+            return features
+        layers = list(features.children())
+        if feature_layer < 0 or feature_layer >= len(layers):
+            raise ValueError(f"feature_layer must be in [0, {len(layers) - 1}], got {feature_layer}")
+        return nn.Sequential(*layers[: feature_layer + 1])
 
     if normalized_name.startswith("timm:"):
         try:

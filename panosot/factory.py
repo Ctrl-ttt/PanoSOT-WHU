@@ -35,6 +35,11 @@ def build_tracker(
             backbone_name=backbone_name,
             device=resolved_device,
             use_amp=(resolved_device.startswith("cuda")),
+            feature_layer=config.deep_feature_layer,
+            normalize_features=config.normalize_deep_features,
+            template_size=config.deep_template_size,
+            coarse_search_size=config.coarse_search_size,
+            refine_search_size=config.refine_search_size,
         )
         deep_extractor = DeepFeatureExtractor(feat_config)
         similarity_head = build_similarity_head("depthwise_xcorr")

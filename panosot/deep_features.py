@@ -28,6 +28,8 @@ class FeatureConfig:
     backbone_name: str = "mobilenet_v3_small"
     device: str = "cuda"
     use_amp: bool = True
+    feature_layer: int | None = 12
+    normalize_features: bool = False
     template_size: int = 112
     coarse_search_size: int = 224
     refine_search_size: int = 160
@@ -48,6 +50,7 @@ class DeepFeatureExtractor:
         self.model = self._build_model_with_fallback()
         self.model.to(self.device)
         self.model.eval()
+        self.forward_calls = 0
 
         torch = self._torch
         self._mean = torch.tensor(config.mean, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
@@ -63,7 +66,11 @@ class DeepFeatureExtractor:
 
     def _build_model_with_fallback(self) -> Any:
         try:
-            return build_backbone(self.config.backbone_name, pretrained=self.config.pretrained)
+            return build_backbone(
+                self.config.backbone_name,
+                pretrained=self.config.pretrained,
+                feature_layer=self.config.feature_layer,
+            )
         except Exception as exc:
             if not self.config.pretrained:
                 raise
@@ -71,7 +78,11 @@ class DeepFeatureExtractor:
                 f"Falling back to pretrained=False for {self.config.backbone_name}: {exc}",
                 RuntimeWarning,
             )
-            return build_backbone(self.config.backbone_name, pretrained=False)
+            return build_backbone(
+                self.config.backbone_name,
+                pretrained=False,
+                feature_layer=self.config.feature_layer,
+            )
 
     def _resolve_device(self, requested_device: str) -> Any:
         torch = self._torch
@@ -107,12 +118,18 @@ class DeepFeatureExtractor:
 
     def _forward(self, patch: np.ndarray, out_size: int) -> Any:
         tensor = self.preprocess_patch(patch, out_size)
-        with self._torch.no_grad():
+        self.forward_calls += 1
+        with self._torch.inference_mode():
             with self._amp_context():
                 features = self.model(tensor)
         if isinstance(features, (list, tuple)):
             features = features[-1]
+        if self.config.normalize_features:
+            features = self._torch.nn.functional.normalize(features, p=2, dim=1, eps=1e-6)
         return features
+
+    def reset_stats(self) -> None:
+        self.forward_calls = 0
 
     def extract_template_feature(self, patch: np.ndarray) -> Any:
         return self._forward(patch, self.config.template_size)

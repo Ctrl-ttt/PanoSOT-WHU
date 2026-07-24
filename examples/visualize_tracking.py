@@ -23,16 +23,24 @@ def load_ground_truth(gt_path: Path) -> list[np.ndarray]:
 
 def draw_box(frame: np.ndarray, bbox: np.ndarray, color: tuple[int, int, int], label: str = "") -> np.ndarray:
     x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 3)
+    frame_h, frame_w = frame.shape[:2]
+    x %= frame_w
+    y = max(0, min(y, frame_h - 1))
+    bottom = max(y, min(y + h, frame_h - 1))
+    if x + w <= frame_w:
+        cv2.rectangle(frame, (x, y), (x + w, bottom), color, 3)
+    else:
+        cv2.rectangle(frame, (x, y), (frame_w - 1, bottom), color, 3)
+        cv2.rectangle(frame, (0, y), ((x + w) % frame_w, bottom), color, 3)
     if label:
-        cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(frame, label, (x, max(y - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     return frame
 
 
-def create_video(frames_dir: Path, pred_path: Path, gt_path: Path, output_path: Path):
+def create_video(frames_dir: Path, pred_path: Path, gt_path: Path | None, output_path: Path):
     frame_paths = sorted(p for p in frames_dir.iterdir() if p.suffix.lower() in (".jpg", ".png"))
     predictions = load_predictions(pred_path)
-    ground_truth = load_ground_truth(gt_path)
+    ground_truth = load_ground_truth(gt_path) if gt_path else []
     
     first_frame = cv2.imread(str(frame_paths[0]))
     height, width = first_frame.shape[:2]
@@ -64,11 +72,12 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize tracking results")
     parser.add_argument("--frames", required=True, help="Directory containing frames")
     parser.add_argument("--pred", required=True, help="Prediction file")
-    parser.add_argument("--gt", required=True, help="Ground truth file")
+    parser.add_argument("--gt", default=None, help="Optional ground truth file")
     parser.add_argument("--output", default="tracking_visualization.mp4", help="Output video path")
     args = parser.parse_args()
     
-    create_video(Path(args.frames), Path(args.pred), Path(args.gt), Path(args.output))
+    gt_path = Path(args.gt) if args.gt else None
+    create_video(Path(args.frames), Path(args.pred), gt_path, Path(args.output))
 
 
 if __name__ == "__main__":
