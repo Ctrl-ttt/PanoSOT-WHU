@@ -214,14 +214,23 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Data files
+# Data & results (regenerable)
 data/
-
-# Results
 results/
 
-# Output videos
+# Output videos & debug images
 *.mp4
+*.avi
+debug_*
+analysis_*
+tracking_frame_*
+first_frame*
+target_*
+distinct_*
+stable_*
+try_*
+find_target_*
+video_targets_*
 
 # Local debug/temp artifacts
 tmp_*/
