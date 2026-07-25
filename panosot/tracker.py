@@ -46,16 +46,19 @@ class TrackerConfig:
     refine_search_size: int = 160
     deep_feature_layer: int | None = 12
     normalize_deep_features: bool = False
-    deep_motion_momentum: float = 0.5
+    deep_motion_momentum: float = 0.3
     deep_template_rotations_deg: tuple[float, ...] = (0.0, -45.0, 45.0, 90.0)
     device: str = "auto"
     use_amp: bool = False
     deep_search_enlarge: float = 2.5
-    deep_template_enlarge: float = 2.0  # 模板提取时的上下文扩展倍率（小目标加大可获取更多背景）
+    deep_template_enlarge: float = 4.0
     deep_scale_update_confidence: float = 0.58
     min_target_size_ratio: float = 0.25
     max_target_size_ratio: float = 4.0
     max_output_width_ratio: float = 0.75
+
+    # --- 深度模式尺度因子（扩展范围以适应小目标）---
+    deep_scale_factors: tuple[float, ...] = (0.85, 0.95, 1.0, 1.05, 1.15)
 
     # --- 三模板记忆参数（Phase 2）---
     num_templates: int = 3
@@ -78,8 +81,8 @@ class TrackerConfig:
     relocalize_confidence_threshold: float = 0.35
 
     # --- 遮挡/异常帧抑制参数（P1）---
-    confirmation_frames: int = 2        # 连续高分帧数达到此值才更新模板
-    update_quality_threshold: float = 0.65  # 高于此分才计入"确认"计数（比 high_confidence 更严格）
+    confirmation_frames: int = 2
+    update_quality_threshold: float = 0.65
 
     # --- 深度响应图置信度阈值 ---
     deep_high_confidence: float = 0.52
@@ -88,21 +91,21 @@ class TrackerConfig:
     deep_update_quality_threshold: float = 0.55
 
     # --- 极区自适应参数（P3）---
-    polar_lat_threshold_deg: float = 55.0    # 纬度超过此值视为极区
+    polar_lat_threshold_deg: float = 55.0
     polar_rotation_angles_deg: tuple[float, ...] = (0.0, -30.0, 30.0, -60.0, 60.0, 90.0, -90.0, -120.0, 120.0, 150.0)
-    polar_template_enlarge: float = 5.0       # 极区模板扩大更多上下文
+    polar_template_enlarge: float = 5.0
 
     # --- 增强重定位参数（P4）---
-    relocalize_multi_scale: bool = True           # 重定位时多尺度搜索
-    relocalize_extra_scales: tuple[float, ...] = (0.7, 1.3)   # 额外尺度因子
-    relocalize_use_init_only: bool = True         # 重定位时只用init模板
-    relocalize_lost_trigger: int = 5              # 连续丢N帧强制重定位
-    relocalize_reset_on_success: bool = True       # 重定位成功高置信时重置模板
-    relocalize_reset_score: float = 0.55          # 触发重置的分数阈值
-    relocalize_start_frame: int = 15               # 前N帧禁止重定位（避免早期假阳性）
+    relocalize_multi_scale: bool = True
+    relocalize_extra_scales: tuple[float, ...] = (0.7, 1.3)
+    relocalize_use_init_only: bool = True
+    relocalize_lost_trigger: int = 5
+    relocalize_reset_on_success: bool = True
+    relocalize_reset_score: float = 0.55
+    relocalize_start_frame: int = 15
 
     # --- 尺度更新控制 ---
-    deep_scale_update_confidence: float = 0.6  # 深度模式低于此分冻结尺度更新
+    deep_scale_update_confidence: float = 0.6
 
     # --- 可视化调试 ---
     debug_dir: str | None = None
@@ -131,6 +134,11 @@ class TrackerConfig:
     deep_local_max_lat_jump_deg: float = 5.0
     deep_local_lon_jump_size_ratio: float = 0.90
     deep_local_lat_jump_size_ratio: float = 0.25
+
+    # --- 小目标保护参数 ---
+    small_target_threshold: float = 0.02
+    small_target_template_enlarge: float = 6.0
+    small_target_search_enlarge: float = 3.0
 
 
 @dataclass
@@ -855,7 +863,19 @@ class PanoSOTTracker:
                            False=跟踪更新，只用正常旋转角避免错误匹配。
         """
         size = self.config.deep_template_size
-        enlarge = self._get_template_enlarge(state.lat) if trust_location else self.config.deep_template_enlarge
+
+        if self.frame_shape is not None:
+            h, w = self.frame_shape
+            target_area_ratio = (state.equatorial_width * state.angular_height * w * h) / (2.0 * math.pi)
+            is_small = target_area_ratio < self.config.small_target_threshold
+        else:
+            is_small = False
+
+        if is_small:
+            enlarge = self.config.small_target_template_enlarge
+        else:
+            enlarge = self._get_template_enlarge(state.lat) if trust_location else self.config.deep_template_enlarge
+
         angles = self._get_rotation_angles(state.lat) if trust_location else self.config.deep_template_rotations_deg
         fov_x, fov_y = state_size_to_fov(state, enlarge=enlarge)
         patch = tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
@@ -1100,14 +1120,29 @@ class PanoSOTTracker:
         best_debug_payload: dict[str, np.ndarray] | None = None
         capture_debug = self._should_capture_debug()
 
-        for scale in self.config.scale_factors:
+        if self.frame_shape is not None:
+            h, w = self.frame_shape
+            target_area_ratio = (predicted.equatorial_width * predicted.angular_height * w * h) / (2.0 * math.pi)
+            is_small = target_area_ratio < self.config.small_target_threshold
+        else:
+            is_small = False
+
+        search_enlarge = (
+            self.config.small_target_search_enlarge
+            if is_small
+            else self.config.deep_search_enlarge
+        )
+
+        scale_factors = self.config.deep_scale_factors
+
+        for scale in scale_factors:
             candidate_width, candidate_height = self._clamp_target_size(
                 predicted.equatorial_width * scale,
                 predicted.angular_height * scale,
             )
             fov_x, fov_y = state_size_to_fov(
                 SphereState(predicted.lon, predicted.lat, candidate_width, candidate_height),
-                enlarge=self.config.deep_search_enlarge,
+                enlarge=search_enlarge,
             )
 
             scale_best_score = -1.0
