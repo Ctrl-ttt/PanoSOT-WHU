@@ -223,5 +223,10 @@ results/
 # Output videos
 *.mp4
 
+# Local debug/temp artifacts
+tmp_*/
+tmp_debug_*/
+tmp_smoke/
+
 # Streamlit
 .streamlit/secrets.toml
