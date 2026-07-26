@@ -74,6 +74,8 @@ def generate_basic(output_dir: Path, num_frames: int = 30):
     cx, cy = width // 2, height // 2
     tw, th = 200, 200
     vx, vy = 5, 2
+    init_x = cx - tw // 2
+    init_y = cy - th // 2
 
     for i in range(num_frames):
         frame = np.random.randint(0, 256, (height, width, 3), dtype=np.uint8)
@@ -84,7 +86,7 @@ def generate_basic(output_dir: Path, num_frames: int = 30):
         cx = (cx + vx) % width
         cy = max(th // 2, min(height - th // 2, cy + vy))
 
-    _write_init(output_dir, cx - tw // 2, cy - th // 2, tw, th)
+    _write_init(output_dir, init_x, init_y, tw, th)
     print(f"basic 模式: {num_frames} 帧已生成到 {output_dir}")
 
 
@@ -95,6 +97,8 @@ def generate_better(output_dir: Path, num_frames: int = 30):
     cx, cy = width // 2, height // 2
     tw, th = 200, 200
     vx, vy = 8, 3
+    init_x = cx - tw // 2
+    init_y = cy - th // 2
 
     for i in range(num_frames):
         frame = np.zeros((height, width, 3), dtype=np.uint8)
@@ -109,7 +113,7 @@ def generate_better(output_dir: Path, num_frames: int = 30):
         cx = (cx + vx) % width
         cy = max(th // 2, min(height - th // 2, cy + vy))
 
-    _write_init(output_dir, cx - tw // 2, cy - th // 2, tw, th)
+    _write_init(output_dir, init_x, init_y, tw, th)
     print(f"better 模式: {num_frames} 帧已生成到 {output_dir}")
 
 
@@ -120,6 +124,9 @@ def generate_person(output_dir: Path, num_frames: int = 30):
     cx, cy = width // 2, height // 2
     size = 200
     vx, vy = 6, 2
+    tw, th = size, int(size * 1.8)
+    init_x = cx - tw // 2
+    init_y = cy - th // 2
 
     for i in range(num_frames):
         frame = np.zeros((height, width, 3), dtype=np.uint8)
@@ -132,8 +139,7 @@ def generate_person(output_dir: Path, num_frames: int = 30):
         cx = (cx + vx) % width
         cy = max(size // 2, min(height - size // 2, cy + vy))
 
-    tw, th = size, int(size * 1.8)
-    _write_init(output_dir, cx - tw // 2, cy - th // 2, tw, th)
+    _write_init(output_dir, init_x, init_y, tw, th)
     print(f"person 模式: {num_frames} 帧已生成到 {output_dir}")
 
 
@@ -144,6 +150,8 @@ def generate_pano(output_dir: Path, num_frames: int = 50):
     cx, cy = width // 2, height // 2
     tw, th = 120, 200
     vx, vy = 15, 2
+    init_x = cx - tw // 2
+    init_y = cy - th // 2
 
     for i in range(num_frames):
         frame = np.zeros((height, width, 3), dtype=np.uint8)
@@ -176,7 +184,7 @@ def generate_pano(output_dir: Path, num_frames: int = 50):
         cx = (cx + vx) % width
         cy = max(th // 2, min(height - th // 2, cy + vy))
 
-    _write_init(output_dir, cx - tw // 2, cy - th // 2, tw, th)
+    _write_init(output_dir, init_x, init_y, tw, th)
     print(f"pano 模式: {num_frames} 帧已生成到 {output_dir}")
 
 
@@ -202,7 +210,7 @@ def main():
 
     output_dir = Path(args.output)
     _MODES[args.mode](output_dir, args.num_frames)
-    print(f"✅ 初始化框: {(output_dir / 'init.txt').read_text().strip()}")
+    print(f"init box: {(output_dir / 'init.txt').read_text(encoding='utf-8').strip()}")
 
 
 if __name__ == "__main__":

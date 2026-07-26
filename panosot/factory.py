@@ -13,6 +13,7 @@ def build_tracker(
     device: str = "auto",
     **kwargs: Any,
 ) -> PanoSOTTracker:
+    cache_dir = kwargs.pop("cache_dir", None)
     config = TrackerConfig(use_deep_features=use_deep_features, backbone_name=backbone_name, device=device)
 
     for key, value in kwargs.items():
@@ -40,6 +41,7 @@ def build_tracker(
             template_size=config.deep_template_size,
             coarse_search_size=config.coarse_search_size,
             refine_search_size=config.refine_search_size,
+            cache_dir=cache_dir,
         )
         deep_extractor = DeepFeatureExtractor(feat_config)
         similarity_head = build_similarity_head("depthwise_xcorr")

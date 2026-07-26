@@ -44,7 +44,7 @@ class TrackerConfig:
     deep_template_size: int = 112
     coarse_search_size: int = 224
     refine_search_size: int = 160
-    deep_feature_layer: int | None = 12
+    deep_feature_layer: int | None = 6
     normalize_deep_features: bool = False
     deep_motion_momentum: float = 0.3
     deep_template_rotations_deg: tuple[float, ...] = (0.0, -45.0, 45.0, 90.0)
@@ -128,12 +128,25 @@ class TrackerConfig:
     deep_state_trust_low: float = 0.46
     deep_state_trust_high: float = 0.58
     deep_state_trust_min: float = 0.12
+    deep_state_trust_psr_center: float = 2.0
+    deep_state_trust_psr_scale: float = 0.75
+    deep_velocity_low_psr_threshold: float = 1.85
+    deep_velocity_low_trust_threshold: float = 0.65
+    deep_velocity_decay: float = 0.20
+    deep_relocalize_psr_threshold: float = 1.70
+    deep_relocalize_min_start_frame: int = 6
+    deep_relocalize_min_lost_frames: int = 2
     deep_local_min_lon_jump_deg: float = 2.5
     deep_local_min_lat_jump_deg: float = 2.0
     deep_local_max_lon_jump_deg: float = 7.0
     deep_local_max_lat_jump_deg: float = 5.0
     deep_local_lon_jump_size_ratio: float = 0.90
     deep_local_lat_jump_size_ratio: float = 0.25
+
+    # --- 手工特征低置信保护 ---
+    handcrafted_hold_position_score: float = 0.12
+    handcrafted_center_score_margin: float = 0.02
+    handcrafted_scale_update_confidence: float = 0.16
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -249,6 +262,9 @@ class PanoSOTTracker:
         self._debug_payload: dict[str, np.ndarray] | None = None
         self._last_state_trust = 1.0
         self._last_local_jump_gated = False
+        self._last_center_score = 0.0
+        self._last_best_minus_center = 0.0
+        self._last_center_preferred = False
         self._debug_recorder: TrackerDebugRecorder | None = None
         if self.config.debug_dir:
             self._debug_recorder = TrackerDebugRecorder(
@@ -296,6 +312,11 @@ class PanoSOTTracker:
             return self.config.deep_update_quality_threshold
         return self.config.update_quality_threshold
 
+    def _freeze_scale_update_confidence(self) -> float:
+        if self._deep_mode:
+            return self.config.deep_scale_update_confidence
+        return self.config.handcrafted_scale_update_confidence
+
     def _state_trust(self, score: float) -> float:
         if not self._deep_mode:
             return 1.0
@@ -308,7 +329,13 @@ class PanoSOTTracker:
             return 1.0
 
         alpha = (score - low) / (high - low)
-        return self.config.deep_state_trust_min + alpha * (1.0 - self.config.deep_state_trust_min)
+        trust = self.config.deep_state_trust_min + alpha * (1.0 - self.config.deep_state_trust_min)
+
+        psr = max(float(self.runtime_stats.last_psr), 0.0)
+        psr_scale = max(float(self.config.deep_state_trust_psr_scale), 1e-4)
+        psr_factor = 1.0 / (1.0 + math.exp(-(psr - self.config.deep_state_trust_psr_center) / psr_scale))
+        psr_factor = 0.25 + 0.75 * psr_factor
+        return trust * psr_factor
 
     def _blend_state_position(
         self,
@@ -522,6 +549,9 @@ class PanoSOTTracker:
         self._debug_payload = None
         self._last_state_trust = 1.0
         self._last_local_jump_gated = False
+        self._last_center_score = 0.0
+        self._last_best_minus_center = 0.0
+        self._last_center_preferred = False
         h, w = self.frame_shape
         predicted = SphereState(
             lon=float(wrap_lon(self.state.lon + self.velocity[0])),
@@ -531,6 +561,14 @@ class PanoSOTTracker:
         )
 
         best_state, best_score = self._local_search(frame, predicted)
+        candidate_trust = self._state_trust(best_score) if self._deep_mode else 1.0
+        deep_low_quality = (
+            self._deep_mode
+            and (
+                candidate_trust < self.config.deep_velocity_low_trust_threshold
+                or self.runtime_stats.last_psr < self.config.deep_velocity_low_psr_threshold
+            )
+        )
 
         score_drop = self._last_high_conf_score - best_score
         is_abnormal = score_drop > self.config.max_score_drop and self._last_high_conf_score > 0.0
@@ -543,6 +581,8 @@ class PanoSOTTracker:
         if best_score >= high_confidence:
             self._occlusion_frames = 0
             self._last_high_conf_score = best_score
+        elif deep_low_quality:
+            self._occlusion_frames += 1
         elif best_score < occlusion_threshold or is_abnormal:
             self._occlusion_frames += 1
         else:
@@ -557,6 +597,9 @@ class PanoSOTTracker:
             self.config.relocalize_lost_trigger,
             self.config.relocalize_min_lost_frames_override,
         )
+        if self._deep_mode:
+            relocalize_start_frame = min(relocalize_start_frame, self.config.deep_relocalize_min_start_frame)
+            relocalize_lost_trigger = min(relocalize_lost_trigger, self.config.deep_relocalize_min_lost_frames)
         if self._frame_count >= relocalize_start_frame:
             if best_score < relocalize_threshold:
                 frames_since_relocalize = self._frame_count - self._last_relocalize_frame
@@ -565,6 +608,16 @@ class PanoSOTTracker:
 
             # P4: 连续丢失帧数过多时强制触发重定位
             if not should_relocalize and self.lost_frames >= relocalize_lost_trigger:
+                frames_since_relocalize = self._frame_count - self._last_relocalize_frame
+                if frames_since_relocalize >= self.config.relocalize_min_interval:
+                    should_relocalize = True
+
+            if (
+                self._deep_mode
+                and not should_relocalize
+                and self.runtime_stats.last_psr < self.config.deep_relocalize_psr_threshold
+                and max(self.lost_frames, self._occlusion_frames) >= self.config.deep_relocalize_min_lost_frames
+            ):
                 frames_since_relocalize = self._frame_count - self._last_relocalize_frame
                 if frames_since_relocalize >= self.config.relocalize_min_interval:
                     should_relocalize = True
@@ -595,7 +648,7 @@ class PanoSOTTracker:
                     self._reset_templates(frame, best_state)
 
         best_state = self._clamp_state_size(best_state)
-        if self._deep_mode and best_score < self.config.deep_scale_update_confidence:
+        if best_score < self._freeze_scale_update_confidence():
             best_state = SphereState(
                 lon=best_state.lon,
                 lat=best_state.lat,
@@ -610,8 +663,13 @@ class PanoSOTTracker:
         if self._occlusion_frames > self.config.occlusion_suppress_frames:
             momentum = min(momentum, 0.1)
 
-        self.velocity[0] = momentum * self.velocity[0] + (1.0 - momentum) * lon_delta
-        self.velocity[1] = momentum * self.velocity[1] + (1.0 - momentum) * lat_delta
+        if deep_low_quality:
+            decay = float(np.clip(self.config.deep_velocity_decay, 0.0, 1.0))
+            self.velocity[0] = decay * self.velocity[0]
+            self.velocity[1] = decay * self.velocity[1]
+        else:
+            self.velocity[0] = momentum * self.velocity[0] + (1.0 - momentum) * lon_delta
+            self.velocity[1] = momentum * self.velocity[1] + (1.0 - momentum) * lat_delta
         self.state = best_state
 
 # --- 多模板更新（含遮挡/异常帧抑制）---
@@ -812,6 +870,9 @@ class PanoSOTTracker:
                 "last_apce": f"{self.runtime_stats.last_apce:.6f}",
                 "state_trust": f"{self._last_state_trust:.6f}",
                 "local_jump_gated": self._last_local_jump_gated,
+                "center_score": f"{self._last_center_score:.6f}",
+                "best_minus_center": f"{self._last_best_minus_center:.6f}",
+                "center_preferred": self._last_center_preferred,
                 "velocity_lat": f"{self.velocity[1]:.6f}",
                 "velocity_lon": f"{self.velocity[0]:.6f}",
             },
@@ -1007,7 +1068,9 @@ class PanoSOTTracker:
         search_h, search_w = int(search_feat.shape[-2]), int(search_feat.shape[-1])
         max_offset_y = max(search_h - template_h, 0) / (2.0 * max(search_h, 1))
         max_offset_x = max(search_w - template_w, 0) / (2.0 * max(search_w, 1))
-        offset_y = ((peak_y / (h - 1)) - 0.5) * 2.0 * max_offset_y if h > 1 else 0.0
+        # In ERP image space, a response peak above center means the target moved upward,
+        # which corresponds to increasing latitude rather than decreasing it.
+        offset_y = (0.5 - (peak_y / (h - 1))) * 2.0 * max_offset_y if h > 1 else 0.0
         offset_x = ((peak_x / (w - 1)) - 0.5) * 2.0 * max_offset_x if w > 1 else 0.0
         meta = {"peak": peak, "psr": psr, "apce": apce}
         return score, (float(offset_y), float(offset_x)), meta
@@ -1069,6 +1132,18 @@ class PanoSOTTracker:
             math.radians(2.0),
         )
         step_lat = max(predicted.angular_height * self.config.local_step_factor, math.radians(2.0))
+        center_fov_x, center_fov_y = self._handcrafted_match_fov(predicted)
+        center_patch = tangent_patch(
+            frame,
+            predicted.lon,
+            predicted.lat,
+            center_fov_x,
+            center_fov_y,
+            self.config.template_size,
+            self.config.template_size,
+        )
+        center_score = self._score_patch(center_patch)
+        self._last_center_score = float(center_score)
         best_state = predicted
         best_score = -1.0
         best_patch: np.ndarray | None = None
@@ -1106,6 +1181,16 @@ class PanoSOTTracker:
                             equatorial_width=float(candidate_width),
                             angular_height=float(candidate_height),
                         )
+        self._last_best_minus_center = float(best_score - center_score)
+        if (
+            best_score < self.config.handcrafted_hold_position_score
+            and self._last_best_minus_center <= self.config.handcrafted_center_score_margin
+        ):
+            best_state = predicted
+            best_score = float(center_score)
+            self._last_center_preferred = True
+            if capture_debug:
+                best_patch = center_patch.copy()
         if capture_debug:
             self._debug_payload = {}
             if best_patch is not None:

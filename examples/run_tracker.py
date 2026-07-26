@@ -52,6 +52,7 @@ def main() -> None:
         use_deep_features=args.deep,
         backbone_name=args.backbone,
         device=args.device,
+        cache_dir=args.cache_dir,
         num_templates=args.num_templates,
         template_weight_init=args.template_weight_init,
         template_weight_short=args.template_weight_short,
