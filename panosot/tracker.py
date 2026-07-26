@@ -65,6 +65,9 @@ class TrackerConfig:
     template_max_age: int = 50
     template_update_ema: float = 0.08
     template_update_background: float = 0.02
+    deep_template_update_ema: float = 0.02
+    deep_template_update_background: float = 0.0
+    deep_confirmation_frames: int = 5
 
     # --- 三模板加权融合参数 ---
     template_weight_init: float = 0.40
@@ -312,6 +315,27 @@ class PanoSOTTracker:
             return self.config.deep_update_quality_threshold
         return self.config.update_quality_threshold
 
+    def _template_confirmation_frames(self) -> int:
+        if self._deep_mode:
+            return self.config.deep_confirmation_frames
+        return self.config.confirmation_frames
+
+    def _template_update_rate(self, template_type: str, is_best: bool) -> float:
+        if self._deep_mode:
+            rate = (
+                self.config.deep_template_update_ema
+                if is_best
+                else self.config.deep_template_update_background
+            )
+            if template_type == "init":
+                rate = self.config.deep_template_update_background
+            return rate
+
+        rate = self.config.template_update_ema if is_best else self.config.template_update_background
+        if template_type == "init":
+            rate = self.config.template_update_background
+        return rate
+
     def _freeze_scale_update_confidence(self) -> float:
         if self._deep_mode:
             return self.config.deep_scale_update_confidence
@@ -462,8 +486,9 @@ class PanoSOTTracker:
             return [(0.0, 0.0)]
         offsets = [(0.0, 0.0)]
         # 后续模板用目标尺寸的小比例偏移
-        step_lon = self.state.equatorial_width * 0.08
-        step_lat = self.state.angular_height * 0.08
+        offset_ratio = 0.0 if self._deep_mode else 0.08
+        step_lon = self.state.equatorial_width * offset_ratio
+        step_lat = self.state.angular_height * offset_ratio
         for i in range(1, self.num_templates):
             angle = 2.0 * math.pi * i / (self.num_templates - 1)
             offsets.append((step_lon * math.cos(angle), step_lat * math.sin(angle)))
@@ -683,7 +708,7 @@ class PanoSOTTracker:
         else:
             self.lost_frames += 1
 
-        if self._consecutive_good >= self.config.confirmation_frames:
+        if self._consecutive_good >= self._template_confirmation_frames():
             self.runtime_stats.template_updates += 1
             self._update_templates(frame, best_state, best_score)
         else:
@@ -752,10 +777,7 @@ class PanoSOTTracker:
             if t_type == "init":
                 self._template_ages[i] = 0
 
-            update_rate = (
-                self.config.template_update_ema if i == best_idx
-                else self.config.template_update_background
-            )
+            update_rate = self._template_update_rate(t_type, i == best_idx)
             if t_type == "init":
                 update_rate = self.config.template_update_background  # init 缓慢更新
             self._templates[i] = (1.0 - update_rate) * self._templates[i] + update_rate * new_patch
@@ -768,10 +790,7 @@ class PanoSOTTracker:
             for i in range(len(self._template_feats)):
                 t_type = self._template_types[i] if i < len(self._template_types) else "short"
 
-                update_rate = (
-                    self.config.template_update_ema if i == best_idx
-                    else self.config.template_update_background
-                )
+                update_rate = self._template_update_rate(t_type, i == best_idx)
                 if t_type == "init":
                     update_rate = self.config.template_update_background
                 old_feat_bank = (
