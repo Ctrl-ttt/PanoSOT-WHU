@@ -243,6 +243,12 @@ def main() -> None:
         deep_template_enlarge=4.0,
         confirmation_frames=2,
         update_quality_threshold=0.65,
+        # 深度模式独立参数 — 补上队友新增的参数体系
+        deep_confirmation_frames=2,
+        deep_update_quality_threshold=0.65,
+        deep_template_update_ema=0.08,
+        deep_template_update_background=0.02,
+        deep_motion_momentum=0.5,
     )
 
     deep_extractor = None

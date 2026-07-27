@@ -120,7 +120,7 @@ class TrackerConfig:
     # --- 重定位守门 ---
     relocalize_min_start_frame_override: int = 25
     relocalize_min_lost_frames_override: int = 8
-    relocalize_score_margin: float = 0.08
+    relocalize_score_margin: float = 0.15
     relocalize_jump_gate_frames: int = 30
     relocalize_jump_gate_lost_frames: int = 10
     relocalize_max_lon_jump_deg: float = 40.0
@@ -486,7 +486,7 @@ class PanoSOTTracker:
             return [(0.0, 0.0)]
         offsets = [(0.0, 0.0)]
         # 后续模板用目标尺寸的小比例偏移
-        offset_ratio = 0.0 if self._deep_mode else 0.08
+        offset_ratio = 0.08  # 恢复 P3 的深度模式模板偏移，提供搜索多样性
         step_lon = self.state.equatorial_width * offset_ratio
         step_lat = self.state.angular_height * offset_ratio
         for i in range(1, self.num_templates):
@@ -638,7 +638,8 @@ class PanoSOTTracker:
                     should_relocalize = True
 
             if (
-                self._deep_mode
+                False  # FIX: 关闭 PSR 触发重定位，减少全局搜索噪音
+                and self._deep_mode
                 and not should_relocalize
                 and self.runtime_stats.last_psr < self.config.deep_relocalize_psr_threshold
                 and max(self.lost_frames, self._occlusion_frames) >= self.config.deep_relocalize_min_lost_frames
