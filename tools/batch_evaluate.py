@@ -29,6 +29,8 @@ from panosot.tracker import PanoSOTTracker, TrackerConfig
 # ---------- 序列发现 ----------
 
 IMAGE_DIR_NAMES = ("image", "images", "img", "frames")
+INIT_FILE_NAMES = ("init_box.txt", "init.txt")
+GT_FILE_NAMES = ("groundtruth.txt", "gt.txt")
 
 
 def _find_image_dir(seq_dir: Path) -> Optional[Path]:
@@ -43,16 +45,26 @@ def _find_image_dir(seq_dir: Path) -> Optional[Path]:
     return None
 
 
-def _is_valid_seq_dir(path: Path) -> Optional[Path]:
+def _find_first_file(path: Path, names: tuple[str, ...]) -> Optional[Path]:
+    for name in names:
+        candidate = path / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _is_valid_seq_dir(path: Path) -> Optional[tuple[Path, Path, Path]]:
     """如果 path 是一个有效序列目录，返回图像目录；否则返回 None。"""
     image_dir = _find_image_dir(path)
     if image_dir is None:
         return None
-    if not (path / "init_box.txt").is_file():
+    init_path = _find_first_file(path, INIT_FILE_NAMES)
+    if init_path is None:
         return None
-    if not (path / "groundtruth.txt").is_file():
+    gt_path = _find_first_file(path, GT_FILE_NAMES)
+    if gt_path is None:
         return None
-    return image_dir
+    return image_dir, init_path, gt_path
 
 
 def discover_sequences(data_root: Path) -> list[tuple[str, Path, Path, Path]]:
@@ -64,18 +76,20 @@ def discover_sequences(data_root: Path) -> list[tuple[str, Path, Path, Path]]:
     - data_root 包含多个序列子目录
     """
     # 先检查 data_root 自身是否是序列
-    image_dir = _is_valid_seq_dir(data_root)
-    if image_dir is not None:
-        return [(data_root.name, image_dir, data_root / "init_box.txt", data_root / "groundtruth.txt")]
+    sequence_files = _is_valid_seq_dir(data_root)
+    if sequence_files is not None:
+        image_dir, init_path, gt_path = sequence_files
+        return [(data_root.name, image_dir, init_path, gt_path)]
 
     # 否则扫描子目录
     sequences = []
     for subdir in sorted(data_root.iterdir()):
         if not subdir.is_dir():
             continue
-        image_dir = _is_valid_seq_dir(subdir)
-        if image_dir is not None:
-            sequences.append((subdir.name, image_dir, subdir / "init_box.txt", subdir / "groundtruth.txt"))
+        sequence_files = _is_valid_seq_dir(subdir)
+        if sequence_files is not None:
+            image_dir, init_path, gt_path = sequence_files
+            sequences.append((subdir.name, image_dir, init_path, gt_path))
 
     return sequences
 

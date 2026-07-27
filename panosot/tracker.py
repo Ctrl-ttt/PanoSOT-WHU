@@ -7,6 +7,11 @@ from typing import Any, Iterable, List
 import numpy as np
 from PIL import Image
 
+try:
+    import cv2
+except ImportError:  # OpenCV is optional; template matching remains available.
+    cv2 = None
+
 from .debug import TrackerDebugRecorder
 from .geometry import (
     SphereState,
@@ -54,7 +59,7 @@ class TrackerConfig:
     deep_template_enlarge: float = 4.0
     deep_scale_update_confidence: float = 0.58
     min_target_size_ratio: float = 0.25
-    max_target_size_ratio: float = 4.0
+    max_target_size_ratio: float = 8.0
     max_output_width_ratio: float = 0.75
 
     # --- 深度模式尺度因子（扩展范围以适应小目标）---
@@ -64,7 +69,7 @@ class TrackerConfig:
     num_templates: int = 3
     template_max_age: int = 50
     template_update_ema: float = 0.08
-    template_update_background: float = 0.02
+    template_update_background: float = 0.0
     deep_template_update_ema: float = 0.02
     deep_template_update_background: float = 0.0
     deep_confirmation_frames: int = 5
@@ -150,6 +155,43 @@ class TrackerConfig:
     handcrafted_hold_position_score: float = 0.12
     handcrafted_center_score_margin: float = 0.02
     handcrafted_scale_update_confidence: float = 0.16
+    handcrafted_high_confidence: float = 0.24
+    handcrafted_occlusion_threshold: float = 0.08
+    handcrafted_relocalize_confidence_threshold: float = 0.10
+    handcrafted_update_quality_threshold: float = 0.20
+    handcrafted_state_trust_low: float = 0.08
+    handcrafted_state_trust_high: float = 0.24
+    handcrafted_state_trust_min: float = 0.0
+    handcrafted_flow_enabled: bool = True
+    handcrafted_flow_max_points: int = 100
+    handcrafted_flow_min_points: int = 12
+    handcrafted_flow_min_inlier_ratio: float = 0.65
+    handcrafted_flow_max_fb_error: float = 0.5
+    handcrafted_flow_max_spread: float = 2.5
+    handcrafted_flow_padding: float = 0.15
+    handcrafted_flow_template_score: float = 0.08
+    handcrafted_color_enabled: bool = True
+    handcrafted_color_hue_tolerance: float = 12.0
+    handcrafted_color_min_saturation: int = 90
+    handcrafted_color_min_value: int = 35
+    handcrafted_color_min_area: int = 15
+    handcrafted_color_search_width: int = 640
+    handcrafted_color_search_height: int = 480
+    handcrafted_color_max_scale_step: float = 1.7
+    handcrafted_ncc_enabled: bool = True
+    handcrafted_ncc_search_factor: float = 3.0
+    handcrafted_ncc_max_jump_ratio: float = 0.5
+    handcrafted_ncc_update_rate: float = 0.10
+    handcrafted_ncc_update_score: float = 0.55
+    handcrafted_ncc_distance_penalty: float = 0.30
+    handcrafted_ncc_scale_penalty: float = 0.05
+    handcrafted_ncc_flow_min_points: int = 8
+    handcrafted_ncc_flow_min_inlier_ratio: float = 0.20
+    handcrafted_ncc_flow_max_fb_error: float = 1.5
+    handcrafted_ncc_flow_max_spread: float = 3.0
+    handcrafted_ncc_velocity_momentum: float = 0.50
+    handcrafted_ncc_flow_motion_trigger: float = 0.06
+    handcrafted_ncc_flow_score_trigger: float = 0.72
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -268,6 +310,21 @@ class PanoSOTTracker:
         self._last_center_score = 0.0
         self._last_best_minus_center = 0.0
         self._last_center_preferred = False
+        self._previous_frame_gray: np.ndarray | None = None
+        self._last_flow_reliable = False
+        self._last_flow_inlier_ratio = 0.0
+        self._last_flow_fb_error = 0.0
+        self._last_flow_spread = 0.0
+        self._color_hue: float | None = None
+        self._color_bbox: np.ndarray | None = None
+        self._last_color_reliable = False
+        self._ncc_initial_template: np.ndarray | None = None
+        self._ncc_short_template: np.ndarray | None = None
+        self._ncc_bbox: np.ndarray | None = None
+        self._ncc_velocity = np.zeros(2, dtype=np.float64)
+        self._ncc_flow_was_reliable = False
+        self._ncc_last_score = 1.0
+        self._last_ncc_reliable = False
         self._debug_recorder: TrackerDebugRecorder | None = None
         if self.config.debug_dir:
             self._debug_recorder = TrackerDebugRecorder(
@@ -300,20 +357,24 @@ class PanoSOTTracker:
         }
 
     def _high_confidence(self) -> float:
-        return self.config.deep_high_confidence if self._deep_mode else self.config.high_confidence
+        if self._deep_mode:
+            return self.config.deep_high_confidence
+        return self.config.handcrafted_high_confidence
 
     def _occlusion_threshold(self) -> float:
-        return self.config.deep_occlusion_threshold if self._deep_mode else self.config.occlusion_threshold
+        if self._deep_mode:
+            return self.config.deep_occlusion_threshold
+        return self.config.handcrafted_occlusion_threshold
 
     def _relocalize_confidence_threshold(self) -> float:
         if self._deep_mode:
             return self.config.deep_relocalize_confidence_threshold
-        return self.config.relocalize_confidence_threshold
+        return self.config.handcrafted_relocalize_confidence_threshold
 
     def _update_quality_threshold(self) -> float:
         if self._deep_mode:
             return self.config.deep_update_quality_threshold
-        return self.config.update_quality_threshold
+        return self.config.handcrafted_update_quality_threshold
 
     def _template_confirmation_frames(self) -> int:
         if self._deep_mode:
@@ -342,18 +403,27 @@ class PanoSOTTracker:
         return self.config.handcrafted_scale_update_confidence
 
     def _state_trust(self, score: float) -> float:
-        if not self._deep_mode:
-            return 1.0
+        if self._deep_mode:
+            low_cfg = self.config.deep_state_trust_low
+            high_cfg = self.config.deep_state_trust_high
+            min_trust = self.config.deep_state_trust_min
+        else:
+            low_cfg = self.config.handcrafted_state_trust_low
+            high_cfg = self.config.handcrafted_state_trust_high
+            min_trust = self.config.handcrafted_state_trust_min
 
-        low = min(self.config.deep_state_trust_low, self.config.deep_state_trust_high - 1e-4)
-        high = max(self.config.deep_state_trust_high, low + 1e-4)
+        low = min(low_cfg, high_cfg - 1e-4)
+        high = max(high_cfg, low + 1e-4)
         if score <= low:
-            return self.config.deep_state_trust_min
+            return min_trust
         if score >= high:
             return 1.0
 
         alpha = (score - low) / (high - low)
-        trust = self.config.deep_state_trust_min + alpha * (1.0 - self.config.deep_state_trust_min)
+        trust = min_trust + alpha * (1.0 - min_trust)
+
+        if not self._deep_mode:
+            return float(trust)
 
         psr = max(float(self.runtime_stats.last_psr), 0.0)
         psr_scale = max(float(self.config.deep_state_trust_psr_scale), 1e-4)
@@ -385,11 +455,16 @@ class PanoSOTTracker:
     ) -> SphereState:
         self._last_state_trust = 1.0
         self._last_local_jump_gated = False
-        if not self._deep_mode:
-            return candidate
-
         trust = self._state_trust(score)
         self._last_state_trust = trust
+        if not self._deep_mode:
+            if trust >= 0.999:
+                return candidate
+            if self.lost_frames >= 2 and not self._last_flow_reliable and not self._last_color_reliable:
+                trust = min(trust, 0.20)
+                self._last_state_trust = trust
+            return self._blend_state_position(predicted, candidate, trust)
+
         if score >= self.config.deep_local_jump_gate_confidence and trust >= 0.999:
             return candidate
 
@@ -436,6 +511,11 @@ class PanoSOTTracker:
         self.lost_frames = 0
         self._consecutive_good = 0
         self.velocity[:] = 0.0
+        self._previous_frame_gray = self._flow_gray(frame) if not self._deep_mode else None
+        self._last_flow_reliable = False
+        if not self._deep_mode:
+            self._initialize_color_model(frame, init_bbox_xywh)
+            self._initialize_ncc_model(frame, init_bbox_xywh)
 
         self._templates.clear()
         self._descriptors.clear()
@@ -585,14 +665,43 @@ class PanoSOTTracker:
             angular_height=self.state.angular_height,
         )
 
-        best_state, best_score = self._local_search(frame, predicted)
-        candidate_trust = self._state_trust(best_score) if self._deep_mode else 1.0
+        flow_reliable = False
+        color_reliable = False
+        ncc_reliable = False
+        if not self._deep_mode:
+            if self._color_hue is None:
+                ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame)
+                if ncc_reliable:
+                    best_state = ncc_state
+                    best_score = max(ncc_score, self.config.handcrafted_high_confidence)
+                else:
+                    best_state, best_score = self._local_search(frame, predicted)
+            else:
+                flow_state, flow_reliable = self._predict_with_optical_flow(frame, self.state)
+                if flow_reliable:
+                    flow_score = self._score_state_handcrafted(frame, flow_state)
+                    best_state = flow_state
+                    best_score = max(flow_score, self.config.handcrafted_high_confidence)
+                else:
+                    color_state, color_reliable = self._predict_with_color(frame, predicted)
+                    if color_reliable:
+                        best_state = color_state
+                        best_score = self.config.handcrafted_high_confidence
+                    else:
+                        best_state, best_score = self._local_search(frame, predicted)
+        else:
+            best_state, best_score = self._local_search(frame, predicted)
+        candidate_trust = self._state_trust(best_score)
         deep_low_quality = (
             self._deep_mode
             and (
                 candidate_trust < self.config.deep_velocity_low_trust_threshold
                 or self.runtime_stats.last_psr < self.config.deep_velocity_low_psr_threshold
             )
+        )
+        handcrafted_low_quality = (
+            not self._deep_mode
+            and candidate_trust < 0.35
         )
 
         score_drop = self._last_high_conf_score - best_score
@@ -693,6 +802,8 @@ class PanoSOTTracker:
             decay = float(np.clip(self.config.deep_velocity_decay, 0.0, 1.0))
             self.velocity[0] = decay * self.velocity[0]
             self.velocity[1] = decay * self.velocity[1]
+        elif handcrafted_low_quality:
+            self.velocity *= 0.25
         else:
             self.velocity[0] = momentum * self.velocity[0] + (1.0 - momentum) * lon_delta
             self.velocity[1] = momentum * self.velocity[1] + (1.0 - momentum) * lat_delta
@@ -718,6 +829,8 @@ class PanoSOTTracker:
 
         self._sync_aliases()
         result_bbox = self._state_to_output_bbox(self.state, w, h)
+        if flow_reliable:
+            self._color_bbox = result_bbox.copy()
         self._record_debug_frame(
             frame=frame,
             predicted=predicted,
@@ -725,6 +838,8 @@ class PanoSOTTracker:
             score=best_score,
             relocalize_applied=relocalize_applied,
         )
+        if not self._deep_mode:
+            self._previous_frame_gray = self._flow_gray(frame)
         return result_bbox
 
     def _find_best_template(self, frame: np.ndarray, state: SphereState) -> int:
@@ -855,6 +970,488 @@ class PanoSOTTracker:
         fov_x, fov_y = self._handcrafted_match_fov(state)
         return tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
 
+    def _flow_gray(self, frame: np.ndarray) -> np.ndarray | None:
+        if cv2 is None or not self.config.handcrafted_flow_enabled:
+            return None
+        rgb = np.clip(frame * 255.0, 0.0, 255.0).astype(np.uint8)
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    def _initialize_color_model(self, frame: np.ndarray, bbox_xywh: np.ndarray) -> None:
+        self._color_hue = None
+        self._color_bbox = np.asarray(bbox_xywh, dtype=np.float32).copy()
+        self._last_color_reliable = False
+        if cv2 is None or not self.config.handcrafted_color_enabled:
+            return
+
+        rgb = np.clip(frame * 255.0, 0.0, 255.0).astype(np.uint8)
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        x, y, width, height = [int(round(v)) for v in bbox_xywh]
+        x0 = max(0, min(x, hsv.shape[1] - 1))
+        y0 = max(0, min(y, hsv.shape[0] - 1))
+        x1 = max(x0 + 1, min(x + width, hsv.shape[1]))
+        y1 = max(y0 + 1, min(y + height, hsv.shape[0]))
+        roi = hsv[y0:y1, x0:x1]
+        saturated = roi[..., 1] >= min(self.config.handcrafted_color_min_saturation, 50)
+        if saturated.mean() < 0.30:
+            return
+
+        hues = roi[..., 0][saturated].astype(np.float32)
+        if hues.size < self.config.handcrafted_color_min_area:
+            return
+        angles = hues / 180.0 * 2.0 * math.pi
+        concentration = math.hypot(float(np.cos(angles).mean()), float(np.sin(angles).mean()))
+        if concentration < 0.55:
+            return
+        mean_angle = math.atan2(float(np.sin(angles).mean()), float(np.cos(angles).mean()))
+        self._color_hue = (mean_angle % (2.0 * math.pi)) / (2.0 * math.pi) * 180.0
+
+    def _crop_erp_box(self, image: np.ndarray, bbox_xywh: np.ndarray) -> np.ndarray | None:
+        x, y, width, height = [int(round(v)) for v in bbox_xywh]
+        if width < 2 or height < 2 or x < 0 or x + width > image.shape[1]:
+            return None
+        y0 = max(0, min(y, image.shape[0] - 1))
+        y1 = max(y0 + 1, min(y + height, image.shape[0]))
+        return image[y0:y1, x : x + width]
+
+    def _initialize_ncc_model(self, frame: np.ndarray, bbox_xywh: np.ndarray) -> None:
+        self._ncc_initial_template = None
+        self._ncc_short_template = None
+        self._ncc_bbox = np.asarray(bbox_xywh, dtype=np.float32).copy()
+        self._ncc_velocity[:] = 0.0
+        self._ncc_flow_was_reliable = False
+        self._ncc_last_score = 1.0
+        self._last_ncc_reliable = False
+        if cv2 is None or not self.config.handcrafted_ncc_enabled:
+            return
+
+        gray = cv2.cvtColor(
+            np.clip(frame * 255.0, 0.0, 255.0).astype(np.uint8),
+            cv2.COLOR_RGB2GRAY,
+        )
+        template = self._crop_erp_box(gray, self._ncc_bbox)
+        if template is None:
+            return
+        self._ncc_initial_template = template.copy()
+        self._ncc_short_template = template.copy()
+
+    def _predict_with_ncc(self, frame: np.ndarray) -> tuple[SphereState, float, bool]:
+        self._last_ncc_reliable = False
+        if (
+            cv2 is None
+            or self._ncc_initial_template is None
+            or self._ncc_short_template is None
+            or self._ncc_bbox is None
+            or self.frame_shape is None
+        ):
+            if self.state is None:
+                raise RuntimeError("Tracker state is unavailable.")
+            return self.state, -1.0, False
+
+        gray = cv2.cvtColor(
+            np.clip(frame * 255.0, 0.0, 255.0).astype(np.uint8),
+            cv2.COLOR_RGB2GRAY,
+        )
+        image_height, image_width = self.frame_shape
+        box = self._ncc_bbox.astype(np.float64)
+        center_x = float(box[0] + 0.5 * box[2])
+        center_y = float(box[1] + 0.5 * box[3])
+        relative_motion = max(
+            abs(float(self._ncc_velocity[0])) / max(float(box[2]), 1.0),
+            abs(float(self._ncc_velocity[1])) / max(float(box[3]), 1.0),
+        )
+        should_estimate_flow = (
+            relative_motion >= self.config.handcrafted_ncc_flow_motion_trigger
+            or self._ncc_last_score < self.config.handcrafted_ncc_flow_score_trigger
+        )
+        flow_delta = self._estimate_ncc_flow(gray, box) if should_estimate_flow else None
+        if flow_delta is not None:
+            predicted_delta = flow_delta
+            self._ncc_velocity = flow_delta.copy()
+            self._ncc_flow_was_reliable = True
+        elif self._ncc_flow_was_reliable:
+            predicted_delta = self._ncc_velocity.copy()
+            self._ncc_flow_was_reliable = False
+        else:
+            predicted_delta = self._ncc_velocity.copy()
+        predicted_center_x = center_x + float(predicted_delta[0])
+        predicted_center_y = center_y + float(predicted_delta[1])
+        search_width = max(box[2] * self.config.handcrafted_ncc_search_factor, 220.0)
+        search_height = max(box[3] * self.config.handcrafted_ncc_search_factor, 180.0)
+        x0 = max(0, int(predicted_center_x - 0.5 * search_width))
+        y0 = max(0, int(predicted_center_y - 0.5 * search_height))
+        x1 = min(image_width, int(predicted_center_x + 0.5 * search_width))
+        y1 = min(image_height, int(predicted_center_y + 0.5 * search_height))
+        search = gray[y0:y1, x0:x1]
+        if search.shape[0] < 16 or search.shape[1] < 16:
+            if self.state is None:
+                raise RuntimeError("Tracker state is unavailable.")
+            return self.state, -1.0, False
+
+        scale_pairs = (
+            (0.85, 0.85),
+            (0.93, 0.93),
+            (1.0, 1.0),
+            (1.08, 1.08),
+            (1.16, 1.16),
+            (1.15, 0.90),
+            (1.25, 0.90),
+            (1.35, 0.85),
+            (1.0, 0.85),
+            (0.90, 1.10),
+        )
+        best_score = -1.0
+        best_box: np.ndarray | None = None
+        for width_scale, height_scale in scale_pairs:
+            width = max(12, int(round(box[2] * width_scale)))
+            height = max(12, int(round(box[3] * height_scale)))
+            if width >= search.shape[1] or height >= search.shape[0]:
+                continue
+
+            for source in (self._ncc_short_template, self._ncc_initial_template):
+                candidate_template = cv2.resize(
+                    source, (width, height), interpolation=cv2.INTER_LINEAR,
+                )
+                response = cv2.matchTemplate(
+                    search, candidate_template, cv2.TM_CCOEFF_NORMED,
+                )
+                response_height, response_width = response.shape
+                center_location_x = predicted_center_x - x0 - 0.5 * width
+                center_location_y = predicted_center_y - y0 - 0.5 * height
+                max_dx = box[2] * self.config.handcrafted_ncc_max_jump_ratio
+                max_dy = box[3] * self.config.handcrafted_ncc_max_jump_ratio
+                allowed_x0 = max(0, int(math.floor(center_location_x - max_dx)))
+                allowed_y0 = max(0, int(math.floor(center_location_y - max_dy)))
+                allowed_x1 = min(response_width, int(math.ceil(center_location_x + max_dx + 1)))
+                allowed_y1 = min(response_height, int(math.ceil(center_location_y + max_dy + 1)))
+                if allowed_x1 <= allowed_x0 or allowed_y1 <= allowed_y0:
+                    continue
+
+                allowed_response = response[allowed_y0:allowed_y1, allowed_x0:allowed_x1]
+                _, raw_score, _, local_location = cv2.minMaxLoc(allowed_response)
+                location_x = allowed_x0 + local_location[0]
+                location_y = allowed_y0 + local_location[1]
+                candidate_center_x = x0 + location_x + 0.5 * width
+                candidate_center_y = y0 + location_y + 0.5 * height
+                normalized_distance = math.hypot(
+                    (candidate_center_x - predicted_center_x) / search_width,
+                    (candidate_center_y - predicted_center_y) / search_height,
+                )
+                adjusted_score = (
+                    float(raw_score)
+                    - self.config.handcrafted_ncc_distance_penalty * normalized_distance
+                    - self.config.handcrafted_ncc_scale_penalty
+                    * (abs(math.log(width_scale)) + abs(math.log(height_scale)))
+                )
+                if adjusted_score > best_score:
+                    best_score = adjusted_score
+                    best_box = np.array(
+                        [x0 + location_x, y0 + location_y, width, height],
+                        dtype=np.float64,
+                    )
+
+        if best_box is None:
+            if self.state is None:
+                raise RuntimeError("Tracker state is unavailable.")
+            return self.state, best_score, False
+
+        measured_velocity = np.array(
+            [
+                best_box[0] + 0.5 * best_box[2] - center_x,
+                best_box[1] + 0.5 * best_box[3] - center_y,
+            ],
+            dtype=np.float64,
+        )
+        momentum = float(np.clip(self.config.handcrafted_ncc_velocity_momentum, 0.0, 1.0))
+        self._ncc_velocity = momentum * self._ncc_velocity + (1.0 - momentum) * measured_velocity
+        self._ncc_bbox = best_box.astype(np.float32)
+        self._ncc_last_score = float(best_score)
+        if best_score >= self.config.handcrafted_ncc_update_score:
+            patch = self._crop_erp_box(gray, self._ncc_bbox)
+            if patch is not None:
+                patch = cv2.resize(
+                    patch,
+                    (self._ncc_short_template.shape[1], self._ncc_short_template.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                rate = float(np.clip(self.config.handcrafted_ncc_update_rate, 0.0, 1.0))
+                self._ncc_short_template = cv2.addWeighted(
+                    self._ncc_short_template, 1.0 - rate, patch, rate, 0.0,
+                )
+
+        self._last_ncc_reliable = True
+        state = erp_bbox_to_state(self._ncc_bbox, image_width, image_height)
+        return state, best_score, True
+
+    def _estimate_ncc_flow(
+        self,
+        current_gray: np.ndarray,
+        box: np.ndarray,
+    ) -> np.ndarray | None:
+        previous_gray = self._previous_frame_gray
+        if cv2 is None or previous_gray is None:
+            return None
+
+        mask = np.zeros_like(previous_gray, dtype=np.uint8)
+        x0 = max(0, int(math.floor(box[0])))
+        y0 = max(0, int(math.floor(box[1])))
+        x1 = min(previous_gray.shape[1], int(math.ceil(box[0] + box[2])))
+        y1 = min(previous_gray.shape[0], int(math.ceil(box[1] + box[3])))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return None
+        mask[y0:y1, x0:x1] = 255
+
+        points = cv2.goodFeaturesToTrack(
+            previous_gray,
+            maxCorners=self.config.handcrafted_flow_max_points,
+            qualityLevel=0.005,
+            minDistance=3,
+            mask=mask,
+            blockSize=3,
+        )
+        if points is None or len(points) < self.config.handcrafted_ncc_flow_min_points:
+            return None
+
+        lk_args = {
+            "winSize": (31, 31),
+            "maxLevel": 4,
+            "criteria": (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                30,
+                0.01,
+            ),
+        }
+        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+            previous_gray, current_gray, points, None, **lk_args,
+        )
+        if next_points is None or status is None:
+            return None
+        back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
+            current_gray, previous_gray, next_points, None, **lk_args,
+        )
+        if back_points is None or back_status is None:
+            return None
+
+        forward_backward = np.linalg.norm(back_points - points, axis=2).reshape(-1)
+        valid = (
+            (status.reshape(-1) > 0)
+            & (back_status.reshape(-1) > 0)
+            & (forward_backward < self.config.handcrafted_ncc_flow_max_fb_error)
+        )
+        deltas = (next_points - points).reshape(-1, 2)[valid]
+        if len(deltas) < self.config.handcrafted_ncc_flow_min_points:
+            return None
+
+        median_delta = np.median(deltas, axis=0)
+        spread = float(np.median(np.linalg.norm(deltas - median_delta, axis=1)))
+        inlier_ratio = float(len(deltas) / len(points))
+        if (
+            inlier_ratio < self.config.handcrafted_ncc_flow_min_inlier_ratio
+            or spread > self.config.handcrafted_ncc_flow_max_spread
+        ):
+            return None
+        return median_delta.astype(np.float64)
+
+    def _predict_with_color(
+        self,
+        frame: np.ndarray,
+        anchor: SphereState,
+    ) -> tuple[SphereState, bool]:
+        self._last_color_reliable = False
+        if cv2 is None or self._color_hue is None or self._color_bbox is None or self.frame_shape is None:
+            return anchor, False
+
+        rgb = np.clip(frame * 255.0, 0.0, 255.0).astype(np.uint8)
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        image_height, image_width = self.frame_shape
+        previous_box = self._color_bbox.astype(np.float64)
+        center_x = float(previous_box[0] + 0.5 * previous_box[2])
+        center_y = float(previous_box[1] + 0.5 * previous_box[3])
+        search_width = min(
+            float(self.config.handcrafted_color_search_width),
+            max(220.0, previous_box[2] * 3.0),
+        )
+        search_height = min(
+            float(self.config.handcrafted_color_search_height),
+            max(220.0, previous_box[3] * 3.0),
+        )
+        x0 = max(0, int(center_x - 0.5 * search_width))
+        x1 = min(image_width, int(center_x + 0.5 * search_width))
+        y0 = max(0, int(center_y - 0.5 * search_height))
+        y1 = min(image_height, int(center_y + 0.5 * search_height))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return anchor, False
+
+        region = hsv[y0:y1, x0:x1]
+        hue_delta = np.abs(region[..., 0].astype(np.float32) - self._color_hue)
+        hue_delta = np.minimum(hue_delta, 180.0 - hue_delta)
+        mask = (
+            (hue_delta < self.config.handcrafted_color_hue_tolerance)
+            & (region[..., 1] >= self.config.handcrafted_color_min_saturation)
+            & (region[..., 2] >= self.config.handcrafted_color_min_value)
+        ).astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+
+        previous_area = max(float(previous_box[2] * previous_box[3]), 1.0)
+        best_box: np.ndarray | None = None
+        best_score = -float("inf")
+        for index in range(1, count):
+            comp_x, comp_y, comp_width, comp_height, area = [int(v) for v in stats[index]]
+            if area < self.config.handcrafted_color_min_area:
+                continue
+            if area > max(40000.0, previous_area * 5.0):
+                continue
+
+            candidate_center = np.array(
+                [x0 + comp_x + 0.5 * comp_width, y0 + comp_y + 0.5 * comp_height],
+                dtype=np.float64,
+            )
+            normalized_distance = np.linalg.norm(
+                (candidate_center - np.array([center_x, center_y]))
+                / np.array([search_width, search_height])
+            )
+            fill_ratio = float(area) / max(float(comp_width * comp_height), 1.0)
+            scale_change = abs(math.log(max(float(area), 1.0) / previous_area))
+            score = (
+                fill_ratio
+                - 1.5 * normalized_distance
+                - 0.25 * scale_change
+                + 0.1 * math.log(float(area) + 1.0)
+            )
+            if score > best_score:
+                best_score = score
+                best_box = np.array(
+                    [x0 + comp_x, y0 + comp_y, comp_width, comp_height],
+                    dtype=np.float64,
+                )
+
+        if best_box is None:
+            return anchor, False
+
+        max_scale = max(float(self.config.handcrafted_color_max_scale_step), 1.01)
+        width = float(np.clip(best_box[2], previous_box[2] / max_scale, previous_box[2] * max_scale))
+        height = float(np.clip(best_box[3], previous_box[3] / max_scale, previous_box[3] * max_scale))
+        best_box[0] += 0.5 * (best_box[2] - width)
+        best_box[1] += 0.5 * (best_box[3] - height)
+        best_box[2] = width
+        best_box[3] = height
+        best_box[0] = float(np.clip(best_box[0], 0.0, image_width - width))
+        best_box[1] = float(np.clip(best_box[1], 0.0, image_height - height))
+        self._color_bbox = best_box.astype(np.float32)
+        self._last_color_reliable = True
+        return erp_bbox_to_state(self._color_bbox, image_width, image_height), True
+
+    def _score_state_handcrafted(self, frame: np.ndarray, state: SphereState) -> float:
+        fov_x, fov_y = self._handcrafted_match_fov(state)
+        patch = tangent_patch(
+            frame,
+            state.lon,
+            state.lat,
+            fov_x,
+            fov_y,
+            self.config.template_size,
+            self.config.template_size,
+        )
+        return self._score_patch(patch)
+
+    def _predict_with_optical_flow(
+        self,
+        frame: np.ndarray,
+        state: SphereState,
+    ) -> tuple[SphereState, bool]:
+        self._last_flow_reliable = False
+        self._last_flow_inlier_ratio = 0.0
+        self._last_flow_fb_error = 0.0
+        self._last_flow_spread = 0.0
+        current_gray = self._flow_gray(frame)
+        previous_gray = self._previous_frame_gray
+        if cv2 is None or current_gray is None or previous_gray is None or self.frame_shape is None:
+            return state, False
+
+        image_height, image_width = self.frame_shape
+        bbox = self._state_to_output_bbox(state, image_width, image_height)
+        x, y, width, height = [float(v) for v in bbox]
+        if x + width > image_width:
+            return state, False
+
+        padding = self.config.handcrafted_flow_padding
+        x0 = max(0, int(math.floor(x - padding * width)))
+        y0 = max(0, int(math.floor(y - padding * height)))
+        x1 = min(image_width, int(math.ceil(x + (1.0 + padding) * width)))
+        y1 = min(image_height, int(math.ceil(y + (1.0 + padding) * height)))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return state, False
+
+        mask = np.zeros_like(previous_gray, dtype=np.uint8)
+        mask[y0:y1, x0:x1] = 255
+        points = cv2.goodFeaturesToTrack(
+            previous_gray,
+            maxCorners=self.config.handcrafted_flow_max_points,
+            qualityLevel=0.005,
+            minDistance=3,
+            mask=mask,
+            blockSize=3,
+        )
+        if points is None or len(points) < self.config.handcrafted_flow_min_points:
+            return state, False
+
+        lk_args = {
+            "winSize": (31, 31),
+            "maxLevel": 4,
+            "criteria": (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                30,
+                0.01,
+            ),
+        }
+        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+            previous_gray, current_gray, points, None, **lk_args,
+        )
+        if next_points is None or status is None:
+            return state, False
+        back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
+            current_gray, previous_gray, next_points, None, **lk_args,
+        )
+        if back_points is None or back_status is None:
+            return state, False
+
+        forward_backward = np.linalg.norm(back_points - points, axis=2).reshape(-1)
+        valid = (
+            (status.reshape(-1) > 0)
+            & (back_status.reshape(-1) > 0)
+            & (forward_backward < 1.5)
+        )
+        previous_points = points.reshape(-1, 2)[valid]
+        tracked_points = next_points.reshape(-1, 2)[valid]
+        if len(previous_points) < self.config.handcrafted_flow_min_points:
+            return state, False
+
+        deltas = tracked_points - previous_points
+        median_delta = np.median(deltas, axis=0)
+        spread = float(np.median(np.linalg.norm(deltas - median_delta, axis=1)))
+        fb_error = float(np.median(forward_backward[valid]))
+        inlier_ratio = float(len(previous_points) / len(points))
+        reliable = (
+            inlier_ratio >= self.config.handcrafted_flow_min_inlier_ratio
+            and fb_error <= self.config.handcrafted_flow_max_fb_error
+            and spread <= self.config.handcrafted_flow_max_spread
+        )
+        self._last_flow_inlier_ratio = inlier_ratio
+        self._last_flow_fb_error = fb_error
+        self._last_flow_spread = spread
+        self._last_flow_reliable = reliable
+        if not reliable:
+            return state, False
+
+        delta_lon = float(median_delta[0]) / image_width * 2.0 * math.pi
+        delta_lat = -float(median_delta[1]) / image_height * math.pi
+        return SphereState(
+            lon=float(wrap_lon(state.lon + delta_lon)),
+            lat=float(clamp_lat(state.lat + delta_lat)),
+            equatorial_width=state.equatorial_width,
+            angular_height=state.angular_height,
+        ), True
+
     def _should_capture_debug(self) -> bool:
         return self._debug_recorder is not None and self._debug_recorder.wants_frame(self._frame_count)
 
@@ -893,6 +1490,12 @@ class PanoSOTTracker:
                 "center_score": f"{self._last_center_score:.6f}",
                 "best_minus_center": f"{self._last_best_minus_center:.6f}",
                 "center_preferred": self._last_center_preferred,
+                "flow_reliable": self._last_flow_reliable,
+                "flow_inlier_ratio": f"{self._last_flow_inlier_ratio:.6f}",
+                "flow_fb_error": f"{self._last_flow_fb_error:.6f}",
+                "flow_spread": f"{self._last_flow_spread:.6f}",
+                "color_reliable": self._last_color_reliable,
+                "ncc_reliable": self._last_ncc_reliable,
                 "velocity_lat": f"{self.velocity[1]:.6f}",
                 "velocity_lon": f"{self.velocity[0]:.6f}",
             },
@@ -1147,6 +1750,7 @@ class PanoSOTTracker:
 
     def _local_search_handcrafted(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
         """原始手工特征局部搜索（保持不变）。"""
+        self.runtime_stats.local_searches += 1
         step_lon = max(
             predicted.equatorial_width * self.config.local_step_factor / max(math.cos(predicted.lat), 1e-3),
             math.radians(2.0),
@@ -1215,6 +1819,7 @@ class PanoSOTTracker:
             self._debug_payload = {}
             if best_patch is not None:
                 self._debug_payload["match_patch"] = best_patch
+        self.runtime_stats.last_score = float(best_score)
         return best_state, best_score
 
     def _local_search_deep(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
