@@ -838,6 +838,22 @@ class PanoSOTTracker:
             self.velocity[1] = momentum * self.velocity[1] + (1.0 - momentum) * lat_delta
         self.state = best_state
 
+        # P1 fix: 深度模式后台维护手工独立状态，避免完全失活
+        if self._deep_mode and self._hand_state is not None:
+            # 深度可信时（高分数 + 高PSR），手工速度跟随深度
+            deep_reliable = best_score >= self.config.deep_high_confidence and self.runtime_stats.last_psr >= 2.0
+            hand_uninitialized = self._frame_count <= 3 and np.all(self._hand_velocity == 0)
+            if deep_reliable or hand_uninitialized:
+                self._hand_velocity[0] = self.velocity[0]
+                self._hand_velocity[1] = self.velocity[1]
+            # 手工状态按自身速度外推
+            self._hand_state = SphereState(
+                lon=float(wrap_lon(self._hand_state.lon + self._hand_velocity[0])),
+                lat=float(clamp_lat(self._hand_state.lat + self._hand_velocity[1])),
+                equatorial_width=self._hand_state.equatorial_width,
+                angular_height=self._hand_state.angular_height,
+            )
+
 # --- 多模板更新（含遮挡/异常帧抑制）---
         if best_score >= update_quality_threshold:
             self._consecutive_good += 1
