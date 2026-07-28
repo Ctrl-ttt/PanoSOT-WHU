@@ -325,6 +325,9 @@ class PanoSOTTracker:
         self._ncc_flow_was_reliable = False
         self._ncc_last_score = 1.0
         self._last_ncc_reliable = False
+        # --- 手工模式独立状态（P1：不受深度漂移污染）---
+        self._hand_state: SphereState | None = None
+        self._hand_velocity = np.zeros(2, dtype=np.float32)
         self._debug_recorder: TrackerDebugRecorder | None = None
         if self.config.debug_dir:
             self._debug_recorder = TrackerDebugRecorder(
@@ -511,6 +514,8 @@ class PanoSOTTracker:
         self.lost_frames = 0
         self._consecutive_good = 0
         self.velocity[:] = 0.0
+        self._hand_velocity[:] = 0.0
+        self._hand_state = erp_bbox_to_state(init_bbox_xywh, w, h)
         self._previous_frame_gray = self._flow_gray(frame)
         self._last_flow_reliable = False
         self._initialize_color_model(frame, init_bbox_xywh)
@@ -702,6 +707,19 @@ class PanoSOTTracker:
                 hand_state, hand_score = self._try_handcrafted_fallback(frame, predicted)
                 if psr_low or hand_score > deep_score_before_fallback + 0.03:
                     best_state, best_score = hand_state, hand_score
+                    # P1: 手工模型独立状态回写，仅在手工具结果被采纳时更新
+                    if self._hand_state is not None:
+                        hand_lon_delta = lon_distance(best_state.lon, self._hand_state.lon)
+                        hand_lat_delta = best_state.lat - self._hand_state.lat
+                        h_momentum = self.config.motion_momentum
+                        self._hand_velocity[0] = h_momentum * self._hand_velocity[0] + (1.0 - h_momentum) * hand_lon_delta
+                        self._hand_velocity[1] = h_momentum * self._hand_velocity[1] + (1.0 - h_momentum) * hand_lat_delta
+                        self._hand_state = SphereState(
+                            lon=best_state.lon,
+                            lat=best_state.lat,
+                            equatorial_width=best_state.equatorial_width,
+                            angular_height=best_state.angular_height,
+                        )
         candidate_trust = self._state_trust(best_score)
         deep_low_quality = (
             self._deep_mode
@@ -1840,21 +1858,32 @@ class PanoSOTTracker:
         复用手工分支的路由逻辑：
         - 无颜色 → NCC 匹配
         - 有颜色 → 光流 → 颜色连通域 → 局部搜索
+
+        P1：使用独立的 _hand_state / _hand_velocity 作为锚点，避免被深度漂移污染。
         """
+        if self._hand_state is None:
+            hand_predicted = predicted
+        else:
+            hand_predicted = SphereState(
+                lon=float(wrap_lon(self._hand_state.lon + self._hand_velocity[0])),
+                lat=float(clamp_lat(self._hand_state.lat + self._hand_velocity[1])),
+                equatorial_width=self._hand_state.equatorial_width,
+                angular_height=self._hand_state.angular_height,
+            )
         if self._color_hue is None:
             ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame)
             if ncc_reliable:
                 return ncc_state, max(ncc_score, self.config.handcrafted_high_confidence)
-            return self._local_search_handcrafted(frame, predicted)
+            return self._local_search_handcrafted(frame, hand_predicted)
         else:
-            flow_state, flow_reliable = self._predict_with_optical_flow(frame, self.state)
+            flow_state, flow_reliable = self._predict_with_optical_flow(frame, self._hand_state or self.state)
             if flow_reliable:
                 flow_score = self._score_state_handcrafted(frame, flow_state)
                 return flow_state, max(flow_score, self.config.handcrafted_high_confidence)
-            color_state, color_reliable = self._predict_with_color(frame, predicted)
+            color_state, color_reliable = self._predict_with_color(frame, hand_predicted)
             if color_reliable:
                 return color_state, self.config.handcrafted_high_confidence
-            return self._local_search_handcrafted(frame, predicted)
+            return self._local_search_handcrafted(frame, hand_predicted)
 
     def _local_search_deep(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
         """深度特征 coarse-to-fine 搜索（三模板加权融合版本）。"""
