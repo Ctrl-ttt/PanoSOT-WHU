@@ -564,6 +564,44 @@ class PanoSOTTracker:
             )
         return init_bbox
 
+    def _sync_handcrafted_branch(
+        self,
+        frame: np.ndarray,
+        state: SphereState,
+        *,
+        copy_deep_velocity: bool = False,
+        reset_motion: bool = False,
+        refresh_aux_models: bool = False,
+    ) -> None:
+        if self.frame_shape is None:
+            return
+
+        image_height, image_width = self.frame_shape
+        bbox_xywh = self._state_to_output_bbox(state, image_width, image_height)
+        self._hand_state = SphereState(
+            lon=state.lon,
+            lat=state.lat,
+            equatorial_width=state.equatorial_width,
+            angular_height=state.angular_height,
+        )
+
+        if reset_motion:
+            self._hand_velocity[:] = 0.0
+        elif copy_deep_velocity:
+            self._hand_velocity[0] = self.velocity[0]
+            self._hand_velocity[1] = self.velocity[1]
+
+        self._color_bbox = bbox_xywh.copy()
+        self._ncc_bbox = bbox_xywh.copy()
+        self._ncc_velocity[:] = 0.0
+        self._last_flow_reliable = False
+        self._last_color_reliable = False
+        self._last_ncc_reliable = False
+
+        if refresh_aux_models:
+            self._initialize_color_model(frame, bbox_xywh)
+            self._initialize_ncc_model(frame, bbox_xywh)
+
     def _template_offsets(self) -> list[tuple[float, float]]:
         """生成 num_templates 个模板的初始位置偏移（弧度）。"""
         if self.num_templates <= 1:
@@ -732,6 +770,7 @@ class PanoSOTTracker:
             not self._deep_mode
             and candidate_trust < 0.35
         )
+        had_recent_tracking_instability = self.lost_frames > 0 or self._occlusion_frames > 0
 
         score_drop = self._last_high_conf_score - best_score
         is_abnormal = score_drop > self.config.max_score_drop and self._last_high_conf_score > 0.0
@@ -837,9 +876,26 @@ class PanoSOTTracker:
             self.velocity[0] = momentum * self.velocity[0] + (1.0 - momentum) * lon_delta
             self.velocity[1] = momentum * self.velocity[1] + (1.0 - momentum) * lat_delta
         self.state = best_state
+        handcrafted_resynced = False
+        if self._deep_mode and relocalize_applied:
+            self._sync_handcrafted_branch(
+                frame,
+                best_state,
+                reset_motion=True,
+                refresh_aux_models=True,
+            )
+            handcrafted_resynced = True
+        elif self._deep_mode and best_score >= high_confidence and had_recent_tracking_instability:
+            self._sync_handcrafted_branch(
+                frame,
+                best_state,
+                copy_deep_velocity=True,
+                refresh_aux_models=True,
+            )
+            handcrafted_resynced = True
 
         # P1 fix: 深度模式后台维护手工独立状态，避免完全失活
-        if self._deep_mode and self._hand_state is not None:
+        if self._deep_mode and self._hand_state is not None and not handcrafted_resynced:
             # 深度可信时（高分数 + 高PSR），手工速度跟随深度
             deep_reliable = best_score >= self.config.deep_high_confidence and self.runtime_stats.last_psr >= 2.0
             hand_uninitialized = self._frame_count <= 3 and np.all(self._hand_velocity == 0)
