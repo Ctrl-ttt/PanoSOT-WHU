@@ -21,6 +21,7 @@ from .geometry import (
     state_size_to_fov,
     state_to_erp_bbox,
     tangent_patch,
+    tangent_patches_batch,
     wrap_lon,
 )
 
@@ -328,6 +329,9 @@ class PanoSOTTracker:
         # --- 手工模式独立状态（P1：不受深度漂移污染）---
         self._hand_state: SphereState | None = None
         self._hand_velocity = np.zeros(2, dtype=np.float32)
+        # --- 深度模式搜索特征缓存（P1-1）---
+        self._cached_search_feat: Any = None
+        self._cached_search_state: SphereState | None = None
         self._debug_recorder: TrackerDebugRecorder | None = None
         if self.config.debug_dir:
             self._debug_recorder = TrackerDebugRecorder(
@@ -532,6 +536,8 @@ class PanoSOTTracker:
         self._occlusion_frames = 0
         self._last_high_conf_score = 0.0
         self._last_relocalize_frame = -self.config.relocalize_min_interval
+        self._cached_search_feat = None
+        self._cached_search_state = None
         self.reset_runtime_stats()
 
         self._add_template(frame, self.state, template_type="init")
@@ -891,10 +897,19 @@ class PanoSOTTracker:
         best_idx = 0
         best_score = -1.0
         if self._deep_mode:
-            fov_x, fov_y = state_size_to_fov(state, enlarge=self.config.deep_search_enlarge)
-            search_feat = self._extract_search_feat(
-                frame, state.lon, state.lat, fov_x, fov_y, refine=True,
-            )
+            # P1-1: 优先复用缓存的 search_feat，避免冗余提取
+            search_feat = None
+            if (self._cached_search_feat is not None
+                    and self._cached_search_state is not None):
+                lon_diff = abs(lon_distance(state.lon, self._cached_search_state.lon))
+                lat_diff = abs(state.lat - self._cached_search_state.lat)
+                if lon_diff < 0.01 and lat_diff < 0.01:
+                    search_feat = self._cached_search_feat
+            if search_feat is None:
+                fov_x, fov_y = state_size_to_fov(state, enlarge=self.config.deep_search_enlarge)
+                search_feat = self._extract_search_feat(
+                    frame, state.lon, state.lat, fov_x, fov_y, refine=True,
+                )
             for i, t_feat in enumerate(self._template_feats):
                 template_bank = self._template_feat_banks[i] if i < len(self._template_feat_banks) else [t_feat]
                 score, _ = self._score_template_bank(template_bank, search_feat)
@@ -929,7 +944,9 @@ class PanoSOTTracker:
 
                 new_type = "long" if t_type == "short" else "short"
                 self._add_template(frame, state, template_type=new_type)
-                best_idx = self._find_best_template(frame, state)
+                # P1-1: 新添加的模板在列表末尾，与当前状态最匹配，直接设为 best_idx
+                # 避免二次 _find_best_template 造成的冗余 search_feat 提取
+                best_idx = len(self._templates) - 1
 
         new_patch = self._extract_template(frame, state)
         for i in range(len(self._templates)):
@@ -1509,12 +1526,16 @@ class PanoSOTTracker:
     ) -> None:
         if self._debug_recorder is None or self.frame_shape is None:
             return
+        # P3-2: 惰性求值 — 仅对录制帧构造 metadata，非录制帧跳过所有开销
+        if not self._debug_recorder.wants_frame(self._frame_count):
+            return
 
         predicted_bbox = self._state_to_output_bbox(predicted, self.frame_shape[1], self.frame_shape[0])
         artifacts = dict(self._debug_payload or {})
         if self._templates:
             artifacts.setdefault("template_patch", self._templates[0])
 
+        # metadata 仅在确认需要录制时才构造（含 f-string）
         self._debug_recorder.record_step(
             frame_index=self._frame_count,
             frame=frame,
@@ -1566,6 +1587,30 @@ class PanoSOTTracker:
         rotated = image.rotate(float(angle_deg), resample=Image.BILINEAR)
         return np.asarray(rotated, dtype=np.float32) / 255.0
 
+    def _rotate_patch_gpu_or_cpu(self, patch: np.ndarray, angle_deg: float) -> np.ndarray:
+        """P2-2: 深度模式 + CUDA 时使用 GPU 旋转，否则回退到 PIL。"""
+        if abs(angle_deg) < 1e-6:
+            return patch
+        if not self._deep_mode or self.deep_extractor is None or self.deep_extractor.device.type != "cuda":
+            return self._rotate_patch(patch, angle_deg)
+
+        torch = getattr(self.deep_extractor, "_torch", None)
+        if torch is None:
+            return self._rotate_patch(patch, angle_deg)
+
+        # GPU 旋转：affine_grid + grid_sample
+        tensor = torch.from_numpy(patch).permute(2, 0, 1).unsqueeze(0).to(self.deep_extractor.device)
+        angle_rad = math.radians(angle_deg)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        theta = torch.tensor(
+            [[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0]],
+            dtype=torch.float32, device=self.deep_extractor.device,
+        ).unsqueeze(0)
+        grid = torch.nn.functional.affine_grid(theta, tensor.shape, align_corners=False)
+        rotated = torch.nn.functional.grid_sample(tensor, grid, mode="bilinear", align_corners=False)
+        return rotated.squeeze(0).permute(1, 2, 0).cpu().numpy()
+
     def _is_polar(self, lat: float) -> bool:
         """判断纬度是否处于极区（高畸变区域）。"""
         return abs(math.degrees(lat)) > self.config.polar_lat_threshold_deg
@@ -1584,12 +1629,7 @@ class PanoSOTTracker:
 
     def _extract_template_feat_bank(self, frame: np.ndarray, state: SphereState,
                                      trust_location: bool = False) -> list[Any]:
-        """提取模板的深度特征bank（含旋转增强）。
-
-        Args:
-            trust_location: True=位置可信（初始化/添加模板），用极区多旋转角；
-                           False=跟踪更新，只用正常旋转角避免错误匹配。
-        """
+        """提取模板的深度特征bank（含旋转增强，批量前向优化版）。"""
         size = self.config.deep_template_size
 
         if self.frame_shape is not None:
@@ -1607,11 +1647,17 @@ class PanoSOTTracker:
         angles = self._get_rotation_angles(state.lat) if trust_location else self.config.deep_template_rotations_deg
         fov_x, fov_y = state_size_to_fov(state, enlarge=enlarge)
         patch = tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
-        feat_bank: list[Any] = []
-        for angle_deg in angles:
-            rotated_patch = self._rotate_patch(patch, angle_deg)
-            feat_bank.append(self.deep_extractor.extract_template_feature(rotated_patch))
-        return feat_bank
+
+        # P1-1: 批量旋转 + 批量前向，将 N 次前向压缩为 1 次
+        rotated_patches = [self._rotate_patch_gpu_or_cpu(patch, angle_deg) for angle_deg in angles]
+        if len(rotated_patches) == 1:
+            return [self.deep_extractor.extract_template_feature(rotated_patches[0])]
+        batch_feats = self.deep_extractor.extract_template_features_batch(rotated_patches)
+        # 将 [N, C, h, w] 拆分为 list of [1, C, h, w]
+        torch = getattr(self.deep_extractor, "_torch", None)
+        if torch is not None and batch_feats.shape[0] > 1:
+            return [batch_feats[i : i + 1] for i in range(batch_feats.shape[0])]
+        return [batch_feats]
 
     def _extract_search_feat(
         self, frame: np.ndarray, lon: float, lat: float, fov_x: float, fov_y: float, refine: bool = False
@@ -1902,7 +1948,7 @@ class PanoSOTTracker:
             return self._local_search_handcrafted(frame, hand_predicted)
 
     def _local_search_deep(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
-        """深度特征 coarse-to-fine 搜索（三模板加权融合版本）。"""
+        """深度特征 coarse-to-fine 搜索（批量 coarse + top-K refine 优化版）。"""
         self.runtime_stats.local_searches += 1
         best_state = predicted
         best_score = -1.0
@@ -1923,7 +1969,11 @@ class PanoSOTTracker:
         )
 
         scale_factors = self.config.deep_scale_factors
+        refine_topk = 2  # 只对 top-2 尺度做 refine
 
+        # ---- 批量 coarse 特征提取 ----
+        fovs: list[tuple[float, float, float, float]] = []  # (fov_x, fov_y, candidate_w, candidate_h)
+        coarse_patches: list[np.ndarray] = []
         for scale in scale_factors:
             candidate_width, candidate_height = self._clamp_target_size(
                 predicted.equatorial_width * scale,
@@ -1933,32 +1983,45 @@ class PanoSOTTracker:
                 SphereState(predicted.lon, predicted.lat, candidate_width, candidate_height),
                 enlarge=search_enlarge,
             )
-
-            scale_best_score = -1.0
-            scale_best_state = predicted
-            scale_best_debug_payload: dict[str, np.ndarray] | None = None
-
-            coarse_patch = None
-            if capture_debug:
-                coarse_patch = self._extract_search_patch(
-                    frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
-                )
-                search_feat = self.deep_extractor.extract_search_feature(coarse_patch, refine=False)
-            else:
-                search_feat = self._extract_search_feat(
-                    frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
-                )
-            response, reference_template = self._fused_template_response(search_feat)
-            score, (off_y, off_x), _ = self._response_score_offset(
-                response, reference_template, search_feat,
+            fovs.append((fov_x, fov_y, candidate_width, candidate_height))
+            patch = self._extract_search_patch(
+                frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
             )
-            coarse_response = self._response_to_numpy(response) if capture_debug else None
+            coarse_patches.append(patch)
+
+        # 1次前向替代5次
+        coarse_feats = self.deep_extractor.extract_search_features_batch(
+            coarse_patches, refine=False,
+        )
+
+        # ---- 逐尺度做模板匹配（轻量，无需前向）----
+        coarse_results: list[tuple[float, tuple[float, float], int, float, float, float, float]] = []
+        # (combined_score, (coarse_lon, coarse_lat), feat_idx, fov_x, fov_y, c_width, c_height)
+        for i, (fov_x, fov_y, candidate_width, candidate_height) in enumerate(fovs):
+            feat = coarse_feats[i : i + 1]
+            response, reference_template = self._fused_template_response(feat)
+            score, (off_y, off_x), _ = self._response_score_offset(
+                response, reference_template, feat,
+            )
 
             coarse_lon = wrap_lon(predicted.lon + off_x * fov_x)
             coarse_lat = clamp_lat(predicted.lat + off_y * fov_y)
 
+            # 暂时只用 coarse 分数排序，combined 在 refine 后计算
+            coarse_score = score - 0.02 * abs(scale_factors[i] - 1.0)
+            coarse_results.append((coarse_score, (float(coarse_lon), float(coarse_lat)), i, fov_x, fov_y, candidate_width, candidate_height))
+
+        # 按 coarse 分数排序，只对 top-K 做 refine
+        coarse_results.sort(key=lambda x: x[0], reverse=True)
+
+        best_refine_feat = None
+        for rank, (coarse_score, (coarse_lon, coarse_lat), feat_idx, fov_x, fov_y, candidate_width, candidate_height) in enumerate(coarse_results):
+            if rank >= refine_topk:
+                break
+
             refine_fov_x = fov_x * 0.5
             refine_fov_y = fov_y * 0.5
+
             refine_patch = None
             if capture_debug:
                 refine_patch = self._extract_search_patch(
@@ -1973,41 +2036,39 @@ class PanoSOTTracker:
             refine_score, (roff_y, roff_x), refine_meta = self._response_score_offset(
                 refine_response, refine_reference, refine_feat,
             )
-            refine_response_np = self._response_to_numpy(refine_response) if capture_debug else None
 
             refined_lon = wrap_lon(coarse_lon + roff_x * refine_fov_x)
             refined_lat = clamp_lat(coarse_lat + roff_y * refine_fov_y)
 
-            combined_score = 0.3 * score + 0.7 * refine_score
-            combined_score -= 0.02 * abs(scale - 1.0)
+            # 用原始 coarse 分数（不含 scale 惩罚）和 refine 分数组合
+            orig_coarse_score = coarse_results[rank][0] + 0.02 * abs(scale_factors[feat_idx] - 1.0)
+            combined_score = 0.3 * orig_coarse_score + 0.7 * refine_score
+            combined_score -= 0.02 * abs(scale_factors[feat_idx] - 1.0)
 
-            if combined_score > scale_best_score:
-                scale_best_score = combined_score
-                scale_best_state = SphereState(
+            if combined_score > best_score:
+                best_score = combined_score
+                best_state = SphereState(
                     lon=float(refined_lon), lat=float(refined_lat),
                     equatorial_width=float(candidate_width),
                     angular_height=float(candidate_height),
                 )
-                if capture_debug:
-                    scale_best_debug_payload = {}
-                    if coarse_patch is not None:
-                        scale_best_debug_payload["coarse_patch"] = coarse_patch
-                    if coarse_response is not None:
-                        scale_best_debug_payload["coarse_response"] = coarse_response
-                    if refine_patch is not None:
-                        scale_best_debug_payload["refine_patch"] = refine_patch
-                    if refine_response_np is not None:
-                        scale_best_debug_payload["refine_response"] = refine_response_np
-
-            if scale_best_score > best_score:
-                best_score = scale_best_score
-                best_state = scale_best_state
                 self.runtime_stats.last_score = float(best_score)
                 self.runtime_stats.last_peak = refine_meta["peak"]
                 self.runtime_stats.last_psr = refine_meta["psr"]
                 self.runtime_stats.last_apce = refine_meta["apce"]
+                best_refine_feat = refine_feat
+
                 if capture_debug:
-                    best_debug_payload = scale_best_debug_payload
+                    best_debug_payload = {}
+                    if rank < len(coarse_patches):
+                        best_debug_payload["coarse_patch"] = coarse_patches[feat_idx]
+                    if refine_patch is not None:
+                        best_debug_payload["refine_patch"] = refine_patch
+
+        # P1-1: 缓存最佳 search_feat 供 _find_best_template 复用
+        if best_refine_feat is not None:
+            self._cached_search_feat = best_refine_feat
+            self._cached_search_state = best_state
 
         if capture_debug:
             self._debug_payload = best_debug_payload or {}
@@ -2018,6 +2079,10 @@ class PanoSOTTracker:
         frame: np.ndarray,
         predicted: SphereState,
     ) -> tuple[SphereState, float]:
+        # 深度模式走批量化路径，大幅减少前向传播次数
+        if self._deep_mode:
+            return self._global_relocalize_deep_batched(frame, predicted)
+
         coarse_stride_lon = self.config.relocalize_stride_deg
         coarse_stride_lat = self.config.relocalize_lat_stride_deg
         fine_stride_lon = coarse_stride_lon * 0.5
@@ -2046,24 +2111,18 @@ class PanoSOTTracker:
                 angular_height=predicted.angular_height * reloc_scale,
             )
 
-            if self._deep_mode:
-                fov_x, fov_y = state_size_to_fov(reloc_state, enlarge=self.config.deep_search_enlarge)
-            else:
-                fov_x, fov_y = self._handcrafted_match_fov(reloc_state)
+            fov_x, fov_y = self._handcrafted_match_fov(reloc_state)
 
             candidates: list[tuple[float, SphereState]] = []
 
             for lon in lon_values_coarse:
                 for lat in lat_values_coarse:
                     lat_val = clamp_lat(float(lat))
-                    if self._deep_mode:
-                        score = self._reloc_score_deep(frame, float(lon), lat_val, fov_x, fov_y)
-                    else:
-                        patch = tangent_patch(
-                            frame, float(lon), lat_val, fov_x, fov_y,
-                            self.config.template_size, self.config.template_size,
-                        )
-                        score = self._score_patch(patch)
+                    patch = tangent_patch(
+                        frame, float(lon), lat_val, fov_x, fov_y,
+                        self.config.template_size, self.config.template_size,
+                    )
+                    score = self._score_patch(patch)
                     dist_lon = abs(lon_distance(float(lon), predicted.lon))
                     dist_lat = abs(lat_val - predicted.lat)
                     score -= 0.01 * dist_lon + 0.02 * dist_lat
@@ -2093,14 +2152,11 @@ class PanoSOTTracker:
                     for dlat in lat_range:
                         lon_val = wrap_lon(coarse_state.lon + dlon)
                         lat_val = clamp_lat(coarse_state.lat + dlat)
-                        if self._deep_mode:
-                            score = self._reloc_score_deep(frame, float(lon_val), float(lat_val), fov_x, fov_y)
-                        else:
-                            patch = tangent_patch(
-                                frame, float(lon_val), float(lat_val), fov_x, fov_y,
-                                self.config.template_size, self.config.template_size,
-                            )
-                            score = self._score_patch(patch)
+                        patch = tangent_patch(
+                            frame, float(lon_val), float(lat_val), fov_x, fov_y,
+                            self.config.template_size, self.config.template_size,
+                        )
+                        score = self._score_patch(patch)
                         fine_candidates.append((score, SphereState(
                             lon=float(lon_val), lat=float(lat_val),
                             equatorial_width=coarse_state.equatorial_width,
@@ -2121,6 +2177,189 @@ class PanoSOTTracker:
                 if final_score > best_score:
                     best_state = refined_state
                     best_score = final_score
+
+            if best_score > best_overall_score:
+                best_overall_score = best_score
+                best_overall_state = best_state
+
+        return best_overall_state, best_overall_score
+
+    def _global_relocalize_deep_batched(
+        self,
+        frame: np.ndarray,
+        predicted: SphereState,
+    ) -> tuple[SphereState, float]:
+        """批量化深度模式重定位：将 ~300+ 前向压缩到 ~7 次。"""
+        coarse_stride_lon = self.config.relocalize_stride_deg
+        coarse_stride_lat = self.config.relocalize_lat_stride_deg
+        fine_stride_lon = coarse_stride_lon * 0.5
+        fine_stride_lat = coarse_stride_lat * 0.5
+
+        lon_values_coarse = np.deg2rad(
+            np.arange(-180.0, 180.0, coarse_stride_lon, dtype=np.float32)
+        )
+        lat_values_coarse = np.deg2rad(
+            np.arange(-72.0, 72.1, coarse_stride_lat, dtype=np.float32)
+        )
+        # 构建粗网格坐标矩阵
+        grid_lon, grid_lat = np.meshgrid(lon_values_coarse, lat_values_coarse)
+        grid_lon_flat = grid_lon.ravel()
+        grid_lat_flat = grid_lat.ravel()
+
+        # 多尺度搜索
+        scales = [1.0]
+        if self.config.relocalize_multi_scale:
+            scales.extend(self.config.relocalize_extra_scales)
+
+        best_overall_state = predicted
+        best_overall_score = -1.0
+
+        # 准备模板特征（init-only 或全部）
+        if self.config.relocalize_use_init_only and self._template_feat_banks:
+            template_feats = self._template_feat_banks[0]  # init bank
+        elif self._template_feat_banks:
+            # 合并所有 bank 的特征
+            template_feats = []
+            for bank in self._template_feat_banks:
+                template_feats.extend(bank)
+        else:
+            template_feats = list(self._template_feats) if self._template_feats else []
+        if not template_feats:
+            return predicted, -1.0
+
+        for reloc_scale in scales:
+            reloc_state = SphereState(
+                lon=predicted.lon,
+                lat=predicted.lat,
+                equatorial_width=predicted.equatorial_width * reloc_scale,
+                angular_height=predicted.angular_height * reloc_scale,
+            )
+            fov_x, fov_y = state_size_to_fov(reloc_state, enlarge=self.config.deep_search_enlarge)
+
+            # ---- 粗搜索：批量提取 + 批量匹配 ----
+            # 批量 tangent_patch
+            coarse_lats = clamp_lat(grid_lat_flat)
+            coarse_patches = tangent_patches_batch(
+                frame, grid_lon_flat, coarse_lats,
+                fov_x, fov_y,
+                self.config.coarse_search_size, self.config.coarse_search_size,
+            )
+            # 批量特征提取（1次前向，替代 N 次）
+            search_feats = self.deep_extractor.extract_search_features_batch(
+                list(coarse_patches), refine=False, chunk_size=32,
+            )
+            # 批量匹配：K 个模板 vs N 个搜索区域
+            torch = getattr(self.deep_extractor, "_torch", None)
+            K = len(template_feats)
+            template_tensor = torch.cat(template_feats, dim=0) if K > 1 else template_feats[0]
+            if K > 1 and search_feats.shape[0] > 0:
+                responses = self.similarity_head.forward_n_to_m(template_tensor, search_feats)
+            else:
+                responses = self.similarity_head(template_tensor, search_feats)
+
+            # 提取每个搜索位置的峰值分数
+            N = search_feats.shape[0]
+            scores = []
+            for i in range(N):
+                resp_np = responses[i:i+1].squeeze().detach().float().cpu().numpy()
+                if resp_np.ndim == 0:
+                    resp_np = resp_np.reshape(1, 1)
+                peak = float(resp_np.max())
+                # PSR 简化：用峰值与均值之比作为分数
+                side_mean = float(resp_np.mean())
+                side_std = float(resp_np.std()) if resp_np.size > 1 else 1.0
+                psr = (peak - side_mean) / max(side_std, 1e-6)
+                score = 1.0 / (1.0 + math.exp(-(psr - 2.0) / 2.0))
+                scores.append(score)
+
+            # 加距离惩罚
+            for i in range(N):
+                dist_lon = abs(lon_distance(float(grid_lon_flat[i]), predicted.lon))
+                dist_lat = abs(float(coarse_lats[i]) - predicted.lat)
+                scores[i] -= 0.01 * dist_lon + 0.02 * dist_lat
+
+            # 取 top-k
+            topk_indices = np.argsort(scores)[::-1][: self.config.relocalize_topk]
+
+            # ---- 精搜索：对 top-k 候选做局部细化 ----
+            best_state = predicted
+            best_score = -1.0
+
+            fine_lons_list = []
+            fine_lats_list = []
+            fine_parent_indices = []  # 记录每个 fine 候选属于哪个 coarse topk
+
+            lon_range = np.deg2rad(np.arange(
+                -fine_stride_lon, fine_stride_lon + 1e-6, fine_stride_lon, dtype=np.float32
+            ))
+            lat_range = np.deg2rad(np.arange(
+                -fine_stride_lat, fine_stride_lat + 1e-6, fine_stride_lat, dtype=np.float32
+            ))
+
+            for topk_idx in topk_indices:
+                if scores[topk_idx] < self._occlusion_threshold():
+                    continue
+                coarse_lon = float(grid_lon_flat[topk_idx])
+                coarse_lat = float(coarse_lats[topk_idx])
+                for dlon in lon_range:
+                    for dlat in lat_range:
+                        fine_lons_list.append(wrap_lon(coarse_lon + dlon))
+                        fine_lats_list.append(clamp_lat(coarse_lat + dlat))
+                        fine_parent_indices.append(topk_idx)
+
+            if fine_lons_list:
+                fine_lons_arr = np.array(fine_lons_list, dtype=np.float64)
+                fine_lats_arr = np.array(fine_lats_list, dtype=np.float64)
+                fine_patches = tangent_patches_batch(
+                    frame, fine_lons_arr, fine_lats_arr,
+                    fov_x, fov_y,
+                    self.config.coarse_search_size, self.config.coarse_search_size,
+                )
+                fine_search_feats = self.deep_extractor.extract_search_features_batch(
+                    list(fine_patches), refine=False, chunk_size=32,
+                )
+                if K > 1 and fine_search_feats.shape[0] > 0:
+                    fine_responses = self.similarity_head.forward_n_to_m(template_tensor, fine_search_feats)
+                else:
+                    fine_responses = self.similarity_head(template_tensor, fine_search_feats)
+
+                fine_scores = []
+                for i in range(fine_search_feats.shape[0]):
+                    resp_np = fine_responses[i:i+1].squeeze().detach().float().cpu().numpy()
+                    if resp_np.ndim == 0:
+                        resp_np = resp_np.reshape(1, 1)
+                    peak = float(resp_np.max())
+                    side_mean = float(resp_np.mean())
+                    side_std = float(resp_np.std()) if resp_np.size > 1 else 1.0
+                    psr = (peak - side_mean) / max(side_std, 1e-6)
+                    score = 1.0 / (1.0 + math.exp(-(psr - 2.0) / 2.0))
+                    fine_scores.append(score)
+
+                best_fine_idx = int(np.argmax(fine_scores))
+                best_fine_state = SphereState(
+                    lon=float(fine_lons_arr[best_fine_idx]),
+                    lat=float(fine_lats_arr[best_fine_idx]),
+                    equatorial_width=reloc_state.equatorial_width,
+                    angular_height=reloc_state.angular_height,
+                )
+                best_fine_score = fine_scores[best_fine_idx]
+            else:
+                best_fine_idx = topk_indices[0] if len(topk_indices) > 0 else 0
+                best_fine_state = SphereState(
+                    lon=float(grid_lon_flat[best_fine_idx]),
+                    lat=float(coarse_lats[best_fine_idx]),
+                    equatorial_width=reloc_state.equatorial_width,
+                    angular_height=reloc_state.angular_height,
+                )
+                best_fine_score = scores[best_fine_idx] if best_fine_idx < len(scores) else -1.0
+
+            # 局部搜索细化最佳候选
+            refined_state, refined_score = self._local_search(frame, best_fine_state)
+            final_score = max(refined_score, best_fine_score)
+
+            if final_score > best_score:
+                best_state = refined_state
+                best_score = final_score
 
             if best_score > best_overall_score:
                 best_overall_score = best_score

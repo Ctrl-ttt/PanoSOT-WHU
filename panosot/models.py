@@ -53,6 +53,48 @@ class DepthwiseXCorrHead:
 
     __call__ = forward
 
+    def forward_n_to_m(
+        self,
+        template_feat: Any,
+        search_feat: Any,
+    ) -> Any:
+        """N-to-M 批量匹配：K 个模板与 N 个搜索区域计算响应。
+
+        对每个模板 k，一次 batch conv2d 与所有 N 个 search 计算，
+        最后取每个 search 对所有 template 的最佳响应。
+        总共 K 次 conv2d（每次已 batch 化处理 N 个 search），远优于 K*N 次。
+
+        Args:
+            template_feat: [K, C, h, w] — K 个模板特征
+            search_feat: [N, C, H, W] — N 个搜索区域特征
+
+        Returns:
+            [N, 1, H', W'] — 每个 search 对所有 template 的最佳响应
+        """
+        K = int(template_feat.shape[0])
+        N = int(search_feat.shape[0])
+        area = max(int(template_feat.shape[-2]) * int(template_feat.shape[-1]), 1)
+
+        if K == 1:
+            # 退化为标准 1-to-N 匹配
+            return self.forward(template_feat.expand(N, -1, -1, -1), search_feat)
+
+        # 循环 K 个模板，每次 batch 处理 N 个 search
+        all_responses = []
+        for k in range(K):
+            # template [1, C, h, w] → expand [N, C, h, w]，与 search [N, C, H, W] 1-to-1 匹配
+            t = template_feat[k : k + 1].expand(N, -1, -1, -1)
+            resp = self._channelwise_conv(t, search_feat)  # [N, C, H', W']
+            resp = resp.mean(dim=1, keepdim=True) / area   # [N, 1, H', W']
+            all_responses.append(resp)
+
+        # [K, N, 1, H', W'] → 取每个 search 的最佳 template
+        torch = self._torch
+        stacked = all_responses[0]  # 初始化
+        for r in all_responses[1:]:
+            stacked = torch.maximum(stacked, r)  # element-wise max → [N, 1, H', W']
+        return stacked
+
 
 def build_backbone(name: str, pretrained: bool = True, feature_layer: int | None = 12) -> Any:
     torch, nn = _require_torch()
