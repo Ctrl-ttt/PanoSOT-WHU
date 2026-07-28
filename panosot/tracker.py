@@ -511,11 +511,10 @@ class PanoSOTTracker:
         self.lost_frames = 0
         self._consecutive_good = 0
         self.velocity[:] = 0.0
-        self._previous_frame_gray = self._flow_gray(frame) if not self._deep_mode else None
+        self._previous_frame_gray = self._flow_gray(frame)
         self._last_flow_reliable = False
-        if not self._deep_mode:
-            self._initialize_color_model(frame, init_bbox_xywh)
-            self._initialize_ncc_model(frame, init_bbox_xywh)
+        self._initialize_color_model(frame, init_bbox_xywh)
+        self._initialize_ncc_model(frame, init_bbox_xywh)
 
         self._templates.clear()
         self._descriptors.clear()
@@ -691,6 +690,11 @@ class PanoSOTTracker:
                         best_state, best_score = self._local_search(frame, predicted)
         else:
             best_state, best_score = self._local_search(frame, predicted)
+            # 深度模式低置信时，用手工混合追踪兜底
+            if best_score < self.config.deep_occlusion_threshold:
+                hand_state, hand_score = self._try_handcrafted_fallback(frame, predicted)
+                if hand_score > best_score + 0.03:
+                    best_state, best_score = hand_state, hand_score
         candidate_trust = self._state_trust(best_score)
         deep_low_quality = (
             self._deep_mode
@@ -838,8 +842,7 @@ class PanoSOTTracker:
             score=best_score,
             relocalize_applied=relocalize_applied,
         )
-        if not self._deep_mode:
-            self._previous_frame_gray = self._flow_gray(frame)
+        self._previous_frame_gray = self._flow_gray(frame)
         return result_bbox
 
     def _find_best_template(self, frame: np.ndarray, state: SphereState) -> int:
@@ -1821,6 +1824,30 @@ class PanoSOTTracker:
                 self._debug_payload["match_patch"] = best_patch
         self.runtime_stats.last_score = float(best_score)
         return best_state, best_score
+
+    def _try_handcrafted_fallback(
+        self, frame: np.ndarray, predicted: SphereState,
+    ) -> tuple[SphereState, float]:
+        """深度模式低置信时，尝试手工混合追踪（光流/NCC/颜色）作为兜底。
+
+        复用手工分支的路由逻辑：
+        - 无颜色 → NCC 匹配
+        - 有颜色 → 光流 → 颜色连通域 → 局部搜索
+        """
+        if self._color_hue is None:
+            ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame)
+            if ncc_reliable:
+                return ncc_state, max(ncc_score, self.config.handcrafted_high_confidence)
+            return self._local_search_handcrafted(frame, predicted)
+        else:
+            flow_state, flow_reliable = self._predict_with_optical_flow(frame, self.state)
+            if flow_reliable:
+                flow_score = self._score_state_handcrafted(frame, flow_state)
+                return flow_state, max(flow_score, self.config.handcrafted_high_confidence)
+            color_state, color_reliable = self._predict_with_color(frame, predicted)
+            if color_reliable:
+                return color_state, self.config.handcrafted_high_confidence
+            return self._local_search_handcrafted(frame, predicted)
 
     def _local_search_deep(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
         """深度特征 coarse-to-fine 搜索（三模板加权融合版本）。"""
