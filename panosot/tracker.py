@@ -691,9 +691,16 @@ class PanoSOTTracker:
         else:
             best_state, best_score = self._local_search(frame, predicted)
             # 深度模式低置信时，用手工混合追踪兜底
-            if best_score < self.config.deep_occlusion_threshold:
+            deep_score_before_fallback = best_score
+            # 自适应兜底：深度分数高但PSR低 → 自信地错了，需要手工兜底
+            # 深度分数已低 → 深度自己知道不对，等它恢复或重定位
+            psr_low = self.runtime_stats.last_psr < 1.50
+            hand_model_warm = self._frame_count > 15
+            confident_wrong = best_score > self.config.deep_high_confidence and psr_low and hand_model_warm
+            need_fallback = best_score < self.config.deep_occlusion_threshold or confident_wrong
+            if need_fallback:
                 hand_state, hand_score = self._try_handcrafted_fallback(frame, predicted)
-                if hand_score > best_score + 0.03:
+                if psr_low or hand_score > deep_score_before_fallback + 0.03:
                     best_state, best_score = hand_state, hand_score
         candidate_trust = self._state_trust(best_score)
         deep_low_quality = (
