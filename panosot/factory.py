@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import fields
-import warnings
 from typing import Any
 
 from .deep_features import DeepFeatureExtractor, FeatureConfig
@@ -18,20 +16,9 @@ def build_tracker(
     cache_dir = kwargs.pop("cache_dir", None)
     config = TrackerConfig(use_deep_features=use_deep_features, backbone_name=backbone_name, device=device)
 
-    # P3-1: 类型安全校验，未知参数发出警告
-    valid_fields = {f.name for f in fields(TrackerConfig)}
-    unknown = set(kwargs.keys()) - valid_fields
-    if unknown:
-        warnings.warn(
-            f"Unknown TrackerConfig parameters (will be ignored): {sorted(unknown)}",
-            UserWarning,
-            stacklevel=2,
-        )
-        for key in unknown:
-            kwargs.pop(key)
-
     for key, value in kwargs.items():
-        setattr(config, key, value)
+        if hasattr(config, key):
+            setattr(config, key, value)
 
     deep_extractor = None
     similarity_head = None
@@ -57,8 +44,6 @@ def build_tracker(
             cache_dir=cache_dir,
         )
         deep_extractor = DeepFeatureExtractor(feat_config)
-        # P2-3: 模型预热，消除首帧 CUDA kernel 编译延迟
-        deep_extractor.warmup()
         similarity_head = build_similarity_head("depthwise_xcorr")
         config.device = resolved_device
 

@@ -28,23 +28,6 @@ def load_sequence(sequence_dir: str | Path, max_size: int | None = 960) -> List[
     return [load_image(path, max_size=max_size) for path in frame_paths]
 
 
-def load_sequence_lazy(
-    sequence_dir: str | Path, max_size: int | None = 960
-) -> Iterable[np.ndarray]:
-    """惰性加载序列帧，不一次性占满内存。
-
-    返回生成器，每次只加载一帧。适用于长序列场景，
-    内存占用从 O(N * H * W * 3) 降至 O(H * W * 3)。
-    注意：生成器只能迭代一次。
-    """
-    sequence_dir = Path(sequence_dir)
-    frame_paths = sorted(
-        path for path in sequence_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES
-    )
-    for path in frame_paths:
-        yield load_image(path, max_size=max_size)
-
-
 def load_boxes(path: str | Path) -> np.ndarray:
     rows = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
