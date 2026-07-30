@@ -53,6 +53,22 @@ class DepthwiseXCorrHead:
 
     __call__ = forward
 
+    def forward_bank_to_searches(self, template_feat: Any, search_feat: Any) -> Any:
+        """Return responses for every search/template pair as [N, K, 1, H, W]."""
+        if template_feat.ndim != 4 or search_feat.ndim != 4:
+            raise ValueError("Expected template and search features to have shape [B, C, H, W].")
+        if template_feat.shape[1] != search_feat.shape[1]:
+            raise ValueError("Template and search features must have the same channel count.")
+
+        num_searches = int(search_feat.shape[0])
+        area = max(int(template_feat.shape[-2]) * int(template_feat.shape[-1]), 1)
+        responses = []
+        for index in range(int(template_feat.shape[0])):
+            template = template_feat[index : index + 1].expand(num_searches, -1, -1, -1)
+            response = self._channelwise_conv(template, search_feat)
+            responses.append(response.mean(dim=1, keepdim=True) / area)
+        return self._torch.stack(responses, dim=1)
+
 
 def build_backbone(name: str, pretrained: bool = True, feature_layer: int | None = 12) -> Any:
     torch, nn = _require_torch()

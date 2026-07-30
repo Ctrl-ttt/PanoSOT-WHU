@@ -116,6 +116,28 @@ class DeepFeatureExtractor:
         tensor = (tensor - self._mean) / self._std
         return tensor
 
+    def preprocess_patches(self, patches: list[np.ndarray], out_size: int) -> Any:
+        if not patches:
+            raise ValueError("patches must not be empty.")
+        if any(patch.ndim != 3 or patch.shape[2] != 3 for patch in patches):
+            raise ValueError("Expected every patch to have shape [H, W, 3].")
+
+        normalized = []
+        for patch in patches:
+            if patch.dtype != np.float32:
+                patch = patch.astype(np.float32)
+            normalized.append(np.clip(patch, 0.0, 1.0))
+
+        torch = self._torch
+        tensor = torch.from_numpy(np.stack(normalized, axis=0)).permute(0, 3, 1, 2).to(self.device)
+        tensor = torch.nn.functional.interpolate(
+            tensor,
+            size=(out_size, out_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return (tensor - self._mean) / self._std
+
     def _forward(self, patch: np.ndarray, out_size: int) -> Any:
         tensor = self.preprocess_patch(patch, out_size)
         self.forward_calls += 1
@@ -137,3 +159,41 @@ class DeepFeatureExtractor:
     def extract_search_feature(self, patch: np.ndarray, refine: bool = False) -> Any:
         out_size = self.config.refine_search_size if refine else self.config.coarse_search_size
         return self._forward(patch, out_size)
+
+    def _forward_batch(self, patches: list[np.ndarray], out_size: int, chunk_size: int = 32) -> Any:
+        if not patches:
+            raise ValueError("patches must not be empty.")
+
+        torch = self._torch
+        features_by_chunk: list[Any] = []
+        for start in range(0, len(patches), chunk_size):
+            tensor = self.preprocess_patches(patches[start : start + chunk_size], out_size)
+            self.forward_calls += 1
+            with torch.inference_mode():
+                with self._amp_context():
+                    features = self.model(tensor)
+            if isinstance(features, (list, tuple)):
+                features = features[-1]
+            if self.config.normalize_features:
+                features = torch.nn.functional.normalize(features, p=2, dim=1, eps=1e-6)
+            features_by_chunk.append(features)
+
+        if len(features_by_chunk) == 1:
+            return features_by_chunk[0]
+        return torch.cat(features_by_chunk, dim=0)
+
+    def extract_template_features_batch(
+        self,
+        patches: list[np.ndarray],
+        chunk_size: int = 32,
+    ) -> Any:
+        return self._forward_batch(patches, self.config.template_size, chunk_size)
+
+    def extract_search_features_batch(
+        self,
+        patches: list[np.ndarray],
+        refine: bool = False,
+        chunk_size: int = 32,
+    ) -> Any:
+        out_size = self.config.refine_search_size if refine else self.config.coarse_search_size
+        return self._forward_batch(patches, out_size, chunk_size)

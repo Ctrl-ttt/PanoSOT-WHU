@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 from typing import Tuple
 
 import numpy as np
+
+try:
+    import cv2
+except ImportError:  # Keep geometry usable without the optional OpenCV acceleration.
+    cv2 = None
 
 
 PI = math.pi
@@ -94,6 +100,19 @@ def state_size_to_fov(state: SphereState, enlarge: float = 2.0) -> Tuple[float, 
     return fov_x, fov_y
 
 
+@lru_cache(maxsize=256)
+def _tangent_xy_grid(
+    fov_x: float,
+    fov_y: float,
+    out_h: int,
+    out_w: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    u = np.linspace(-1.0, 1.0, out_w, dtype=np.float32)
+    v = np.linspace(-1.0, 1.0, out_h, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
+    return np.tan(uu * (0.5 * fov_x)), np.tan(vv * (0.5 * fov_y))
+
+
 def tangent_patch(
     frame: np.ndarray,
     lon: float,
@@ -108,12 +127,7 @@ def tangent_patch(
     lat = float(clamp_lat(lat))
     h, w = frame.shape[:2]
 
-    u = np.linspace(-1.0, 1.0, out_w, dtype=np.float32)
-    v = np.linspace(-1.0, 1.0, out_h, dtype=np.float32)
-    uu, vv = np.meshgrid(u, v)
-
-    x = np.tan(uu * (0.5 * fov_x))
-    y = np.tan(vv * (0.5 * fov_y))
+    x, y = _tangent_xy_grid(float(fov_x), float(fov_y), out_h, out_w)
 
     center = np.array(
         [math.cos(lat) * math.cos(lon), math.cos(lat) * math.sin(lon), math.sin(lat)],
@@ -138,6 +152,15 @@ def bilinear_sample(frame: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.nda
     h, w = frame.shape[:2]
     xs = np.mod(xs, w).astype(np.float32)
     ys = np.clip(ys, 0.0, h - 1.001).astype(np.float32)
+
+    if cv2 is not None:
+        return cv2.remap(
+            frame,
+            xs,
+            ys,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_WRAP,
+        ).astype(np.float32, copy=False)
 
     x0 = np.floor(xs).astype(np.int32)
     y0 = np.floor(ys).astype(np.int32)

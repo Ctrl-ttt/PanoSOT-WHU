@@ -26,6 +26,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-layer", type=int, default=12, help="MobileNetV3 feature layer index.")
     parser.add_argument("--normalize-features", action="store_true", help="Apply L2 normalization to deep features.")
     parser.add_argument("--template-enlarge", type=float, default=4.0, help="Template context enlarge factor.")
+    parser.add_argument(
+        "--fallback-psr-threshold",
+        type=float,
+        default=None,
+        help="Override the deep-to-handcrafted fallback PSR threshold.",
+    )
+    parser.add_argument(
+        "--batch-eval-config",
+        action="store_true",
+        help="Use the tuned deep tracker parameters from tools/batch_evaluate.py.",
+    )
+    parser.add_argument("--output", default=None, help="Optional JSON output path.")
     return parser.parse_args()
 
 
@@ -39,12 +51,27 @@ def main() -> None:
         raise SystemExit(f"No frames found in {sequence}")
 
     init_box = load_boxes(args.init_box)[0]
+    tracker_kwargs: dict[str, object] = {}
+    if args.batch_eval_config:
+        tracker_kwargs.update(
+            confirmation_frames=2,
+            update_quality_threshold=0.65,
+            deep_confirmation_frames=2,
+            deep_update_quality_threshold=0.65,
+            deep_template_update_ema=0.08,
+            deep_template_update_background=0.02,
+            deep_motion_momentum=0.5,
+        )
+    if args.fallback_psr_threshold is not None:
+        tracker_kwargs["deep_fallback_psr_threshold"] = args.fallback_psr_threshold
+
     tracker = build_tracker(
         use_deep_features=True,
         device=args.device,
         deep_feature_layer=args.feature_layer,
         normalize_deep_features=args.normalize_features,
         deep_template_enlarge=args.template_enlarge,
+        **tracker_kwargs,
     )
 
     t0 = time.perf_counter()
@@ -65,7 +92,12 @@ def main() -> None:
         image_width = float(load_image(frame_paths[0]).shape[1])
         result["metrics"] = otb_metrics(predictions[:n], gt_boxes[:n], image_width=image_width)
 
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    payload = json.dumps(result, indent=2, ensure_ascii=False)
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(payload, encoding="utf-8")
+    print(payload)
 
 
 if __name__ == "__main__":

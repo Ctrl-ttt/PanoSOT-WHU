@@ -49,7 +49,7 @@ class TrackerConfig:
     deep_template_size: int = 112
     coarse_search_size: int = 224
     refine_search_size: int = 160
-    deep_feature_layer: int | None = 6
+    deep_feature_layer: int | None = 12
     normalize_deep_features: bool = False
     deep_motion_momentum: float = 0.3
     deep_template_rotations_deg: tuple[float, ...] = (0.0, -45.0, 45.0, 90.0)
@@ -141,7 +141,16 @@ class TrackerConfig:
     deep_velocity_low_psr_threshold: float = 1.85
     deep_velocity_low_trust_threshold: float = 0.65
     deep_velocity_decay: float = 0.20
+    deep_fallback_psr_threshold: float = 2.0
+    deep_probe_interval: int = 5
+    deep_probe_backoff_after: int = 3
+    deep_probe_backoff_multiplier: float = 2.0
+    deep_probe_max_interval: int = 20
     deep_relocalize_psr_threshold: float = 1.70
+    deep_relocalize_accept_psr_threshold: float = 1.75
+    deep_relocalize_backoff_after: int = 2
+    deep_relocalize_backoff_multiplier: float = 2.0
+    deep_relocalize_max_interval: int = 80
     deep_relocalize_min_start_frame: int = 6
     deep_relocalize_min_lost_frames: int = 2
     deep_local_min_lon_jump_deg: float = 2.5
@@ -192,6 +201,13 @@ class TrackerConfig:
     handcrafted_ncc_velocity_momentum: float = 0.50
     handcrafted_ncc_flow_motion_trigger: float = 0.06
     handcrafted_ncc_flow_score_trigger: float = 0.72
+    handcrafted_ncc_flow_disagreement_ratio: float = 0.35
+    handcrafted_ncc_flow_axis_disagreement_ratio: float = 0.20
+    handcrafted_ncc_flow_disagreement_score: float = 0.55
+    handcrafted_ncc_flow_grace_frames: int = 3
+    handcrafted_ncc_flow_guard_min_size: float = 64.0
+    handcrafted_ncc_flow_scale_tolerance: float = 0.10
+    handcrafted_ncc_flow_scale_min_inlier_ratio: float = 0.50
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -204,6 +220,31 @@ class TrackerRuntimeStats:
     frames: int = 0
     local_searches: int = 0
     relocalizations: int = 0
+    relocalization_accepts: int = 0
+    relocalization_psr_rejects: int = 0
+    last_relocalization_psr: float = 0.0
+    fallback_attempts: int = 0
+    fallback_accepts: int = 0
+    fallback_low_score_triggers: int = 0
+    fallback_low_psr_triggers: int = 0
+    fallback_confident_wrong_triggers: int = 0
+    fallback_flow_results: int = 0
+    fallback_ncc_results: int = 0
+    fallback_color_results: int = 0
+    fallback_local_search_results: int = 0
+    ncc_flow_disagreement_rejects: int = 0
+    ncc_flow_scale_adjustments: int = 0
+    fallback_deep_score_sum: float = 0.0
+    fallback_hand_score_sum: float = 0.0
+    deep_probe_skips: int = 0
+    deep_psr_samples: int = 0
+    deep_psr_sum: float = 0.0
+    deep_psr_min: float = float("inf")
+    deep_psr_max: float = float("-inf")
+    deep_psr_below_125: int = 0
+    deep_psr_below_150: int = 0
+    deep_psr_below_175: int = 0
+    deep_psr_below_200: int = 0
     template_updates: int = 0
     response_maps: int = 0
     response_batches: int = 0
@@ -303,6 +344,10 @@ class PanoSOTTracker:
 
         # --- 全局重定位冷却状态 ---
         self._last_relocalize_frame = -self.config.relocalize_min_interval
+        self._last_relocalize_attempt_frame = -self.config.relocalize_min_interval
+        self._last_deep_probe_frame = -max(self.config.deep_probe_interval, 1)
+        self._consecutive_low_deep_probes = 0
+        self._consecutive_relocalization_rejects = 0
         self.runtime_stats = TrackerRuntimeStats()
         self._debug_payload: dict[str, np.ndarray] | None = None
         self._last_state_trust = 1.0
@@ -322,7 +367,9 @@ class PanoSOTTracker:
         self._ncc_short_template: np.ndarray | None = None
         self._ncc_bbox: np.ndarray | None = None
         self._ncc_velocity = np.zeros(2, dtype=np.float64)
+        self._ncc_flow_scale: np.ndarray | None = None
         self._ncc_flow_was_reliable = False
+        self._ncc_frames_since_flow = self.config.handcrafted_ncc_flow_grace_frames + 1
         self._ncc_last_score = 1.0
         self._last_ncc_reliable = False
         # --- 手工模式独立状态（P1：不受深度漂移污染）---
@@ -345,10 +392,40 @@ class PanoSOTTracker:
     def get_runtime_stats(self) -> dict[str, float | int]:
         stats = self.runtime_stats
         current_forward_calls = int(getattr(self.deep_extractor, "forward_calls", 0))
+        has_psr = stats.deep_psr_samples > 0
         return {
             "frames": stats.frames,
             "local_searches": stats.local_searches,
             "relocalizations": stats.relocalizations,
+            "relocalization_accepts": stats.relocalization_accepts,
+            "relocalization_psr_rejects": stats.relocalization_psr_rejects,
+            "last_relocalization_psr": stats.last_relocalization_psr,
+            "relocalization_interval": self._current_relocalization_interval(),
+            "consecutive_relocalization_rejects": self._consecutive_relocalization_rejects,
+            "fallback_attempts": stats.fallback_attempts,
+            "fallback_accepts": stats.fallback_accepts,
+            "fallback_low_score_triggers": stats.fallback_low_score_triggers,
+            "fallback_low_psr_triggers": stats.fallback_low_psr_triggers,
+            "fallback_confident_wrong_triggers": stats.fallback_confident_wrong_triggers,
+            "fallback_flow_results": stats.fallback_flow_results,
+            "fallback_ncc_results": stats.fallback_ncc_results,
+            "fallback_color_results": stats.fallback_color_results,
+            "fallback_local_search_results": stats.fallback_local_search_results,
+            "ncc_flow_disagreement_rejects": stats.ncc_flow_disagreement_rejects,
+            "ncc_flow_scale_adjustments": stats.ncc_flow_scale_adjustments,
+            "fallback_deep_score_sum": stats.fallback_deep_score_sum,
+            "fallback_hand_score_sum": stats.fallback_hand_score_sum,
+            "deep_probe_skips": stats.deep_probe_skips,
+            "deep_probe_interval": self._current_deep_probe_interval(),
+            "consecutive_low_deep_probes": self._consecutive_low_deep_probes,
+            "deep_psr_samples": stats.deep_psr_samples,
+            "deep_psr_mean": stats.deep_psr_sum / stats.deep_psr_samples if has_psr else 0.0,
+            "deep_psr_min": stats.deep_psr_min if has_psr else 0.0,
+            "deep_psr_max": stats.deep_psr_max if has_psr else 0.0,
+            "deep_psr_below_125": stats.deep_psr_below_125,
+            "deep_psr_below_150": stats.deep_psr_below_150,
+            "deep_psr_below_175": stats.deep_psr_below_175,
+            "deep_psr_below_200": stats.deep_psr_below_200,
             "template_updates": stats.template_updates,
             "response_maps": stats.response_maps,
             "response_batches": stats.response_batches,
@@ -359,23 +436,88 @@ class PanoSOTTracker:
             "deep_forward_calls": current_forward_calls - stats.deep_forward_calls_start,
         }
 
-    def _high_confidence(self) -> float:
-        if self._deep_mode:
+    def _high_confidence(self, handcrafted_result: bool = False) -> float:
+        if self._deep_mode and not handcrafted_result:
             return self.config.deep_high_confidence
         return self.config.handcrafted_high_confidence
 
-    def _occlusion_threshold(self) -> float:
-        if self._deep_mode:
+    def _occlusion_threshold(self, handcrafted_result: bool = False) -> float:
+        if self._deep_mode and not handcrafted_result:
             return self.config.deep_occlusion_threshold
         return self.config.handcrafted_occlusion_threshold
 
-    def _relocalize_confidence_threshold(self) -> float:
-        if self._deep_mode:
+    def _relocalize_confidence_threshold(self, handcrafted_result: bool = False) -> float:
+        if self._deep_mode and not handcrafted_result:
             return self.config.deep_relocalize_confidence_threshold
         return self.config.handcrafted_relocalize_confidence_threshold
 
-    def _update_quality_threshold(self) -> float:
-        if self._deep_mode:
+    def _relocalize_cooldown_elapsed(self) -> bool:
+        return (
+            self._frame_count - self._last_relocalize_attempt_frame
+            >= self._current_relocalization_interval()
+        )
+
+    def _current_relocalization_interval(self) -> int:
+        base_interval = max(int(self.config.relocalize_min_interval), 1)
+        if not self._deep_mode:
+            return base_interval
+        backoff_after = max(int(self.config.deep_relocalize_backoff_after), 1)
+        backoff_steps = self._consecutive_relocalization_rejects // backoff_after
+        multiplier = max(float(self.config.deep_relocalize_backoff_multiplier), 1.0)
+        interval = int(round(base_interval * multiplier ** backoff_steps))
+        return min(interval, max(int(self.config.deep_relocalize_max_interval), base_interval))
+
+    def _deep_probe_due(self) -> bool:
+        interval = self._current_deep_probe_interval()
+        return self._frame_count - self._last_deep_probe_frame >= interval
+
+    def _current_deep_probe_interval(self) -> int:
+        base_interval = max(int(self.config.deep_probe_interval), 1)
+        backoff_after = max(int(self.config.deep_probe_backoff_after), 1)
+        backoff_steps = self._consecutive_low_deep_probes // backoff_after
+        multiplier = max(float(self.config.deep_probe_backoff_multiplier), 1.0)
+        interval = int(round(base_interval * multiplier ** backoff_steps))
+        return min(interval, max(int(self.config.deep_probe_max_interval), base_interval))
+
+    def _record_deep_probe_psr(self, psr: float) -> None:
+        if psr < self.config.deep_fallback_psr_threshold:
+            self._consecutive_low_deep_probes += 1
+        else:
+            self._consecutive_low_deep_probes = 0
+
+    def _accept_relocalization_candidate(
+        self,
+        candidate_score: float,
+        current_score: float,
+        candidate_psr: float,
+        large_jump_early: bool,
+        candidate_is_deep: bool,
+    ) -> bool:
+        if large_jump_early:
+            return False
+        if candidate_score <= current_score + self.config.relocalize_score_margin:
+            return False
+        if candidate_is_deep and candidate_psr < self.config.deep_relocalize_accept_psr_threshold:
+            return False
+        return True
+
+    def _accept_handcrafted_fallback(self, hand_state: SphereState) -> None:
+        if self._hand_state is None:
+            return
+        hand_lon_delta = lon_distance(hand_state.lon, self._hand_state.lon)
+        hand_lat_delta = hand_state.lat - self._hand_state.lat
+        momentum = self.config.motion_momentum
+        self._hand_velocity[0] = momentum * self._hand_velocity[0] + (1.0 - momentum) * hand_lon_delta
+        self._hand_velocity[1] = momentum * self._hand_velocity[1] + (1.0 - momentum) * hand_lat_delta
+        self._hand_state = SphereState(
+            lon=hand_state.lon,
+            lat=hand_state.lat,
+            equatorial_width=hand_state.equatorial_width,
+            angular_height=hand_state.angular_height,
+        )
+
+    def _update_quality_threshold(self, handcrafted_result: bool = False) -> float:
+        if self._deep_mode and not handcrafted_result:
             return self.config.deep_update_quality_threshold
         return self.config.handcrafted_update_quality_threshold
 
@@ -400,13 +542,13 @@ class PanoSOTTracker:
             rate = self.config.template_update_background
         return rate
 
-    def _freeze_scale_update_confidence(self) -> float:
-        if self._deep_mode:
+    def _freeze_scale_update_confidence(self, handcrafted_result: bool = False) -> float:
+        if self._deep_mode and not handcrafted_result:
             return self.config.deep_scale_update_confidence
         return self.config.handcrafted_scale_update_confidence
 
-    def _state_trust(self, score: float) -> float:
-        if self._deep_mode:
+    def _state_trust(self, score: float, handcrafted_result: bool = False) -> float:
+        if self._deep_mode and not handcrafted_result:
             low_cfg = self.config.deep_state_trust_low
             high_cfg = self.config.deep_state_trust_high
             min_trust = self.config.deep_state_trust_min
@@ -425,7 +567,7 @@ class PanoSOTTracker:
         alpha = (score - low) / (high - low)
         trust = min_trust + alpha * (1.0 - min_trust)
 
-        if not self._deep_mode:
+        if not self._deep_mode or handcrafted_result:
             return float(trust)
 
         psr = max(float(self.runtime_stats.last_psr), 0.0)
@@ -455,12 +597,13 @@ class PanoSOTTracker:
         predicted: SphereState,
         candidate: SphereState,
         score: float,
+        handcrafted_result: bool = False,
     ) -> SphereState:
         self._last_state_trust = 1.0
         self._last_local_jump_gated = False
-        trust = self._state_trust(score)
+        trust = self._state_trust(score, handcrafted_result)
         self._last_state_trust = trust
-        if not self._deep_mode:
+        if not self._deep_mode or handcrafted_result:
             if trust >= 0.999:
                 return candidate
             if self.lost_frames >= 2 and not self._last_flow_reliable and not self._last_color_reliable:
@@ -532,6 +675,10 @@ class PanoSOTTracker:
         self._occlusion_frames = 0
         self._last_high_conf_score = 0.0
         self._last_relocalize_frame = -self.config.relocalize_min_interval
+        self._last_relocalize_attempt_frame = -self.config.relocalize_min_interval
+        self._last_deep_probe_frame = -max(self.config.deep_probe_interval, 1)
+        self._consecutive_low_deep_probes = 0
+        self._consecutive_relocalization_rejects = 0
         self.reset_runtime_stats()
 
         self._add_template(frame, self.state, template_type="init")
@@ -672,6 +819,7 @@ class PanoSOTTracker:
         flow_reliable = False
         color_reliable = False
         ncc_reliable = False
+        handcrafted_result = False
         if not self._deep_mode:
             if self._color_hue is None:
                 ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame)
@@ -694,35 +842,59 @@ class PanoSOTTracker:
                     else:
                         best_state, best_score = self._local_search(frame, predicted)
         else:
-            best_state, best_score = self._local_search(frame, predicted)
-            # 深度模式低置信时，用手工混合追踪兜底
-            deep_score_before_fallback = best_score
-            # 自适应兜底：深度分数高但PSR低 → 自信地错了，需要手工兜底
-            # 深度分数已低 → 深度自己知道不对，等它恢复或重定位
-            psr_low = self.runtime_stats.last_psr < 1.50
-            hand_model_warm = self._frame_count > 15
-            confident_wrong = best_score > self.config.deep_high_confidence and psr_low and hand_model_warm
-            need_fallback = best_score < self.config.deep_occlusion_threshold or confident_wrong
-            if need_fallback:
-                hand_state, hand_score = self._try_handcrafted_fallback(frame, predicted)
-                if psr_low or hand_score > deep_score_before_fallback + 0.03:
-                    best_state, best_score = hand_state, hand_score
-                    # P1: 手工模型独立状态回写，仅在手工具结果被采纳时更新
-                    if self._hand_state is not None:
-                        hand_lon_delta = lon_distance(best_state.lon, self._hand_state.lon)
-                        hand_lat_delta = best_state.lat - self._hand_state.lat
-                        h_momentum = self.config.motion_momentum
-                        self._hand_velocity[0] = h_momentum * self._hand_velocity[0] + (1.0 - h_momentum) * hand_lon_delta
-                        self._hand_velocity[1] = h_momentum * self._hand_velocity[1] + (1.0 - h_momentum) * hand_lat_delta
-                        self._hand_state = SphereState(
-                            lon=best_state.lon,
-                            lat=best_state.lat,
-                            equatorial_width=best_state.equatorial_width,
-                            angular_height=best_state.angular_height,
-                        )
-        candidate_trust = self._state_trust(best_score)
+            last_probe_low = (
+                self.runtime_stats.deep_psr_samples > 0
+                and self.runtime_stats.last_psr < self.config.deep_fallback_psr_threshold
+            )
+            skip_deep_probe = last_probe_low and not self._deep_probe_due()
+            if skip_deep_probe:
+                self.runtime_stats.deep_probe_skips += 1
+                self.runtime_stats.fallback_attempts += 1
+                self.runtime_stats.fallback_accepts += 1
+                self.runtime_stats.fallback_low_psr_triggers += 1
+                hand_state, hand_score, fallback_source = self._try_handcrafted_fallback(frame, predicted)
+                flow_reliable = fallback_source == "flow"
+                self.runtime_stats.fallback_hand_score_sum += float(hand_score)
+                best_state, best_score = hand_state, hand_score
+                handcrafted_result = True
+                self._accept_handcrafted_fallback(hand_state)
+            else:
+                self._last_deep_probe_frame = self._frame_count
+                best_state, best_score = self._local_search(frame, predicted)
+                deep_psr = float(self.runtime_stats.last_psr)
+                self._record_deep_probe_psr(deep_psr)
+                self.runtime_stats.deep_psr_samples += 1
+                self.runtime_stats.deep_psr_sum += deep_psr
+                self.runtime_stats.deep_psr_min = min(self.runtime_stats.deep_psr_min, deep_psr)
+                self.runtime_stats.deep_psr_max = max(self.runtime_stats.deep_psr_max, deep_psr)
+                self.runtime_stats.deep_psr_below_125 += int(deep_psr < 1.25)
+                self.runtime_stats.deep_psr_below_150 += int(deep_psr < 1.50)
+                self.runtime_stats.deep_psr_below_175 += int(deep_psr < 1.75)
+                self.runtime_stats.deep_psr_below_200 += int(deep_psr < 2.00)
+                deep_score_before_fallback = best_score
+                psr_low = self.runtime_stats.last_psr < self.config.deep_fallback_psr_threshold
+                hand_model_warm = self._frame_count > 15
+                confident_wrong = best_score > self.config.deep_high_confidence and psr_low and hand_model_warm
+                low_score_fallback = best_score < self.config.deep_occlusion_threshold
+                need_fallback = low_score_fallback or psr_low
+                if need_fallback:
+                    self.runtime_stats.fallback_attempts += 1
+                    self.runtime_stats.fallback_low_score_triggers += int(low_score_fallback)
+                    self.runtime_stats.fallback_low_psr_triggers += int(psr_low)
+                    self.runtime_stats.fallback_confident_wrong_triggers += int(confident_wrong)
+                    self.runtime_stats.fallback_deep_score_sum += float(deep_score_before_fallback)
+                    hand_state, hand_score, fallback_source = self._try_handcrafted_fallback(frame, predicted)
+                    flow_reliable = fallback_source == "flow"
+                    self.runtime_stats.fallback_hand_score_sum += float(hand_score)
+                    if psr_low or hand_score > deep_score_before_fallback + 0.03:
+                        self.runtime_stats.fallback_accepts += 1
+                        best_state, best_score = hand_state, hand_score
+                        handcrafted_result = True
+                        self._accept_handcrafted_fallback(hand_state)
+        candidate_trust = self._state_trust(best_score, handcrafted_result)
         deep_low_quality = (
             self._deep_mode
+            and not handcrafted_result
             and (
                 candidate_trust < self.config.deep_velocity_low_trust_threshold
                 or self.runtime_stats.last_psr < self.config.deep_velocity_low_psr_threshold
@@ -736,10 +908,10 @@ class PanoSOTTracker:
         score_drop = self._last_high_conf_score - best_score
         is_abnormal = score_drop > self.config.max_score_drop and self._last_high_conf_score > 0.0
 
-        high_confidence = self._high_confidence()
-        occlusion_threshold = self._occlusion_threshold()
-        relocalize_threshold = self._relocalize_confidence_threshold()
-        update_quality_threshold = self._update_quality_threshold()
+        high_confidence = self._high_confidence(handcrafted_result)
+        occlusion_threshold = self._occlusion_threshold(handcrafted_result)
+        relocalize_threshold = self._relocalize_confidence_threshold(handcrafted_result)
+        update_quality_threshold = self._update_quality_threshold(handcrafted_result)
 
         if best_score >= high_confidence:
             self._occlusion_frames = 0
@@ -761,18 +933,17 @@ class PanoSOTTracker:
             self.config.relocalize_min_lost_frames_override,
         )
         if self._deep_mode:
-            relocalize_start_frame = min(relocalize_start_frame, self.config.deep_relocalize_min_start_frame)
-            relocalize_lost_trigger = min(relocalize_lost_trigger, self.config.deep_relocalize_min_lost_frames)
+            if not handcrafted_result:
+                relocalize_start_frame = min(relocalize_start_frame, self.config.deep_relocalize_min_start_frame)
+                relocalize_lost_trigger = min(relocalize_lost_trigger, self.config.deep_relocalize_min_lost_frames)
         if self._frame_count >= relocalize_start_frame:
             if best_score < relocalize_threshold:
-                frames_since_relocalize = self._frame_count - self._last_relocalize_frame
-                if frames_since_relocalize >= self.config.relocalize_min_interval:
+                if self._relocalize_cooldown_elapsed():
                     should_relocalize = True
 
             # P4: 连续丢失帧数过多时强制触发重定位
             if not should_relocalize and self.lost_frames >= relocalize_lost_trigger:
-                frames_since_relocalize = self._frame_count - self._last_relocalize_frame
-                if frames_since_relocalize >= self.config.relocalize_min_interval:
+                if self._relocalize_cooldown_elapsed():
                     should_relocalize = True
 
             if (
@@ -782,14 +953,22 @@ class PanoSOTTracker:
                 and self.runtime_stats.last_psr < self.config.deep_relocalize_psr_threshold
                 and max(self.lost_frames, self._occlusion_frames) >= self.config.deep_relocalize_min_lost_frames
             ):
-                frames_since_relocalize = self._frame_count - self._last_relocalize_frame
-                if frames_since_relocalize >= self.config.relocalize_min_interval:
+                if self._relocalize_cooldown_elapsed():
                     should_relocalize = True
 
         relocalize_applied = False
         if should_relocalize:
             self.runtime_stats.relocalizations += 1
-            relocalized, relocalized_score = self._global_relocalize(frame, predicted)
+            self._last_relocalize_attempt_frame = self._frame_count
+            deep_relocalization = self._deep_mode and not handcrafted_result
+            relocalized, relocalized_score, relocalized_psr = self._global_relocalize(
+                frame,
+                predicted,
+                use_deep=deep_relocalization,
+            )
+            self.runtime_stats.last_relocalization_psr = (
+                float(relocalized_psr) if deep_relocalization else 0.0
+            )
             lon_jump_deg = abs(math.degrees(lon_distance(relocalized.lon, predicted.lon)))
             lat_jump_deg = abs(math.degrees(relocalized.lat - predicted.lat))
             large_jump_early = (
@@ -800,29 +979,58 @@ class PanoSOTTracker:
                     or lat_jump_deg > self.config.relocalize_max_lat_jump_deg
                 )
             )
-            score_improved = relocalized_score > best_score + self.config.relocalize_score_margin
-            if score_improved and not large_jump_early:
+            accept_relocalization = self._accept_relocalization_candidate(
+                relocalized_score,
+                best_score,
+                relocalized_psr,
+                large_jump_early,
+                deep_relocalization,
+            )
+            if (
+                deep_relocalization
+                and relocalized_score > best_score + self.config.relocalize_score_margin
+                and relocalized_psr < self.config.deep_relocalize_accept_psr_threshold
+            ):
+                self.runtime_stats.relocalization_psr_rejects += 1
+            if accept_relocalization:
+                self.runtime_stats.relocalization_accepts += 1
+                self._consecutive_relocalization_rejects = 0
                 best_state, best_score = relocalized, relocalized_score
+                handcrafted_result = not deep_relocalization
                 self._last_relocalize_frame = self._frame_count
                 relocalize_applied = True
 
                 # P4: 高置信重定位成功后重置模板
-                if (self.config.relocalize_reset_on_success
-                        and relocalized_score >= self.config.relocalize_reset_score):
+                if (
+                    self.config.relocalize_reset_on_success
+                    and relocalized_score >= self.config.relocalize_reset_score
+                    and (not self._deep_mode or deep_relocalization)
+                ):
                     self._reset_templates(frame, best_state)
+            else:
+                self._consecutive_relocalization_rejects += 1
+
+        if relocalize_applied:
+            high_confidence = self._high_confidence(handcrafted_result)
+            update_quality_threshold = self._update_quality_threshold(handcrafted_result)
 
         best_state = self._clamp_state_size(best_state)
-        if best_score < self._freeze_scale_update_confidence():
+        if best_score < self._freeze_scale_update_confidence(handcrafted_result):
             best_state = SphereState(
                 lon=best_state.lon,
                 lat=best_state.lat,
                 equatorial_width=self.state.equatorial_width,
                 angular_height=self.state.angular_height,
             )
-        best_state = self._guard_low_confidence_state(predicted, best_state, best_score)
+        best_state = self._guard_low_confidence_state(
+            predicted, best_state, best_score, handcrafted_result,
+        )
         lon_delta = lon_distance(best_state.lon, self.state.lon)
         lat_delta = best_state.lat - self.state.lat
-        momentum = self.config.deep_motion_momentum if self._deep_mode else self.config.motion_momentum
+        momentum = (
+            self.config.motion_momentum
+            if handcrafted_result else self.config.deep_motion_momentum
+        ) if self._deep_mode else self.config.motion_momentum
 
         if self._occlusion_frames > self.config.occlusion_suppress_frames:
             momentum = min(momentum, 0.1)
@@ -839,7 +1047,7 @@ class PanoSOTTracker:
         self.state = best_state
 
         # P1 fix: 深度模式后台维护手工独立状态，避免完全失活
-        if self._deep_mode and self._hand_state is not None:
+        if self._deep_mode and self._hand_state is not None and not handcrafted_result:
             # 深度可信时（高分数 + 高PSR），手工速度跟随深度
             deep_reliable = best_score >= self.config.deep_high_confidence and self.runtime_stats.last_psr >= 2.0
             hand_uninitialized = self._frame_count <= 3 and np.all(self._hand_velocity == 0)
@@ -855,7 +1063,9 @@ class PanoSOTTracker:
             )
 
 # --- 多模板更新（含遮挡/异常帧抑制）---
-        if best_score >= update_quality_threshold:
+        if handcrafted_result:
+            self._consecutive_good = 0
+        elif best_score >= update_quality_threshold:
             self._consecutive_good += 1
         else:
             self._consecutive_good = 0
@@ -865,7 +1075,10 @@ class PanoSOTTracker:
         else:
             self.lost_frames += 1
 
-        if self._consecutive_good >= self._template_confirmation_frames():
+        if (
+            self._consecutive_good >= self._template_confirmation_frames()
+            and not handcrafted_result
+        ):
             self.runtime_stats.template_updates += 1
             self._update_templates(frame, best_state, best_score)
         else:
@@ -1062,7 +1275,9 @@ class PanoSOTTracker:
         self._ncc_short_template = None
         self._ncc_bbox = np.asarray(bbox_xywh, dtype=np.float32).copy()
         self._ncc_velocity[:] = 0.0
+        self._ncc_flow_scale = None
         self._ncc_flow_was_reliable = False
+        self._ncc_frames_since_flow = self.config.handcrafted_ncc_flow_grace_frames + 1
         self._ncc_last_score = 1.0
         self._last_ncc_reliable = False
         if cv2 is None or not self.config.handcrafted_ncc_enabled:
@@ -1112,11 +1327,14 @@ class PanoSOTTracker:
             predicted_delta = flow_delta
             self._ncc_velocity = flow_delta.copy()
             self._ncc_flow_was_reliable = True
+            self._ncc_frames_since_flow = 0
         elif self._ncc_flow_was_reliable:
             predicted_delta = self._ncc_velocity.copy()
             self._ncc_flow_was_reliable = False
+            self._ncc_frames_since_flow += 1
         else:
             predicted_delta = self._ncc_velocity.copy()
+            self._ncc_frames_since_flow += 1
         predicted_center_x = center_x + float(predicted_delta[0])
         predicted_center_y = center_y + float(predicted_delta[1])
         search_width = max(box[2] * self.config.handcrafted_ncc_search_factor, 220.0)
@@ -1205,6 +1423,32 @@ class PanoSOTTracker:
             ],
             dtype=np.float64,
         )
+        recent_flow = (
+            self._ncc_frames_since_flow <= max(int(self.config.handcrafted_ncc_flow_grace_frames), 0)
+        )
+        reference_delta = flow_delta if flow_delta is not None else (predicted_delta if recent_flow else None)
+        if not self._ncc_candidate_consistent(
+            measured_velocity,
+            reference_delta,
+            box,
+            best_score,
+            strict_axes=flow_delta is not None,
+        ):
+            self.runtime_stats.ncc_flow_disagreement_rejects += 1
+            best_box = box.copy()
+            best_box[0] += float(reference_delta[0])
+            best_box[1] += float(reference_delta[1])
+            best_box[0] = float(np.clip(best_box[0], 0.0, image_width - best_box[2]))
+            best_box[1] = float(np.clip(best_box[1], 0.0, image_height - best_box[3]))
+            measured_velocity = reference_delta.copy()
+        guarded_box = self._guard_ncc_candidate_scale(
+            best_box, box, self._ncc_flow_scale if flow_delta is not None else None, best_score,
+        )
+        if not np.array_equal(guarded_box[2:4], best_box[2:4]):
+            self.runtime_stats.ncc_flow_scale_adjustments += 1
+        best_box = guarded_box
+        best_box[0] = float(np.clip(best_box[0], 0.0, image_width - best_box[2]))
+        best_box[1] = float(np.clip(best_box[1], 0.0, image_height - best_box[3]))
         momentum = float(np.clip(self.config.handcrafted_ncc_velocity_momentum, 0.0, 1.0))
         self._ncc_velocity = momentum * self._ncc_velocity + (1.0 - momentum) * measured_velocity
         self._ncc_bbox = best_box.astype(np.float32)
@@ -1226,11 +1470,74 @@ class PanoSOTTracker:
         state = erp_bbox_to_state(self._ncc_bbox, image_width, image_height)
         return state, best_score, True
 
+    def _ncc_candidate_consistent(
+        self,
+        measured_velocity: np.ndarray,
+        reference_delta: np.ndarray | None,
+        box: np.ndarray,
+        score: float,
+        *,
+        strict_axes: bool = False,
+    ) -> bool:
+        if reference_delta is None or score >= self.config.handcrafted_ncc_flow_disagreement_score:
+            return True
+        scale = max(float(box[2]), float(box[3]), 1.0)
+        if scale < self.config.handcrafted_ncc_flow_guard_min_size:
+            return True
+        if float(np.linalg.norm(reference_delta)) < self.config.handcrafted_ncc_flow_motion_trigger * scale:
+            return True
+        disagreement = float(np.linalg.norm(measured_velocity - reference_delta))
+        opposite_direction = float(np.dot(measured_velocity, reference_delta)) < 0.0
+        axis_disagreement = (
+            abs(float(measured_velocity[0] - reference_delta[0]))
+            > self.config.handcrafted_ncc_flow_axis_disagreement_ratio * max(float(box[2]), 1.0)
+            or abs(float(measured_velocity[1] - reference_delta[1]))
+            > self.config.handcrafted_ncc_flow_axis_disagreement_ratio * max(float(box[3]), 1.0)
+        )
+        return not (
+            (strict_axes and axis_disagreement)
+            or (
+                opposite_direction
+                and disagreement > self.config.handcrafted_ncc_flow_disagreement_ratio * scale
+            )
+        )
+
+    def _guard_ncc_candidate_scale(
+        self,
+        candidate_box: np.ndarray,
+        previous_box: np.ndarray,
+        flow_scale: np.ndarray | None,
+        score: float,
+    ) -> np.ndarray:
+        if (
+            self._deep_mode
+            or flow_scale is None
+            or score >= self.config.handcrafted_ncc_flow_disagreement_score
+            or max(float(previous_box[2]), float(previous_box[3]))
+            < self.config.handcrafted_ncc_flow_guard_min_size
+        ):
+            return candidate_box
+
+        tolerance = max(float(self.config.handcrafted_ncc_flow_scale_tolerance), 0.0)
+        lower = np.maximum(flow_scale / (1.0 + tolerance), 0.5)
+        upper = np.minimum(flow_scale * (1.0 + tolerance), 2.0)
+        candidate_scale = candidate_box[2:4] / np.maximum(previous_box[2:4], 1.0)
+        guarded_scale = np.clip(candidate_scale, lower, upper)
+        if np.array_equal(candidate_scale, guarded_scale):
+            return candidate_box
+
+        guarded = candidate_box.copy()
+        center = candidate_box[:2] + 0.5 * candidate_box[2:4]
+        guarded[2:4] = previous_box[2:4] * guarded_scale
+        guarded[:2] = center - 0.5 * guarded[2:4]
+        return guarded
+
     def _estimate_ncc_flow(
         self,
         current_gray: np.ndarray,
         box: np.ndarray,
     ) -> np.ndarray | None:
+        self._ncc_flow_scale = None
         previous_gray = self._previous_frame_gray
         if cv2 is None or previous_gray is None:
             return None
@@ -1281,7 +1588,9 @@ class PanoSOTTracker:
             & (back_status.reshape(-1) > 0)
             & (forward_backward < self.config.handcrafted_ncc_flow_max_fb_error)
         )
-        deltas = (next_points - points).reshape(-1, 2)[valid]
+        previous_points = points.reshape(-1, 2)[valid]
+        tracked_points = next_points.reshape(-1, 2)[valid]
+        deltas = tracked_points - previous_points
         if len(deltas) < self.config.handcrafted_ncc_flow_min_points:
             return None
 
@@ -1293,6 +1602,25 @@ class PanoSOTTracker:
             or spread > self.config.handcrafted_ncc_flow_max_spread
         ):
             return None
+
+        affine, affine_inliers = cv2.estimateAffine2D(
+            previous_points,
+            tracked_points,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=2.5,
+            maxIters=1000,
+            confidence=0.99,
+            refineIters=10,
+        )
+        if affine is not None and affine_inliers is not None:
+            affine_inlier_ratio = float(np.mean(affine_inliers.reshape(-1) > 0))
+            if affine_inlier_ratio >= self.config.handcrafted_ncc_flow_scale_min_inlier_ratio:
+                scale_x = math.hypot(float(affine[0, 0]), float(affine[1, 0]))
+                scale_y = math.hypot(float(affine[0, 1]), float(affine[1, 1]))
+                if np.isfinite(scale_x) and np.isfinite(scale_y):
+                    self._ncc_flow_scale = np.clip(
+                        np.array([scale_x, scale_y], dtype=np.float64), 0.80, 1.25,
+                    )
         return median_delta.astype(np.float64)
 
     def _predict_with_color(
@@ -1607,11 +1935,10 @@ class PanoSOTTracker:
         angles = self._get_rotation_angles(state.lat) if trust_location else self.config.deep_template_rotations_deg
         fov_x, fov_y = state_size_to_fov(state, enlarge=enlarge)
         patch = tangent_patch(frame, state.lon, state.lat, fov_x, fov_y, size, size)
-        feat_bank: list[Any] = []
-        for angle_deg in angles:
-            rotated_patch = self._rotate_patch(patch, angle_deg)
-            feat_bank.append(self.deep_extractor.extract_template_feature(rotated_patch))
-        return feat_bank
+        return [
+            self.deep_extractor.extract_template_feature(self._rotate_patch(patch, angle_deg))
+            for angle_deg in angles
+        ]
 
     def _extract_search_feat(
         self, frame: np.ndarray, lon: float, lat: float, fov_x: float, fov_y: float, refine: bool = False
@@ -1692,6 +2019,103 @@ class PanoSOTTracker:
         if total_weight > 0.0:
             fused_response = fused_response / total_weight
         return fused_response, reference_template
+
+    def _fused_template_responses_batch(self, search_features: Any) -> tuple[Any, Any]:
+        fused_response = None
+        total_weight = 0.0
+        reference_template = None
+        for index, template_feat in enumerate(self._template_feats):
+            template_bank = (
+                self._template_feat_banks[index]
+                if index < len(self._template_feat_banks)
+                else [template_feat]
+            )
+            bank_features = self.deep_extractor._torch.cat(template_bank, dim=0)
+            bank_responses = self.similarity_head.forward_bank_to_searches(
+                bank_features, search_features,
+            )
+            self.runtime_stats.response_maps += int(bank_responses.shape[0] * bank_responses.shape[1])
+            self.runtime_stats.response_batches += 1
+            bank_peaks = bank_responses.flatten(start_dim=3).max(dim=3).values.squeeze(-1)
+            best_bank = bank_peaks.argmax(dim=1)
+            search_indices = self.deep_extractor._torch.arange(
+                int(search_features.shape[0]), device=search_features.device,
+            )
+            response = bank_responses[search_indices, best_bank]
+            weight = self._template_weight(index)
+            fused_response = response * weight if fused_response is None else fused_response + response * weight
+            total_weight += weight
+            if reference_template is None:
+                reference_template = template_feat
+
+        if fused_response is None or reference_template is None:
+            raise RuntimeError("No deep templates available for scoring.")
+        if total_weight > 0.0:
+            fused_response = fused_response / total_weight
+        return fused_response, reference_template
+
+    def _response_scores_batch(self, responses: Any) -> list[float]:
+        scores, _, _ = self._response_scores_offsets_batch(responses, None, None)
+        return scores
+
+    def _response_scores_offsets_batch(
+        self,
+        responses: Any,
+        template_feat: Any | None,
+        search_features: Any | None,
+    ) -> tuple[list[float], list[tuple[float, float]], list[dict[str, float]]]:
+        torch = self.deep_extractor._torch
+        response_maps = responses.detach().float().squeeze(1)
+        flat = response_maps.flatten(start_dim=1)
+        peaks, peak_indices = flat.max(dim=1)
+        height, width = int(response_maps.shape[-2]), int(response_maps.shape[-1])
+        peak_y = peak_indices // width
+        peak_x = peak_indices % width
+        grid_y = torch.arange(height, device=responses.device)[None, :, None]
+        grid_x = torch.arange(width, device=responses.device)[None, None, :]
+        exclusion = (
+            (torch.abs(grid_y - peak_y[:, None, None]) <= 1)
+            & (torch.abs(grid_x - peak_x[:, None, None]) <= 1)
+        )
+        side = response_maps.masked_fill(exclusion, float("nan")).flatten(start_dim=1)
+        side_count = torch.isfinite(side).sum(dim=1)
+        side_mean = torch.nanmean(side, dim=1)
+        side_mean = torch.where(side_count > 0, side_mean, flat.mean(dim=1))
+        centered = side - side_mean[:, None]
+        side_var = torch.nanmean(centered * centered, dim=1)
+        fallback_var = ((flat - side_mean[:, None]) ** 2).mean(dim=1)
+        side_var = torch.where(side_count > 0, side_var, fallback_var)
+        psr = (peaks - side_mean) / torch.sqrt(side_var.clamp_min(1e-12))
+        confidence = torch.sigmoid((psr - 2.0) / 2.0)
+        response_min = flat.min(dim=1).values
+        apce_den = ((flat - response_min[:, None]) ** 2).mean(dim=1)
+        apce = ((peaks - response_min) ** 2) / apce_den.clamp_min(1e-6)
+
+        if template_feat is not None and search_features is not None:
+            template_h, template_w = int(template_feat.shape[-2]), int(template_feat.shape[-1])
+            search_h, search_w = int(search_features.shape[-2]), int(search_features.shape[-1])
+            max_offset_y = max(search_h - template_h, 0) / (2.0 * max(search_h, 1))
+            max_offset_x = max(search_w - template_w, 0) / (2.0 * max(search_w, 1))
+            offset_y = (
+                (0.5 - peak_y.float() / (height - 1)) * 2.0 * max_offset_y
+                if height > 1 else torch.zeros_like(peaks)
+            )
+            offset_x = (
+                (peak_x.float() / (width - 1) - 0.5) * 2.0 * max_offset_x
+                if width > 1 else torch.zeros_like(peaks)
+            )
+        else:
+            offset_y = torch.zeros_like(peaks)
+            offset_x = torch.zeros_like(peaks)
+
+        packed = torch.stack((confidence, offset_y, offset_x, peaks, psr, apce), dim=1).cpu().tolist()
+        scores = [float(row[0]) for row in packed]
+        offsets = [(float(row[1]), float(row[2])) for row in packed]
+        metadata = [
+            {"peak": float(row[3]), "psr": float(row[4]), "apce": float(row[5])}
+            for row in packed
+        ]
+        return scores, offsets, metadata
 
     def _response_confidence(self, response_np: np.ndarray, peak_y: int, peak_x: int) -> tuple[float, float, float, float]:
         peak = float(response_np[peak_y, peak_x])
@@ -1868,7 +2292,7 @@ class PanoSOTTracker:
 
     def _try_handcrafted_fallback(
         self, frame: np.ndarray, predicted: SphereState,
-    ) -> tuple[SphereState, float]:
+    ) -> tuple[SphereState, float, str]:
         """深度模式低置信时，尝试手工混合追踪（光流/NCC/颜色）作为兜底。
 
         复用手工分支的路由逻辑：
@@ -1889,17 +2313,24 @@ class PanoSOTTracker:
         if self._color_hue is None:
             ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame)
             if ncc_reliable:
-                return ncc_state, max(ncc_score, self.config.handcrafted_high_confidence)
-            return self._local_search_handcrafted(frame, hand_predicted)
+                self.runtime_stats.fallback_ncc_results += 1
+                return ncc_state, max(ncc_score, self.config.handcrafted_high_confidence), "ncc"
+            self.runtime_stats.fallback_local_search_results += 1
+            state, score = self._local_search_handcrafted(frame, hand_predicted)
+            return state, score, "local_search"
         else:
             flow_state, flow_reliable = self._predict_with_optical_flow(frame, self._hand_state or self.state)
             if flow_reliable:
                 flow_score = self._score_state_handcrafted(frame, flow_state)
-                return flow_state, max(flow_score, self.config.handcrafted_high_confidence)
+                self.runtime_stats.fallback_flow_results += 1
+                return flow_state, max(flow_score, self.config.handcrafted_high_confidence), "flow"
             color_state, color_reliable = self._predict_with_color(frame, hand_predicted)
             if color_reliable:
-                return color_state, self.config.handcrafted_high_confidence
-            return self._local_search_handcrafted(frame, hand_predicted)
+                self.runtime_stats.fallback_color_results += 1
+                return color_state, self.config.handcrafted_high_confidence, "color"
+            self.runtime_stats.fallback_local_search_results += 1
+            state, score = self._local_search_handcrafted(frame, hand_predicted)
+            return state, score, "local_search"
 
     def _local_search_deep(self, frame: np.ndarray, predicted: SphereState) -> tuple[SphereState, float]:
         """深度特征 coarse-to-fine 搜索（三模板加权融合版本）。"""
@@ -1923,7 +2354,8 @@ class PanoSOTTracker:
         )
 
         scale_factors = self.config.deep_scale_factors
-
+        scale_data: list[tuple[float, float, float, float, float]] = []
+        coarse_patches: list[np.ndarray] = []
         for scale in scale_factors:
             candidate_width, candidate_height = self._clamp_target_size(
                 predicted.equatorial_width * scale,
@@ -1933,47 +2365,50 @@ class PanoSOTTracker:
                 SphereState(predicted.lon, predicted.lat, candidate_width, candidate_height),
                 enlarge=search_enlarge,
             )
+            scale_data.append((scale, fov_x, fov_y, candidate_width, candidate_height))
+            coarse_patches.append(self._extract_search_patch(
+                frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
+            ))
+
+        coarse_features = self.deep_extractor.extract_search_features_batch(
+            coarse_patches, refine=False, chunk_size=1,
+        )
+        coarse_responses, coarse_reference = self._fused_template_responses_batch(coarse_features)
+        coarse_scores, coarse_offsets, coarse_metadata = self._response_scores_offsets_batch(
+            coarse_responses, coarse_reference, coarse_features,
+        )
+        coarse_results: list[tuple[float, float, float, dict[str, float]]] = []
+        refine_patches: list[np.ndarray] = []
+        for index, (_, fov_x, fov_y, _, _) in enumerate(scale_data):
+            score = coarse_scores[index]
+            off_y, off_x = coarse_offsets[index]
+            coarse_lon = wrap_lon(predicted.lon + off_x * fov_x)
+            coarse_lat = clamp_lat(predicted.lat + off_y * fov_y)
+            coarse_results.append((float(score), float(coarse_lon), float(coarse_lat), coarse_metadata[index]))
+            refine_patches.append(self._extract_search_patch(
+                frame, coarse_lon, coarse_lat, fov_x * 0.5, fov_y * 0.5, refine=True,
+            ))
+
+        refine_features = self.deep_extractor.extract_search_features_batch(
+            refine_patches, refine=True, chunk_size=1,
+        )
+        refine_responses, refine_reference = self._fused_template_responses_batch(refine_features)
+        refine_scores, refine_offsets, refine_metadata = self._response_scores_offsets_batch(
+            refine_responses, refine_reference, refine_features,
+        )
+
+        for index, (scale, fov_x, fov_y, candidate_width, candidate_height) in enumerate(scale_data):
+            score, coarse_lon, coarse_lat, _ = coarse_results[index]
 
             scale_best_score = -1.0
             scale_best_state = predicted
             scale_best_debug_payload: dict[str, np.ndarray] | None = None
 
-            coarse_patch = None
-            if capture_debug:
-                coarse_patch = self._extract_search_patch(
-                    frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
-                )
-                search_feat = self.deep_extractor.extract_search_feature(coarse_patch, refine=False)
-            else:
-                search_feat = self._extract_search_feat(
-                    frame, predicted.lon, predicted.lat, fov_x, fov_y, refine=False,
-                )
-            response, reference_template = self._fused_template_response(search_feat)
-            score, (off_y, off_x), _ = self._response_score_offset(
-                response, reference_template, search_feat,
-            )
-            coarse_response = self._response_to_numpy(response) if capture_debug else None
-
-            coarse_lon = wrap_lon(predicted.lon + off_x * fov_x)
-            coarse_lat = clamp_lat(predicted.lat + off_y * fov_y)
-
             refine_fov_x = fov_x * 0.5
             refine_fov_y = fov_y * 0.5
-            refine_patch = None
-            if capture_debug:
-                refine_patch = self._extract_search_patch(
-                    frame, coarse_lon, coarse_lat, refine_fov_x, refine_fov_y, refine=True,
-                )
-                refine_feat = self.deep_extractor.extract_search_feature(refine_patch, refine=True)
-            else:
-                refine_feat = self._extract_search_feat(
-                    frame, coarse_lon, coarse_lat, refine_fov_x, refine_fov_y, refine=True,
-                )
-            refine_response, refine_reference = self._fused_template_response(refine_feat)
-            refine_score, (roff_y, roff_x), refine_meta = self._response_score_offset(
-                refine_response, refine_reference, refine_feat,
-            )
-            refine_response_np = self._response_to_numpy(refine_response) if capture_debug else None
+            refine_score = refine_scores[index]
+            roff_y, roff_x = refine_offsets[index]
+            refine_meta = refine_metadata[index]
 
             refined_lon = wrap_lon(coarse_lon + roff_x * refine_fov_x)
             refined_lat = clamp_lat(coarse_lat + roff_y * refine_fov_y)
@@ -1989,15 +2424,11 @@ class PanoSOTTracker:
                     angular_height=float(candidate_height),
                 )
                 if capture_debug:
-                    scale_best_debug_payload = {}
-                    if coarse_patch is not None:
-                        scale_best_debug_payload["coarse_patch"] = coarse_patch
-                    if coarse_response is not None:
-                        scale_best_debug_payload["coarse_response"] = coarse_response
-                    if refine_patch is not None:
-                        scale_best_debug_payload["refine_patch"] = refine_patch
-                    if refine_response_np is not None:
-                        scale_best_debug_payload["refine_response"] = refine_response_np
+                    scale_best_debug_payload = {
+                        "coarse_patch": coarse_patches[index],
+                        "refine_patch": refine_patches[index],
+                        "refine_response": self._response_to_numpy(refine_responses[index : index + 1]),
+                    }
 
             if scale_best_score > best_score:
                 best_score = scale_best_score
@@ -2013,11 +2444,42 @@ class PanoSOTTracker:
             self._debug_payload = best_debug_payload or {}
         return best_state, best_score
 
+    def _reloc_scores_deep_batch(self, patches: list[np.ndarray]) -> list[tuple[float, float]]:
+        if not patches:
+            return []
+        search_features = self.deep_extractor.extract_search_features_batch(
+            patches, refine=False, chunk_size=16,
+        )
+        if self.config.relocalize_use_init_only and self._template_feats:
+            init_bank = (
+                self._template_feat_banks[0]
+                if self._template_feat_banks else [self._template_feats[0]]
+            )
+            bank_features = self.deep_extractor._torch.cat(init_bank, dim=0)
+            bank_responses = self.similarity_head.forward_bank_to_searches(
+                bank_features, search_features,
+            )
+            self.runtime_stats.response_maps += int(bank_responses.shape[0] * bank_responses.shape[1])
+            self.runtime_stats.response_batches += 1
+            bank_peaks = bank_responses.flatten(start_dim=3).max(dim=3).values.squeeze(-1)
+            best_bank = bank_peaks.argmax(dim=1)
+            search_indices = self.deep_extractor._torch.arange(
+                int(search_features.shape[0]), device=search_features.device,
+            )
+            responses = bank_responses[search_indices, best_bank]
+        else:
+            responses, _ = self._fused_template_responses_batch(search_features)
+        scores, _, metadata = self._response_scores_offsets_batch(responses, None, None)
+        return [(score, meta["psr"]) for score, meta in zip(scores, metadata)]
+
     def _global_relocalize(
         self,
         frame: np.ndarray,
         predicted: SphereState,
-    ) -> tuple[SphereState, float]:
+        *,
+        use_deep: bool | None = None,
+    ) -> tuple[SphereState, float, float]:
+        deep_search = self._deep_mode if use_deep is None else bool(use_deep and self._deep_mode)
         coarse_stride_lon = self.config.relocalize_stride_deg
         coarse_stride_lat = self.config.relocalize_lat_stride_deg
         fine_stride_lon = coarse_stride_lon * 0.5
@@ -2037,6 +2499,7 @@ class PanoSOTTracker:
 
         best_overall_state = predicted
         best_overall_score = -1.0
+        best_overall_psr = 0.0
 
         for reloc_scale in scales:
             reloc_state = SphereState(
@@ -2046,18 +2509,26 @@ class PanoSOTTracker:
                 angular_height=predicted.angular_height * reloc_scale,
             )
 
-            if self._deep_mode:
+            if deep_search:
                 fov_x, fov_y = state_size_to_fov(reloc_state, enlarge=self.config.deep_search_enlarge)
             else:
                 fov_x, fov_y = self._handcrafted_match_fov(reloc_state)
 
-            candidates: list[tuple[float, SphereState]] = []
+            candidates: list[tuple[float, SphereState, float]] = []
+            coarse_states: list[SphereState] = []
+            coarse_patches: list[np.ndarray] = []
 
             for lon in lon_values_coarse:
                 for lat in lat_values_coarse:
                     lat_val = clamp_lat(float(lat))
-                    if self._deep_mode:
-                        score = self._reloc_score_deep(frame, float(lon), lat_val, fov_x, fov_y)
+                    state = SphereState(
+                        lon=float(lon), lat=lat_val,
+                        equatorial_width=reloc_state.equatorial_width,
+                        angular_height=reloc_state.angular_height,
+                    )
+                    if deep_search:
+                        coarse_states.append(state)
+                        continue
                     else:
                         patch = tangent_patch(
                             frame, float(lon), lat_val, fov_x, fov_y,
@@ -2067,18 +2538,28 @@ class PanoSOTTracker:
                     dist_lon = abs(lon_distance(float(lon), predicted.lon))
                     dist_lat = abs(lat_val - predicted.lat)
                     score -= 0.01 * dist_lon + 0.02 * dist_lat
-                    candidates.append((score, SphereState(
-                        lon=float(lon), lat=lat_val,
-                        equatorial_width=reloc_state.equatorial_width,
-                        angular_height=reloc_state.angular_height,
-                    )))
+                    candidates.append((score, state, float("inf")))
+
+            if deep_search:
+                coarse_patches = [
+                    self._extract_search_patch(
+                        frame, state.lon, state.lat, fov_x, fov_y, refine=False,
+                    )
+                    for state in coarse_states
+                ]
+                coarse_scores = self._reloc_scores_deep_batch(coarse_patches)
+                for (score, psr), state in zip(coarse_scores, coarse_states):
+                    dist_lon = abs(lon_distance(state.lon, predicted.lon))
+                    dist_lat = abs(state.lat - predicted.lat)
+                    candidates.append((score - 0.01 * dist_lon - 0.02 * dist_lat, state, psr))
 
             candidates.sort(key=lambda item: item[0], reverse=True)
             best_state = predicted
             best_score = -1.0
+            best_psr = 0.0
 
-            for coarse_score, coarse_state in candidates[: self.config.relocalize_topk]:
-                if coarse_score < self._occlusion_threshold():
+            for coarse_score, coarse_state, coarse_psr in candidates[: self.config.relocalize_topk]:
+                if coarse_score < self._occlusion_threshold(handcrafted_result=not deep_search):
                     continue
 
                 lon_range = np.deg2rad(np.arange(
@@ -2088,45 +2569,74 @@ class PanoSOTTracker:
                     -fine_stride_lat, fine_stride_lat + 1e-6, fine_stride_lat, dtype=np.float32
                 ))
 
-                fine_candidates: list[tuple[float, SphereState]] = []
+                fine_candidates: list[tuple[float, SphereState, float]] = []
+                fine_states: list[SphereState] = []
+                fine_patches: list[np.ndarray] = []
                 for dlon in lon_range:
                     for dlat in lat_range:
                         lon_val = wrap_lon(coarse_state.lon + dlon)
                         lat_val = clamp_lat(coarse_state.lat + dlat)
-                        if self._deep_mode:
-                            score = self._reloc_score_deep(frame, float(lon_val), float(lat_val), fov_x, fov_y)
+                        state = SphereState(
+                            lon=float(lon_val), lat=float(lat_val),
+                            equatorial_width=coarse_state.equatorial_width,
+                            angular_height=coarse_state.angular_height,
+                        )
+                        if deep_search:
+                            fine_states.append(state)
+                            continue
                         else:
                             patch = tangent_patch(
                                 frame, float(lon_val), float(lat_val), fov_x, fov_y,
                                 self.config.template_size, self.config.template_size,
                             )
                             score = self._score_patch(patch)
-                        fine_candidates.append((score, SphereState(
-                            lon=float(lon_val), lat=float(lat_val),
-                            equatorial_width=coarse_state.equatorial_width,
-                            angular_height=coarse_state.angular_height,
-                        )))
+                        fine_candidates.append((score, state, float("inf")))
+
+                if deep_search:
+                    fine_patches = [
+                        self._extract_search_patch(
+                            frame, state.lon, state.lat, fov_x, fov_y, refine=False,
+                        )
+                        for state in fine_states
+                    ]
+                    fine_scores = self._reloc_scores_deep_batch(fine_patches)
+                    fine_candidates.extend(
+                        (score, state, psr)
+                        for (score, psr), state in zip(fine_scores, fine_states)
+                    )
 
                 if fine_candidates:
                     fine_candidates.sort(key=lambda item: item[0], reverse=True)
                     best_fine_state = fine_candidates[0][1]
                     best_fine_score = fine_candidates[0][0]
+                    best_fine_psr = fine_candidates[0][2]
                 else:
                     best_fine_state = coarse_state
                     best_fine_score = coarse_score
+                    best_fine_psr = coarse_psr
 
-                refined_state, refined_score = self._local_search(frame, best_fine_state)
+                if deep_search:
+                    refined_state, refined_score = self._local_search_deep(frame, best_fine_state)
+                else:
+                    refined_state, refined_score = self._local_search_handcrafted(frame, best_fine_state)
                 final_score = max(refined_score, best_fine_score)
+                final_psr = (
+                    float(self.runtime_stats.last_psr)
+                    if deep_search and refined_score >= best_fine_score
+                    else best_fine_psr
+                )
 
                 if final_score > best_score:
                     best_state = refined_state
                     best_score = final_score
+                    best_psr = final_psr
 
             if best_score > best_overall_score:
                 best_overall_score = best_score
                 best_overall_state = best_state
+                best_overall_psr = best_psr
 
-        return best_overall_state, best_overall_score
+        return best_overall_state, best_overall_score, best_overall_psr
 
     def _reloc_score_deep(self, frame: np.ndarray, lon: float, lat: float,
                           fov_x: float, fov_y: float) -> float:

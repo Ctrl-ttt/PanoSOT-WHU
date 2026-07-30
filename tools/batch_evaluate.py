@@ -105,6 +105,8 @@ class SeqResult:
     auc: float
     mean_iou: float
     error: Optional[str] = None
+    runtime_stats: Optional[dict[str, float | int]] = None
+    prefix_metrics: Optional[dict[str, dict[str, float]]] = None
 
 
 def evaluate_one(
@@ -161,6 +163,14 @@ def evaluate_one(
 
     image_width = float(load_image(frame_paths[0]).shape[1])
     metrics = otb_metrics(pred_arr, gt_arr, image_width=image_width)
+    prefix_metrics = {}
+    checkpoints = [100, 300, 600, 1200, 1800, n]
+    for checkpoint in sorted({min(value, n) for value in checkpoints if value > 0}):
+        prefix_metrics[str(checkpoint)] = otb_metrics(
+            pred_arr[:checkpoint],
+            gt_arr[:checkpoint],
+            image_width=image_width,
+        )
 
     # 可选：写出预测结果
     if output_pred:
@@ -174,6 +184,8 @@ def evaluate_one(
         success_rate=metrics["success_rate"],
         auc=metrics["auc"],
         mean_iou=metrics["mean_iou"],
+        runtime_stats=tracker.get_runtime_stats(),
+        prefix_metrics=prefix_metrics,
     )
 
 
@@ -280,6 +292,11 @@ def main() -> None:
             backbone_name=args.backbone,
             device=resolved_device,
             use_amp=resolved_device.startswith("cuda"),
+            feature_layer=config.deep_feature_layer,
+            normalize_features=config.normalize_deep_features,
+            template_size=config.deep_template_size,
+            coarse_search_size=config.coarse_search_size,
+            refine_search_size=config.refine_search_size,
         )
         config.device = resolved_device
         deep_extractor = DeepFeatureExtractor(feat_config)
@@ -367,6 +384,8 @@ def main() -> None:
                     "auc": r.auc,
                     "mean_iou": r.mean_iou,
                     "error": r.error,
+                    "runtime_stats": r.runtime_stats,
+                    "prefix_metrics": r.prefix_metrics,
                 }
                 for r in results
             ],
