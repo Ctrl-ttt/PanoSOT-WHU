@@ -159,6 +159,29 @@ class TrackerConfig:
     deep_local_max_lat_jump_deg: float = 5.0
     deep_local_lon_jump_size_ratio: float = 0.90
     deep_local_lat_jump_size_ratio: float = 0.25
+    deep_semantic_proposal_enabled: bool = True
+    deep_semantic_history_size: int = 8
+    deep_semantic_history_interval: int = 40
+    deep_semantic_history_ncc_score: float = 0.55
+    deep_semantic_trigger_ncc_score: float = 0.40
+    deep_semantic_trigger_frames: int = 8
+    deep_semantic_min_interval: int = 20
+    deep_semantic_min_score: float = 0.58
+    deep_semantic_topk: int = 3
+    deep_semantic_nms_deg: float = 18.0
+    deep_semantic_lon_stride_deg: float = 24.0
+    deep_semantic_lat_stride_deg: float = 18.0
+    deep_semantic_lat_limit_deg: float = 36.0
+    deep_semantic_scale_pairs: tuple[tuple[float, float], ...] = (
+        (0.8, 0.8), (1.0, 0.8), (1.0, 1.0),
+        (1.25, 0.7), (1.5, 0.6), (1.5, 0.8),
+        (2.0, 0.6), (2.0, 0.8), (2.5, 0.8),
+    )
+    deep_semantic_verify_score_margin: float = 0.08
+    deep_semantic_verify_psr: float = 1.75
+    deep_semantic_refine_offsets_deg: tuple[float, ...] = (-6.0, -3.0, 0.0, 3.0, 6.0)
+    deep_semantic_motion_penalty: float = 0.10
+    deep_semantic_batch_size: int = 32
 
     # --- 手工特征低置信保护 ---
     handcrafted_hold_position_score: float = 0.12
@@ -248,6 +271,15 @@ class TrackerRuntimeStats:
     deep_psr_below_150: int = 0
     deep_psr_below_175: int = 0
     deep_psr_below_200: int = 0
+    semantic_proposal_attempts: int = 0
+    semantic_proposal_candidates: int = 0
+    semantic_refine_attempts: int = 0
+    semantic_refine_accepts: int = 0
+    semantic_history_updates: int = 0
+    last_semantic_score: float = 0.0
+    last_semantic_refine_score: float = 0.0
+    last_semantic_current_score: float = 0.0
+    last_semantic_refine_psr: float = 0.0
     template_updates: int = 0
     response_maps: int = 0
     response_batches: int = 0
@@ -351,6 +383,11 @@ class PanoSOTTracker:
         self._last_deep_probe_frame = -max(self.config.deep_probe_interval, 1)
         self._consecutive_low_deep_probes = 0
         self._consecutive_relocalization_rejects = 0
+        self._semantic_history: list[Any] = []
+        self._semantic_size_anchor: SphereState | None = None
+        self._last_semantic_history_frame = -max(self.config.deep_semantic_history_interval, 1)
+        self._last_semantic_proposal_frame = -max(self.config.deep_semantic_min_interval, 1)
+        self._consecutive_low_ncc = 0
         self.runtime_stats = TrackerRuntimeStats()
         self._debug_payload: dict[str, np.ndarray] | None = None
         self._last_state_trust = 1.0
@@ -431,6 +468,16 @@ class PanoSOTTracker:
             "deep_psr_below_150": stats.deep_psr_below_150,
             "deep_psr_below_175": stats.deep_psr_below_175,
             "deep_psr_below_200": stats.deep_psr_below_200,
+            "semantic_proposal_attempts": stats.semantic_proposal_attempts,
+            "semantic_proposal_candidates": stats.semantic_proposal_candidates,
+            "semantic_refine_attempts": stats.semantic_refine_attempts,
+            "semantic_refine_accepts": stats.semantic_refine_accepts,
+            "semantic_history_updates": stats.semantic_history_updates,
+            "semantic_history_size": len(self._semantic_history),
+            "last_semantic_score": stats.last_semantic_score,
+            "last_semantic_refine_score": stats.last_semantic_refine_score,
+            "last_semantic_current_score": stats.last_semantic_current_score,
+            "last_semantic_refine_psr": stats.last_semantic_refine_psr,
             "template_updates": stats.template_updates,
             "response_maps": stats.response_maps,
             "response_batches": stats.response_batches,
@@ -520,6 +567,273 @@ class PanoSOTTracker:
             equatorial_width=hand_state.equatorial_width,
             angular_height=hand_state.angular_height,
         )
+
+    def _semantic_descriptor(self, feature: Any) -> Any:
+        torch = self.deep_extractor._torch
+        descriptor = feature.float().mean(dim=(2, 3))
+        return torch.nn.functional.normalize(descriptor, p=2, dim=1, eps=1e-6)
+
+    def _semantic_proposal_due(self) -> bool:
+        return (
+            self._deep_mode
+            and self.config.deep_semantic_proposal_enabled
+            and bool(self._semantic_history)
+            and self._semantic_size_anchor is not None
+            and self._consecutive_low_ncc >= max(int(self.config.deep_semantic_trigger_frames), 1)
+            and self._frame_count - self._last_semantic_proposal_frame
+            >= max(int(self.config.deep_semantic_min_interval), 1)
+        )
+
+    def _record_semantic_history(self, frame: np.ndarray, state: SphereState) -> None:
+        if not self._deep_mode or not self.config.deep_semantic_proposal_enabled:
+            return
+        if (
+            self._semantic_size_anchor is None
+            or state.equatorial_width * state.angular_height
+            >= self._semantic_size_anchor.equatorial_width * self._semantic_size_anchor.angular_height
+        ):
+            self._semantic_size_anchor = SphereState(
+                state.lon, state.lat, state.equatorial_width, state.angular_height,
+            )
+        interval = max(int(self.config.deep_semantic_history_interval), 1)
+        if self._semantic_history and self._frame_count - self._last_semantic_history_frame < interval:
+            return
+        feature = self._extract_template_feat(frame, state)
+        self._semantic_history.append(self._semantic_descriptor(feature).detach())
+        max_history = max(int(self.config.deep_semantic_history_size), 1)
+        self._semantic_history = self._semantic_history[-max_history:]
+        self._last_semantic_history_frame = self._frame_count
+        self.runtime_stats.semantic_history_updates += 1
+
+    def _semantic_score_features(self, features: Any) -> Any:
+        history = self.deep_extractor._torch.cat(self._semantic_history, dim=0)
+        return (self._semantic_descriptor(features) @ history.T).mean(dim=1)
+
+    def _select_semantic_topk(
+        self,
+        states: list[SphereState],
+        scores: Any,
+    ) -> list[tuple[SphereState, float]]:
+        ranked = sorted(
+            zip(states, (float(score) for score in scores)),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        selected: list[tuple[SphereState, float]] = []
+        min_distance = math.radians(max(float(self.config.deep_semantic_nms_deg), 0.0))
+        for state, score in ranked:
+            if score < self.config.deep_semantic_min_score:
+                break
+            if any(
+                math.hypot(
+                    lon_distance(state.lon, existing.lon) * math.cos(existing.lat),
+                    state.lat - existing.lat,
+                ) < min_distance
+                for existing, _ in selected
+            ):
+                continue
+            selected.append((state, score))
+            if len(selected) >= max(int(self.config.deep_semantic_topk), 1):
+                break
+        return selected
+
+    def _semantic_proposals(self, frame: np.ndarray) -> list[tuple[SphereState, float]]:
+        if self._semantic_size_anchor is None or not self._semantic_history:
+            return []
+        lon_values = np.deg2rad(np.arange(
+            -180.0, 180.0,
+            max(float(self.config.deep_semantic_lon_stride_deg), 1.0),
+            dtype=np.float32,
+        ))
+        lat_limit = min(max(float(self.config.deep_semantic_lat_limit_deg), 0.0), 80.0)
+        lat_values = np.deg2rad(np.arange(
+            -lat_limit, lat_limit + 1e-6,
+            max(float(self.config.deep_semantic_lat_stride_deg), 1.0),
+            dtype=np.float32,
+        ))
+        states: list[SphereState] = []
+        patches: list[np.ndarray] = []
+        for width_scale, height_scale in self.config.deep_semantic_scale_pairs:
+            width, height = self._clamp_target_size(
+                self._semantic_size_anchor.equatorial_width * width_scale,
+                self._semantic_size_anchor.angular_height * height_scale,
+            )
+            size_state = SphereState(0.0, 0.0, width, height)
+            fov_x, fov_y = state_size_to_fov(
+                size_state, enlarge=self.config.deep_search_enlarge,
+            )
+            for lon in lon_values:
+                for lat in lat_values:
+                    state = SphereState(float(lon), float(lat), width, height)
+                    states.append(state)
+                    patches.append(self._extract_search_patch(
+                        frame, state.lon, state.lat, fov_x, fov_y, refine=False,
+                    ))
+        if not patches:
+            return []
+        features = self.deep_extractor.extract_search_features_batch(
+            patches,
+            refine=False,
+            chunk_size=max(int(self.config.deep_semantic_batch_size), 1),
+        )
+        return self._select_semantic_topk(states, self._semantic_score_features(features))
+
+    def _refine_semantic_proposals(
+        self,
+        frame: np.ndarray,
+        proposals: list[SphereState],
+        current: SphereState,
+    ) -> list[tuple[SphereState, float, float, float, float]]:
+        if not proposals:
+            return []
+        refine_states: list[SphereState] = []
+        refine_patches: list[np.ndarray] = []
+        proposal_ranges: list[tuple[int, int]] = []
+        for proposal in proposals:
+            start = len(refine_states)
+            fov_x, fov_y = state_size_to_fov(
+                proposal, enlarge=self.config.deep_search_enlarge,
+            )
+            for lon_offset_deg in self.config.deep_semantic_refine_offsets_deg:
+                for lat_offset_deg in self.config.deep_semantic_refine_offsets_deg:
+                    state = SphereState(
+                        lon=float(wrap_lon(proposal.lon + math.radians(lon_offset_deg))),
+                        lat=float(clamp_lat(proposal.lat + math.radians(lat_offset_deg))),
+                        equatorial_width=proposal.equatorial_width,
+                        angular_height=proposal.angular_height,
+                    )
+                    refine_states.append(state)
+                    refine_patches.append(self._extract_search_patch(
+                        frame, state.lon, state.lat, fov_x, fov_y, refine=False,
+                    ))
+            proposal_ranges.append((start, len(refine_states)))
+        features = self.deep_extractor.extract_search_features_batch(
+            refine_patches,
+            refine=False,
+            chunk_size=max(int(self.config.deep_semantic_batch_size), 1),
+        )
+        semantic_scores = self._semantic_score_features(features)
+        selected_indices = [
+            start + int(semantic_scores[start:end].argmax())
+            for start, end in proposal_ranges
+        ]
+        selected_features = features[selected_indices]
+        correlation_scores = self._reloc_scores_deep_features(selected_features)
+        results = []
+        motion_penalty = max(float(self.config.deep_semantic_motion_penalty), 0.0)
+        for index, (score, psr) in zip(selected_indices, correlation_scores):
+            refined = refine_states[index]
+            distance = math.hypot(
+                lon_distance(refined.lon, current.lon) * math.cos(current.lat),
+                refined.lat - current.lat,
+            )
+            ranked_score = float(score) - motion_penalty * distance
+            results.append((
+                refined,
+                float(semantic_scores[index]),
+                float(score),
+                float(psr),
+                ranked_score,
+            ))
+        return results
+
+    def _refine_semantic_proposal(
+        self,
+        frame: np.ndarray,
+        proposal: SphereState,
+        current: SphereState,
+    ) -> tuple[SphereState, float, float, float, float]:
+        return self._refine_semantic_proposals(frame, [proposal], current)[0]
+
+    def _verify_semantic_proposals(
+        self,
+        frame: np.ndarray,
+        current: SphereState,
+        current_score: float,
+        proposals: list[tuple[SphereState, float]],
+    ) -> tuple[SphereState, float, float] | None:
+        if not proposals:
+            return None
+        saved_quality = (
+            self.runtime_stats.last_score,
+            self.runtime_stats.last_peak,
+            self.runtime_stats.last_psr,
+            self.runtime_stats.last_apce,
+        )
+        current_refined, current_refine_score = self._local_search_deep(frame, current)
+        current_refine_score = max(float(current_refine_score), float(current_score))
+        current_ranked_score = current_refine_score
+        best_state = current_refined
+        best_score = current_refine_score
+        best_ranked_score = current_ranked_score
+        best_psr = float(self.runtime_stats.last_psr)
+        best_semantic_score = 0.0
+        best_quality = (
+            self.runtime_stats.last_score,
+            self.runtime_stats.last_peak,
+            self.runtime_stats.last_psr,
+            self.runtime_stats.last_apce,
+        )
+        refined_proposals = self._refine_semantic_proposals(
+            frame, [proposal for proposal, _ in proposals], current,
+        )
+        self.runtime_stats.semantic_refine_attempts += len(refined_proposals)
+        for refined_result in refined_proposals:
+            refined, refined_semantic_score, score, psr, ranked_score = (
+                refined_result
+            )
+            if ranked_score > best_ranked_score and psr >= self.config.deep_semantic_verify_psr:
+                best_state = SphereState(
+                    refined.lon,
+                    refined.lat,
+                    current.equatorial_width,
+                    current.angular_height,
+                )
+                best_score = float(score)
+                best_ranked_score = ranked_score
+                best_psr = psr
+                best_semantic_score = refined_semantic_score
+                best_quality = (
+                    float(score),
+                    saved_quality[1],
+                    float(psr),
+                    saved_quality[3],
+                )
+
+        self.runtime_stats.last_semantic_current_score = current_refine_score
+        self.runtime_stats.last_semantic_refine_score = best_score
+        self.runtime_stats.last_semantic_refine_psr = best_psr
+        accepted = (
+            best_semantic_score > 0.0
+            and best_ranked_score
+            >= current_ranked_score + self.config.deep_semantic_verify_score_margin
+        )
+        if not accepted:
+            (
+                self.runtime_stats.last_score,
+                self.runtime_stats.last_peak,
+                self.runtime_stats.last_psr,
+                self.runtime_stats.last_apce,
+            ) = saved_quality
+            return None
+        (
+            self.runtime_stats.last_score,
+            self.runtime_stats.last_peak,
+            self.runtime_stats.last_psr,
+            self.runtime_stats.last_apce,
+        ) = best_quality
+        self.runtime_stats.last_semantic_score = best_semantic_score
+        return best_state, best_score, best_psr
+
+    def _sync_semantic_recovery(self, frame: np.ndarray, state: SphereState) -> None:
+        self.velocity[:] = 0.0
+        self._hand_velocity[:] = 0.0
+        self._hand_state = state
+        if self.frame_shape is None:
+            return
+        bbox = self._state_to_output_bbox(state, self.frame_shape[1], self.frame_shape[0])
+        self._ncc_bbox = bbox.astype(np.float32)
+        self._color_bbox = bbox.astype(np.float32)
 
     def _update_quality_threshold(self, handcrafted_result: bool = False) -> float:
         if self._deep_mode and not handcrafted_result:
@@ -684,6 +998,11 @@ class PanoSOTTracker:
         self._last_deep_probe_frame = -max(self.config.deep_probe_interval, 1)
         self._consecutive_low_deep_probes = 0
         self._consecutive_relocalization_rejects = 0
+        self._semantic_history.clear()
+        self._semantic_size_anchor = None
+        self._last_semantic_history_frame = -max(self.config.deep_semantic_history_interval, 1)
+        self._last_semantic_proposal_frame = -max(self.config.deep_semantic_min_interval, 1)
+        self._consecutive_low_ncc = 0
         self.reset_runtime_stats()
 
         self._add_template(frame, self.state, template_type="init")
@@ -701,6 +1020,7 @@ class PanoSOTTracker:
                 self._add_template(frame, perturbed, template_type=t_type)
 
         self._sync_aliases()
+        self._record_semantic_history(frame, self.state)
         self.initialized = True
         init_bbox = self._state_to_output_bbox(self.state, w, h)
         if self._debug_recorder is not None:
@@ -825,6 +1145,8 @@ class PanoSOTTracker:
         color_reliable = False
         ncc_reliable = False
         handcrafted_result = False
+        fallback_source = ""
+        semantic_recovery = False
         if not self._deep_mode:
             if self._color_hue is None:
                 ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame)
@@ -896,10 +1218,36 @@ class PanoSOTTracker:
                         best_state, best_score = hand_state, hand_score
                         handcrafted_result = True
                         self._accept_handcrafted_fallback(hand_state)
+        if self._deep_mode and handcrafted_result and fallback_source == "ncc":
+            if self._ncc_last_score < self.config.deep_semantic_trigger_ncc_score:
+                self._consecutive_low_ncc += 1
+            else:
+                self._consecutive_low_ncc = 0
+            if self._ncc_last_score >= self.config.deep_semantic_history_ncc_score:
+                self._record_semantic_history(frame, best_state)
+        elif self._deep_mode and not handcrafted_result:
+            self._consecutive_low_ncc = 0
+
+        if self._semantic_proposal_due():
+            self.runtime_stats.semantic_proposal_attempts += 1
+            self._last_semantic_proposal_frame = self._frame_count
+            proposals = self._semantic_proposals(frame)
+            self.runtime_stats.semantic_proposal_candidates += len(proposals)
+            semantic_result = self._verify_semantic_proposals(
+                frame, best_state, best_score, proposals,
+            )
+            if semantic_result is not None:
+                best_state, best_score, semantic_psr = semantic_result
+                self.runtime_stats.semantic_refine_accepts += 1
+                self.runtime_stats.last_psr = semantic_psr
+                handcrafted_result = False
+                semantic_recovery = True
+                self._consecutive_low_ncc = 0
         candidate_trust = self._state_trust(best_score, handcrafted_result)
         deep_low_quality = (
             self._deep_mode
             and not handcrafted_result
+            and not semantic_recovery
             and (
                 candidate_trust < self.config.deep_velocity_low_trust_threshold
                 or self.runtime_stats.last_psr < self.config.deep_velocity_low_psr_threshold
@@ -961,7 +1309,7 @@ class PanoSOTTracker:
                 if self._relocalize_cooldown_elapsed():
                     should_relocalize = True
 
-        relocalize_applied = False
+        relocalize_applied = semantic_recovery
         if should_relocalize:
             self.runtime_stats.relocalizations += 1
             self._last_relocalize_attempt_frame = self._frame_count
@@ -1020,16 +1368,20 @@ class PanoSOTTracker:
             update_quality_threshold = self._update_quality_threshold(handcrafted_result)
 
         best_state = self._clamp_state_size(best_state)
-        if best_score < self._freeze_scale_update_confidence(handcrafted_result):
+        if not semantic_recovery and best_score < self._freeze_scale_update_confidence(handcrafted_result):
             best_state = SphereState(
                 lon=best_state.lon,
                 lat=best_state.lat,
                 equatorial_width=self.state.equatorial_width,
                 angular_height=self.state.angular_height,
             )
-        best_state = self._guard_low_confidence_state(
-            predicted, best_state, best_score, handcrafted_result,
-        )
+        if semantic_recovery:
+            self._last_state_trust = 1.0
+            self._last_local_jump_gated = False
+        else:
+            best_state = self._guard_low_confidence_state(
+                predicted, best_state, best_score, handcrafted_result,
+            )
         lon_delta = lon_distance(best_state.lon, self.state.lon)
         lat_delta = best_state.lat - self.state.lat
         momentum = (
@@ -1040,7 +1392,9 @@ class PanoSOTTracker:
         if self._occlusion_frames > self.config.occlusion_suppress_frames:
             momentum = min(momentum, 0.1)
 
-        if deep_low_quality:
+        if semantic_recovery:
+            self.velocity[:] = 0.0
+        elif deep_low_quality:
             decay = float(np.clip(self.config.deep_velocity_decay, 0.0, 1.0))
             self.velocity[0] = decay * self.velocity[0]
             self.velocity[1] = decay * self.velocity[1]
@@ -1050,6 +1404,8 @@ class PanoSOTTracker:
             self.velocity[0] = momentum * self.velocity[0] + (1.0 - momentum) * lon_delta
             self.velocity[1] = momentum * self.velocity[1] + (1.0 - momentum) * lat_delta
         self.state = best_state
+        if semantic_recovery:
+            self._sync_semantic_recovery(frame, best_state)
 
         # P1 fix: 深度模式后台维护手工独立状态，避免完全失活
         if self._deep_mode and self._hand_state is not None and not handcrafted_result:
@@ -2489,6 +2845,11 @@ class PanoSOTTracker:
         search_features = self.deep_extractor.extract_search_features_batch(
             patches, refine=False, chunk_size=16,
         )
+        return self._reloc_scores_deep_features(search_features)
+
+    def _reloc_scores_deep_features(self, search_features: Any) -> list[tuple[float, float]]:
+        if int(search_features.shape[0]) == 0:
+            return []
         if self.config.relocalize_use_init_only and self._template_feats:
             init_bank = (
                 self._template_feat_banks[0]

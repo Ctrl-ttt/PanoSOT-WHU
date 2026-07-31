@@ -327,6 +327,154 @@ class HybridTrackerTests(unittest.TestCase):
             strict_axes=False,
         ))
 
+    def test_semantic_proposal_requires_streak_and_cooldown(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            deep_semantic_trigger_frames=3,
+            deep_semantic_min_interval=20,
+        ))
+        tracker._deep_mode = True
+        tracker._semantic_history = [object()]
+        tracker._semantic_size_anchor = erp_bbox_to_state(
+            np.array([10.0, 10.0, 40.0, 30.0], dtype=np.float32), 200, 100,
+        )
+        tracker._frame_count = 40
+        tracker._last_semantic_proposal_frame = 10
+
+        tracker._consecutive_low_ncc = 2
+        self.assertFalse(tracker._semantic_proposal_due())
+        tracker._consecutive_low_ncc = 3
+        self.assertTrue(tracker._semantic_proposal_due())
+        tracker._last_semantic_proposal_frame = 30
+        self.assertFalse(tracker._semantic_proposal_due())
+
+    def test_semantic_topk_suppresses_nearby_candidates(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            deep_semantic_min_score=0.58,
+            deep_semantic_topk=2,
+            deep_semantic_nms_deg=18.0,
+        ))
+        states = [
+            erp_bbox_to_state(np.array([10.0, 20.0, 20.0, 10.0]), 360, 180),
+            erp_bbox_to_state(np.array([15.0, 20.0, 20.0, 10.0]), 360, 180),
+            erp_bbox_to_state(np.array([100.0, 20.0, 20.0, 10.0]), 360, 180),
+        ]
+
+        selected = tracker._select_semantic_topk(states, [0.90, 0.85, 0.80])
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(selected[0][0], states[0])
+        self.assertEqual(selected[1][0], states[2])
+
+    def test_semantic_verification_rejection_restores_quality_state(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            deep_semantic_verify_score_margin=0.08,
+            deep_semantic_verify_psr=1.75,
+        ))
+        current = erp_bbox_to_state(
+            np.array([10.0, 10.0, 40.0, 30.0], dtype=np.float32), 200, 100,
+        )
+        proposal = erp_bbox_to_state(
+            np.array([100.0, 10.0, 40.0, 30.0], dtype=np.float32), 200, 100,
+        )
+        tracker.runtime_stats.last_score = 0.40
+        tracker.runtime_stats.last_peak = 1.0
+        tracker.runtime_stats.last_psr = 1.2
+        tracker.runtime_stats.last_apce = 2.0
+        def fake_search(frame: np.ndarray, state) -> tuple:
+            result_state, score, psr = current, 0.60, 2.0
+            tracker.runtime_stats.last_score = score
+            tracker.runtime_stats.last_peak = score + 1.0
+            tracker.runtime_stats.last_psr = psr
+            tracker.runtime_stats.last_apce = score + 2.0
+            return result_state, score
+
+        tracker._local_search_deep = fake_search
+        tracker._refine_semantic_proposals = lambda frame, states, anchor: [
+            (proposal, 0.80, 0.65, 2.1, 0.65),
+        ]
+        result = tracker._verify_semantic_proposals(
+            np.zeros((10, 20, 3), dtype=np.float32),
+            current,
+            0.40,
+            [(proposal, 0.80)],
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            (
+                tracker.runtime_stats.last_score,
+                tracker.runtime_stats.last_peak,
+                tracker.runtime_stats.last_psr,
+                tracker.runtime_stats.last_apce,
+            ),
+            (0.40, 1.0, 1.2, 2.0),
+        )
+
+    def test_semantic_verification_accepts_clear_ranked_advantage(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            deep_semantic_verify_score_margin=0.08,
+            deep_semantic_verify_psr=1.75,
+        ))
+        current = erp_bbox_to_state(
+            np.array([10.0, 10.0, 40.0, 30.0], dtype=np.float32), 200, 100,
+        )
+        proposal = erp_bbox_to_state(
+            np.array([100.0, 10.0, 40.0, 30.0], dtype=np.float32), 200, 100,
+        )
+        tracker._local_search_deep = lambda frame, state: (current, 0.48)
+        tracker.runtime_stats.last_psr = 1.6
+        tracker._refine_semantic_proposals = lambda frame, states, anchor: [
+            (proposal, 0.82, 0.64, 2.4, 0.59),
+        ]
+
+        result = tracker._verify_semantic_proposals(
+            np.zeros((10, 20, 3), dtype=np.float32),
+            current,
+            0.48,
+            [(proposal, 0.80)],
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        recovered, score, psr = result
+        self.assertEqual((recovered.lon, recovered.lat), (proposal.lon, proposal.lat))
+        self.assertEqual(
+            (recovered.equatorial_width, recovered.angular_height),
+            (current.equatorial_width, current.angular_height),
+        )
+        self.assertEqual((score, psr), (0.64, 2.4))
+        self.assertEqual(tracker.runtime_stats.last_semantic_score, 0.82)
+
+    def test_semantic_verification_batches_all_proposals(self) -> None:
+        tracker = PanoSOTTracker()
+        current = erp_bbox_to_state(
+            np.array([10.0, 10.0, 40.0, 30.0], dtype=np.float32), 200, 100,
+        )
+        proposals = [
+            erp_bbox_to_state(
+                np.array([x, 10.0, 40.0, 30.0], dtype=np.float32), 200, 100,
+            )
+            for x in (60.0, 100.0, 140.0)
+        ]
+        tracker._local_search_deep = lambda frame, state: (current, 0.60)
+        calls = []
+
+        def fake_batch(frame, states, anchor):
+            calls.append(list(states))
+            return [(state, 0.70, 0.61, 2.0, 0.61) for state in states]
+
+        tracker._refine_semantic_proposals = fake_batch
+        tracker._verify_semantic_proposals(
+            np.zeros((10, 20, 3), dtype=np.float32),
+            current,
+            0.60,
+            [(state, 0.70) for state in proposals],
+        )
+
+        self.assertEqual(calls, [proposals])
+        self.assertEqual(tracker.runtime_stats.semantic_refine_attempts, 3)
+
     def test_batch_discovery_supports_smoke_file_names(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
