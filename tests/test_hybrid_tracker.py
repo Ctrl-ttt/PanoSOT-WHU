@@ -99,6 +99,18 @@ class HybridTrackerTests(unittest.TestCase):
 
         self.assertTrue(np.allclose(sampled, 0.5, atol=0.02))
 
+    def test_ncc_crop_wraps_across_erp_seam(self) -> None:
+        tracker = PanoSOTTracker()
+        frame = np.tile(np.arange(5, dtype=np.uint8), (4, 1))
+
+        crop = tracker._crop_erp_box(
+            frame,
+            np.array([3.0, 1.0, 4.0, 2.0], dtype=np.float32),
+        )
+
+        self.assertIsNotNone(crop)
+        self.assertEqual(crop.tolist(), [[3, 4, 0, 1], [3, 4, 0, 1]])
+
     def test_relocalization_attempt_uses_its_own_cooldown(self) -> None:
         config = TrackerConfig(relocalize_min_interval=10)
         tracker = PanoSOTTracker(config)
@@ -235,12 +247,10 @@ class HybridTrackerTests(unittest.TestCase):
             candidate,
         ))
         tracker._deep_mode = True
-        self.assertTrue(np.array_equal(
-            tracker._guard_ncc_candidate_scale(
-                candidate, previous, np.array([1.12, 1.03]), 0.30,
-            ),
-            candidate,
-        ))
+        guarded_deep = tracker._guard_ncc_candidate_scale(
+            candidate, previous, np.array([1.12, 1.03]), 0.30,
+        )
+        self.assertTrue(np.array_equal(guarded_deep, guarded))
 
     def test_ncc_low_score_scale_keeps_recent_confident_anchor(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(
@@ -264,10 +274,8 @@ class HybridTrackerTests(unittest.TestCase):
             candidate,
         ))
         tracker._deep_mode = True
-        self.assertTrue(np.array_equal(
-            tracker._guard_ncc_scale_anchor(candidate, previous, 0.30),
-            candidate,
-        ))
+        guarded_deep = tracker._guard_ncc_scale_anchor(candidate, previous, 0.30)
+        self.assertTrue(np.array_equal(guarded_deep, guarded))
 
     def test_ncc_rejects_low_score_candidate_opposing_flow(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(

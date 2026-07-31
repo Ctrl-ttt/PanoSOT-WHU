@@ -231,8 +231,8 @@ class TrackerConfig:
     handcrafted_ncc_flow_guard_min_size: float = 64.0
     handcrafted_ncc_flow_scale_tolerance: float = 0.10
     handcrafted_ncc_flow_scale_min_inlier_ratio: float = 0.50
-    handcrafted_ncc_scale_anchor_score: float = 0.55
-    handcrafted_ncc_scale_anchor_min_ratio: float = 0.65
+    handcrafted_ncc_scale_anchor_score: float = 0.99
+    handcrafted_ncc_scale_anchor_min_ratio: float = 1.0
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -1625,11 +1625,14 @@ class PanoSOTTracker:
 
     def _crop_erp_box(self, image: np.ndarray, bbox_xywh: np.ndarray) -> np.ndarray | None:
         x, y, width, height = [int(round(v)) for v in bbox_xywh]
-        if width < 2 or height < 2 or x < 0 or x + width > image.shape[1]:
+        image_height, image_width = image.shape[:2]
+        if width < 2 or height < 2 or image_width < 1 or image_height < 1:
             return None
-        y0 = max(0, min(y, image.shape[0] - 1))
-        y1 = max(y0 + 1, min(y + height, image.shape[0]))
-        return image[y0:y1, x : x + width]
+        width = min(width, image_width)
+        y0 = max(0, min(y, image_height - 1))
+        y1 = max(y0 + 1, min(y + height, image_height))
+        xs = np.mod(np.arange(x, x + width), image_width).astype(np.intp, copy=False)
+        return image[y0:y1][:, xs]
 
     def _initialize_ncc_model(self, frame: np.ndarray, bbox_xywh: np.ndarray) -> None:
         self._ncc_initial_template = None
@@ -1699,13 +1702,19 @@ class PanoSOTTracker:
             self._ncc_frames_since_flow += 1
         predicted_center_x = center_x + float(predicted_delta[0])
         predicted_center_y = center_y + float(predicted_delta[1])
-        search_width = max(box[2] * self.config.handcrafted_ncc_search_factor, 220.0)
+        search_width = min(
+            max(box[2] * self.config.handcrafted_ncc_search_factor, 220.0),
+            float(image_width),
+        )
         search_height = max(box[3] * self.config.handcrafted_ncc_search_factor, 180.0)
-        x0 = max(0, int(predicted_center_x - 0.5 * search_width))
+        x0 = int(math.floor(predicted_center_x - 0.5 * search_width))
         y0 = max(0, int(predicted_center_y - 0.5 * search_height))
-        x1 = min(image_width, int(predicted_center_x + 0.5 * search_width))
+        x1 = int(math.ceil(predicted_center_x + 0.5 * search_width))
         y1 = min(image_height, int(predicted_center_y + 0.5 * search_height))
-        search = gray[y0:y1, x0:x1]
+        if x1 <= x0:
+            x1 = x0 + 1
+        xs = np.mod(np.arange(x0, x1), image_width).astype(np.intp, copy=False)
+        search = gray[y0:y1][:, xs]
         if search.shape[0] < 16 or search.shape[1] < 16:
             if self.state is None:
                 raise RuntimeError("Tracker state is unavailable.")
@@ -1725,6 +1734,8 @@ class PanoSOTTracker:
         )
         best_score = -1.0
         best_box: np.ndarray | None = None
+        best_center_x: float | None = None
+        best_center_y: float | None = None
         for width_scale, height_scale in scale_pairs:
             width = max(12, int(round(box[2] * width_scale)))
             height = max(12, int(round(box[3] * height_scale)))
@@ -1754,7 +1765,8 @@ class PanoSOTTracker:
                 _, raw_score, _, local_location = cv2.minMaxLoc(allowed_response)
                 location_x = allowed_x0 + local_location[0]
                 location_y = allowed_y0 + local_location[1]
-                candidate_center_x = x0 + location_x + 0.5 * width
+                candidate_start_x = x0 + location_x
+                candidate_center_x = candidate_start_x + 0.5 * width
                 candidate_center_y = y0 + location_y + 0.5 * height
                 normalized_distance = math.hypot(
                     (candidate_center_x - predicted_center_x) / search_width,
@@ -1769,19 +1781,24 @@ class PanoSOTTracker:
                 if adjusted_score > best_score:
                     best_score = adjusted_score
                     best_box = np.array(
-                        [x0 + location_x, y0 + location_y, width, height],
+                        [candidate_start_x % image_width, y0 + location_y, width, height],
                         dtype=np.float64,
                     )
+                    best_center_x = candidate_center_x
+                    best_center_y = candidate_center_y
 
         if best_box is None:
             if self.state is None:
                 raise RuntimeError("Tracker state is unavailable.")
             return self.state, best_score, False
 
+        if best_center_x is None or best_center_y is None:
+            best_center_x = float(best_box[0] + 0.5 * best_box[2])
+            best_center_y = float(best_box[1] + 0.5 * best_box[3])
         measured_velocity = np.array(
             [
-                best_box[0] + 0.5 * best_box[2] - center_x,
-                best_box[1] + 0.5 * best_box[3] - center_y,
+                best_center_x - center_x,
+                best_center_y - center_y,
             ],
             dtype=np.float64,
         )
@@ -1800,7 +1817,7 @@ class PanoSOTTracker:
             best_box = box.copy()
             best_box[0] += float(reference_delta[0])
             best_box[1] += float(reference_delta[1])
-            best_box[0] = float(np.clip(best_box[0], 0.0, image_width - best_box[2]))
+            best_box[0] = float(best_box[0] % image_width)
             best_box[1] = float(np.clip(best_box[1], 0.0, image_height - best_box[3]))
             measured_velocity = reference_delta.copy()
         guarded_box = self._guard_ncc_candidate_scale(
@@ -1813,7 +1830,7 @@ class PanoSOTTracker:
         if not np.array_equal(anchored_box[2:4], best_box[2:4]):
             self.runtime_stats.ncc_scale_anchor_adjustments += 1
         best_box = anchored_box
-        best_box[0] = float(np.clip(best_box[0], 0.0, image_width - best_box[2]))
+        best_box[0] = float(best_box[0] % image_width)
         best_box[1] = float(np.clip(best_box[1], 0.0, image_height - best_box[3]))
         momentum = float(np.clip(self.config.handcrafted_ncc_velocity_momentum, 0.0, 1.0))
         self._ncc_velocity = momentum * self._ncc_velocity + (1.0 - momentum) * measured_velocity
@@ -1878,8 +1895,7 @@ class PanoSOTTracker:
         score: float,
     ) -> np.ndarray:
         if (
-            self._deep_mode
-            or flow_scale is None
+            flow_scale is None
             or score >= self.config.handcrafted_ncc_flow_disagreement_score
             or max(float(previous_box[2]), float(previous_box[3]))
             < self.config.handcrafted_ncc_flow_guard_min_size
@@ -1907,8 +1923,7 @@ class PanoSOTTracker:
         score: float,
     ) -> np.ndarray:
         if (
-            self._deep_mode
-            or self._ncc_scale_anchor is None
+            self._ncc_scale_anchor is None
             or score >= self.config.handcrafted_ncc_scale_anchor_score
             or max(float(previous_box[2]), float(previous_box[3]))
             < self.config.handcrafted_ncc_flow_guard_min_size
@@ -1942,9 +1957,15 @@ class PanoSOTTracker:
         y0 = max(0, int(math.floor(box[1])))
         x1 = min(previous_gray.shape[1], int(math.ceil(box[0] + box[2])))
         y1 = min(previous_gray.shape[0], int(math.ceil(box[1] + box[3])))
-        if x1 - x0 < 4 or y1 - y0 < 4:
+        box_width = int(round(box[2]))
+        if box_width < 4 or y1 - y0 < 4:
             return None
-        mask[y0:y1, x0:x1] = 255
+        xs = np.mod(
+            np.arange(int(math.floor(box[0])), int(math.floor(box[0])) + box_width),
+            previous_gray.shape[1],
+        ).astype(np.intp, copy=False)
+        rows = np.arange(y0, y1, dtype=np.intp)[:, None]
+        mask[rows, xs[None, :]] = 255
 
         points = cv2.goodFeaturesToTrack(
             previous_gray,
