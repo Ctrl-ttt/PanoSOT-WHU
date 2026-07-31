@@ -219,6 +219,81 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertAlmostEqual(float(delta[0]), 7.0, delta=1.5)
         self.assertAlmostEqual(float(delta[1]), 5.0, delta=1.5)
 
+    def test_ncc_parallel_matches_serial_prediction(self) -> None:
+        rng = np.random.default_rng(19)
+        first = rng.random((240, 360, 3), dtype=np.float32) * 0.05
+        second = first.copy()
+        patch = rng.random((70, 110, 3), dtype=np.float32)
+        first[80:150, 120:230] = patch
+        second[80:150, 120:230] = 0.0
+        second[86:156, 129:239] = patch
+        init_box = np.array([120.0, 80.0, 110.0, 70.0], dtype=np.float32)
+        serial = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_parallel_workers=1,
+            handcrafted_ncc_flow_motion_trigger=10.0,
+            handcrafted_ncc_flow_score_trigger=-1.0,
+        ))
+        parallel = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_parallel_workers=8,
+            handcrafted_ncc_flow_motion_trigger=10.0,
+            handcrafted_ncc_flow_score_trigger=-1.0,
+        ))
+        serial.initialize(first, init_box)
+        parallel.initialize(first, init_box)
+
+        serial_state, serial_score, serial_reliable = serial._predict_with_ncc(second)
+        parallel_state, parallel_score, parallel_reliable = parallel._predict_with_ncc(second)
+
+        self.assertEqual(parallel_reliable, serial_reliable)
+        self.assertEqual(parallel_score, serial_score)
+        self.assertEqual(parallel_state, serial_state)
+        self.assertTrue(np.array_equal(parallel._ncc_bbox, serial._ncc_bbox))
+        self.assertTrue(np.array_equal(parallel._ncc_velocity, serial._ncc_velocity))
+        serial.close()
+        parallel.close()
+
+    def test_ncc_parallel_matches_serial_across_erp_seam(self) -> None:
+        rng = np.random.default_rng(29)
+        first = rng.random((220, 360, 3), dtype=np.float32) * 0.03
+        second = first.copy()
+        patch = rng.random((56, 48, 3), dtype=np.float32)
+        first_x = 334
+        second_x = 342
+        y = 82
+        first[y : y + patch.shape[0], np.mod(
+            np.arange(first_x, first_x + patch.shape[1]), first.shape[1],
+        )] = patch
+        second[y : y + patch.shape[0], np.mod(
+            np.arange(first_x, first_x + patch.shape[1]), second.shape[1],
+        )] = 0.0
+        second[y : y + patch.shape[0], np.mod(
+            np.arange(second_x, second_x + patch.shape[1]), second.shape[1],
+        )] = patch
+        init_box = np.array([first_x, y, patch.shape[1], patch.shape[0]], dtype=np.float32)
+        serial = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_parallel_workers=1,
+            handcrafted_ncc_flow_motion_trigger=10.0,
+            handcrafted_ncc_flow_score_trigger=-1.0,
+        ))
+        parallel = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_parallel_workers=8,
+            handcrafted_ncc_flow_motion_trigger=10.0,
+            handcrafted_ncc_flow_score_trigger=-1.0,
+        ))
+        serial.initialize(first, init_box)
+        parallel.initialize(first, init_box)
+
+        serial_result = serial._predict_with_ncc(second)
+        parallel_result = parallel._predict_with_ncc(second)
+
+        self.assertEqual(parallel_result, serial_result)
+        self.assertTrue(np.array_equal(parallel._ncc_bbox, serial._ncc_bbox))
+        self.assertAlmostEqual(float(parallel._ncc_bbox[0]), second_x, delta=1.0)
+        self.assertGreaterEqual(float(parallel._ncc_bbox[0]), 0.0)
+        self.assertLess(float(parallel._ncc_bbox[0]), second.shape[1])
+        serial.close()
+        parallel.close()
+
     def test_ncc_low_score_scale_uses_reliable_flow_bounds(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(
             handcrafted_ncc_flow_scale_tolerance=0.10,
@@ -247,10 +322,12 @@ class HybridTrackerTests(unittest.TestCase):
             candidate,
         ))
         tracker._deep_mode = True
-        guarded_deep = tracker._guard_ncc_candidate_scale(
-            candidate, previous, np.array([1.12, 1.03]), 0.30,
-        )
-        self.assertTrue(np.array_equal(guarded_deep, guarded))
+        self.assertTrue(np.array_equal(
+            tracker._guard_ncc_candidate_scale(
+                candidate, previous, np.array([1.12, 1.03]), 0.30,
+            ),
+            candidate,
+        ))
 
     def test_ncc_low_score_scale_keeps_recent_confident_anchor(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(
@@ -274,8 +351,10 @@ class HybridTrackerTests(unittest.TestCase):
             candidate,
         ))
         tracker._deep_mode = True
-        guarded_deep = tracker._guard_ncc_scale_anchor(candidate, previous, 0.30)
-        self.assertTrue(np.array_equal(guarded_deep, guarded))
+        self.assertTrue(np.array_equal(
+            tracker._guard_ncc_scale_anchor(candidate, previous, 0.30),
+            candidate,
+        ))
 
     def test_ncc_rejects_low_score_candidate_opposing_flow(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
 from typing import Any, Iterable, List
@@ -213,6 +214,7 @@ class TrackerConfig:
     handcrafted_ncc_enabled: bool = True
     handcrafted_ncc_search_factor: float = 3.0
     handcrafted_ncc_max_jump_ratio: float = 0.5
+    handcrafted_ncc_parallel_workers: int = 8
     handcrafted_ncc_update_rate: float = 0.10
     handcrafted_ncc_update_score: float = 0.55
     handcrafted_ncc_distance_penalty: float = 0.30
@@ -231,8 +233,8 @@ class TrackerConfig:
     handcrafted_ncc_flow_guard_min_size: float = 64.0
     handcrafted_ncc_flow_scale_tolerance: float = 0.10
     handcrafted_ncc_flow_scale_min_inlier_ratio: float = 0.50
-    handcrafted_ncc_scale_anchor_score: float = 0.99
-    handcrafted_ncc_scale_anchor_min_ratio: float = 1.0
+    handcrafted_ncc_scale_anchor_score: float = 0.55
+    handcrafted_ncc_scale_anchor_min_ratio: float = 0.65
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -260,6 +262,7 @@ class TrackerRuntimeStats:
     ncc_flow_disagreement_rejects: int = 0
     ncc_flow_scale_adjustments: int = 0
     ncc_scale_anchor_adjustments: int = 0
+    ncc_exact_matches: int = 0
     fallback_deep_score_sum: float = 0.0
     fallback_hand_score_sum: float = 0.0
     deep_probe_skips: int = 0
@@ -413,6 +416,7 @@ class PanoSOTTracker:
         self._ncc_frames_since_flow = self.config.handcrafted_ncc_flow_grace_frames + 1
         self._ncc_last_score = 1.0
         self._last_ncc_reliable = False
+        self._ncc_executor: ThreadPoolExecutor | None = None
         # --- 手工模式独立状态（P1：不受深度漂移污染）---
         self._hand_state: SphereState | None = None
         self._hand_velocity = np.zeros(2, dtype=np.float32)
@@ -425,6 +429,15 @@ class PanoSOTTracker:
                 frame_stride=self.config.debug_frame_stride,
                 save_response_maps=self.config.debug_save_response_maps,
             )
+
+    def close(self) -> None:
+        executor = getattr(self, "_ncc_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._ncc_executor = None
+
+    def __del__(self) -> None:
+        self.close()
 
     def reset_runtime_stats(self) -> None:
         forward_calls = getattr(self.deep_extractor, "forward_calls", 0)
@@ -455,6 +468,7 @@ class PanoSOTTracker:
             "ncc_flow_disagreement_rejects": stats.ncc_flow_disagreement_rejects,
             "ncc_flow_scale_adjustments": stats.ncc_flow_scale_adjustments,
             "ncc_scale_anchor_adjustments": stats.ncc_scale_anchor_adjustments,
+            "ncc_exact_matches": stats.ncc_exact_matches,
             "fallback_deep_score_sum": stats.fallback_deep_score_sum,
             "fallback_hand_score_sum": stats.fallback_hand_score_sum,
             "deep_probe_skips": stats.deep_probe_skips,
@@ -1706,13 +1720,12 @@ class PanoSOTTracker:
             max(box[2] * self.config.handcrafted_ncc_search_factor, 220.0),
             float(image_width),
         )
+        search_width = float(min(max(int(round(search_width)), 1), image_width))
         search_height = max(box[3] * self.config.handcrafted_ncc_search_factor, 180.0)
         x0 = int(math.floor(predicted_center_x - 0.5 * search_width))
         y0 = max(0, int(predicted_center_y - 0.5 * search_height))
-        x1 = int(math.ceil(predicted_center_x + 0.5 * search_width))
+        x1 = x0 + int(search_width)
         y1 = min(image_height, int(predicted_center_y + 0.5 * search_height))
-        if x1 <= x0:
-            x1 = x0 + 1
         xs = np.mod(np.arange(x0, x1), image_width).astype(np.intp, copy=False)
         search = gray[y0:y1][:, xs]
         if search.shape[0] < 16 or search.shape[1] < 16:
@@ -1736,6 +1749,7 @@ class PanoSOTTracker:
         best_box: np.ndarray | None = None
         best_center_x: float | None = None
         best_center_y: float | None = None
+        candidates: list[tuple[float, float, int, int, np.ndarray]] = []
         for width_scale, height_scale in scale_pairs:
             width = max(12, int(round(box[2] * width_scale)))
             height = max(12, int(round(box[3] * height_scale)))
@@ -1746,46 +1760,67 @@ class PanoSOTTracker:
                 candidate_template = cv2.resize(
                     source, (width, height), interpolation=cv2.INTER_LINEAR,
                 )
-                response = cv2.matchTemplate(
-                    search, candidate_template, cv2.TM_CCOEFF_NORMED,
+                candidates.append(
+                    (width_scale, height_scale, width, height, candidate_template),
                 )
-                response_height, response_width = response.shape
-                center_location_x = predicted_center_x - x0 - 0.5 * width
-                center_location_y = predicted_center_y - y0 - 0.5 * height
-                max_dx = box[2] * self.config.handcrafted_ncc_max_jump_ratio
-                max_dy = box[3] * self.config.handcrafted_ncc_max_jump_ratio
-                allowed_x0 = max(0, int(math.floor(center_location_x - max_dx)))
-                allowed_y0 = max(0, int(math.floor(center_location_y - max_dy)))
-                allowed_x1 = min(response_width, int(math.ceil(center_location_x + max_dx + 1)))
-                allowed_y1 = min(response_height, int(math.ceil(center_location_y + max_dy + 1)))
-                if allowed_x1 <= allowed_x0 or allowed_y1 <= allowed_y0:
-                    continue
 
-                allowed_response = response[allowed_y0:allowed_y1, allowed_x0:allowed_x1]
-                _, raw_score, _, local_location = cv2.minMaxLoc(allowed_response)
-                location_x = allowed_x0 + local_location[0]
-                location_y = allowed_y0 + local_location[1]
-                candidate_start_x = x0 + location_x
-                candidate_center_x = candidate_start_x + 0.5 * width
-                candidate_center_y = y0 + location_y + 0.5 * height
-                normalized_distance = math.hypot(
-                    (candidate_center_x - predicted_center_x) / search_width,
-                    (candidate_center_y - predicted_center_y) / search_height,
+        parallel_workers = max(int(self.config.handcrafted_ncc_parallel_workers), 1)
+        if parallel_workers > 1:
+            if self._ncc_executor is None:
+                self._ncc_executor = ThreadPoolExecutor(max_workers=parallel_workers)
+            responses = list(self._ncc_executor.map(
+                lambda item: cv2.matchTemplate(
+                    search, item[4], cv2.TM_CCOEFF_NORMED,
+                ),
+                candidates,
+            ))
+        else:
+            responses = [
+                cv2.matchTemplate(search, item[4], cv2.TM_CCOEFF_NORMED)
+                for item in candidates
+            ]
+        self.runtime_stats.ncc_exact_matches += len(responses)
+
+        for candidate_index, candidate in enumerate(candidates):
+            width_scale, height_scale, width, height, candidate_template = candidate
+            response = responses[candidate_index]
+            center_location_x = predicted_center_x - x0 - 0.5 * width
+            center_location_y = predicted_center_y - y0 - 0.5 * height
+            max_dx = box[2] * self.config.handcrafted_ncc_max_jump_ratio
+            max_dy = box[3] * self.config.handcrafted_ncc_max_jump_ratio
+            response_height, response_width = response.shape
+            allowed_x0 = max(0, int(math.floor(center_location_x - max_dx)))
+            allowed_y0 = max(0, int(math.floor(center_location_y - max_dy)))
+            allowed_x1 = min(response_width, int(math.ceil(center_location_x + max_dx + 1)))
+            allowed_y1 = min(response_height, int(math.ceil(center_location_y + max_dy + 1)))
+            if allowed_x1 <= allowed_x0 or allowed_y1 <= allowed_y0:
+                continue
+
+            allowed_response = response[allowed_y0:allowed_y1, allowed_x0:allowed_x1]
+            _, raw_score, _, local_location = cv2.minMaxLoc(allowed_response)
+            location_x = allowed_x0 + local_location[0]
+            location_y = allowed_y0 + local_location[1]
+            candidate_start_x = x0 + location_x
+            candidate_center_x = candidate_start_x + 0.5 * width
+            candidate_center_y = y0 + location_y + 0.5 * height
+            normalized_distance = math.hypot(
+                (candidate_center_x - predicted_center_x) / search_width,
+                (candidate_center_y - predicted_center_y) / search_height,
+            )
+            adjusted_score = (
+                float(raw_score)
+                - self.config.handcrafted_ncc_distance_penalty * normalized_distance
+                - self.config.handcrafted_ncc_scale_penalty
+                * (abs(math.log(width_scale)) + abs(math.log(height_scale)))
+            )
+            if adjusted_score > best_score:
+                best_score = adjusted_score
+                best_box = np.array(
+                    [candidate_start_x % image_width, y0 + location_y, width, height],
+                    dtype=np.float64,
                 )
-                adjusted_score = (
-                    float(raw_score)
-                    - self.config.handcrafted_ncc_distance_penalty * normalized_distance
-                    - self.config.handcrafted_ncc_scale_penalty
-                    * (abs(math.log(width_scale)) + abs(math.log(height_scale)))
-                )
-                if adjusted_score > best_score:
-                    best_score = adjusted_score
-                    best_box = np.array(
-                        [candidate_start_x % image_width, y0 + location_y, width, height],
-                        dtype=np.float64,
-                    )
-                    best_center_x = candidate_center_x
-                    best_center_y = candidate_center_y
+                best_center_x = candidate_center_x
+                best_center_y = candidate_center_y
 
         if best_box is None:
             if self.state is None:
@@ -1895,7 +1930,8 @@ class PanoSOTTracker:
         score: float,
     ) -> np.ndarray:
         if (
-            flow_scale is None
+            self._deep_mode
+            or flow_scale is None
             or score >= self.config.handcrafted_ncc_flow_disagreement_score
             or max(float(previous_box[2]), float(previous_box[3]))
             < self.config.handcrafted_ncc_flow_guard_min_size
@@ -1923,7 +1959,8 @@ class PanoSOTTracker:
         score: float,
     ) -> np.ndarray:
         if (
-            self._ncc_scale_anchor is None
+            self._deep_mode
+            or self._ncc_scale_anchor is None
             or score >= self.config.handcrafted_ncc_scale_anchor_score
             or max(float(previous_box[2]), float(previous_box[3]))
             < self.config.handcrafted_ncc_flow_guard_min_size
