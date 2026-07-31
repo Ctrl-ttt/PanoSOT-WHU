@@ -242,6 +242,33 @@ class HybridTrackerTests(unittest.TestCase):
             candidate,
         ))
 
+    def test_ncc_low_score_scale_keeps_recent_confident_anchor(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_scale_anchor_score=0.55,
+            handcrafted_ncc_scale_anchor_min_ratio=0.65,
+        ))
+        tracker._ncc_scale_anchor = np.array([180.0, 90.0], dtype=np.float64)
+        previous = np.array([100.0, 80.0, 170.0, 80.0], dtype=np.float64)
+        candidate = np.array([120.0, 95.0, 120.0, 45.0], dtype=np.float64)
+
+        guarded = tracker._guard_ncc_scale_anchor(candidate, previous, 0.30)
+
+        self.assertGreaterEqual(float(guarded[2]), 117.0)
+        self.assertGreaterEqual(float(guarded[3]), 58.5)
+        self.assertAlmostEqual(
+            float(guarded[0] + 0.5 * guarded[2]),
+            float(candidate[0] + 0.5 * candidate[2]),
+        )
+        self.assertTrue(np.array_equal(
+            tracker._guard_ncc_scale_anchor(candidate, previous, 0.75),
+            candidate,
+        ))
+        tracker._deep_mode = True
+        self.assertTrue(np.array_equal(
+            tracker._guard_ncc_scale_anchor(candidate, previous, 0.30),
+            candidate,
+        ))
+
     def test_ncc_rejects_low_score_candidate_opposing_flow(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(
             handcrafted_ncc_flow_disagreement_ratio=0.35,

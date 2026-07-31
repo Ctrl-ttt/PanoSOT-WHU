@@ -208,6 +208,8 @@ class TrackerConfig:
     handcrafted_ncc_flow_guard_min_size: float = 64.0
     handcrafted_ncc_flow_scale_tolerance: float = 0.10
     handcrafted_ncc_flow_scale_min_inlier_ratio: float = 0.50
+    handcrafted_ncc_scale_anchor_score: float = 0.55
+    handcrafted_ncc_scale_anchor_min_ratio: float = 0.65
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -234,6 +236,7 @@ class TrackerRuntimeStats:
     fallback_local_search_results: int = 0
     ncc_flow_disagreement_rejects: int = 0
     ncc_flow_scale_adjustments: int = 0
+    ncc_scale_anchor_adjustments: int = 0
     fallback_deep_score_sum: float = 0.0
     fallback_hand_score_sum: float = 0.0
     deep_probe_skips: int = 0
@@ -368,6 +371,7 @@ class PanoSOTTracker:
         self._ncc_bbox: np.ndarray | None = None
         self._ncc_velocity = np.zeros(2, dtype=np.float64)
         self._ncc_flow_scale: np.ndarray | None = None
+        self._ncc_scale_anchor: np.ndarray | None = None
         self._ncc_flow_was_reliable = False
         self._ncc_frames_since_flow = self.config.handcrafted_ncc_flow_grace_frames + 1
         self._ncc_last_score = 1.0
@@ -413,6 +417,7 @@ class PanoSOTTracker:
             "fallback_local_search_results": stats.fallback_local_search_results,
             "ncc_flow_disagreement_rejects": stats.ncc_flow_disagreement_rejects,
             "ncc_flow_scale_adjustments": stats.ncc_flow_scale_adjustments,
+            "ncc_scale_anchor_adjustments": stats.ncc_scale_anchor_adjustments,
             "fallback_deep_score_sum": stats.fallback_deep_score_sum,
             "fallback_hand_score_sum": stats.fallback_hand_score_sum,
             "deep_probe_skips": stats.deep_probe_skips,
@@ -1276,6 +1281,7 @@ class PanoSOTTracker:
         self._ncc_bbox = np.asarray(bbox_xywh, dtype=np.float32).copy()
         self._ncc_velocity[:] = 0.0
         self._ncc_flow_scale = None
+        self._ncc_scale_anchor = self._ncc_bbox[2:4].astype(np.float64)
         self._ncc_flow_was_reliable = False
         self._ncc_frames_since_flow = self.config.handcrafted_ncc_flow_grace_frames + 1
         self._ncc_last_score = 1.0
@@ -1447,12 +1453,18 @@ class PanoSOTTracker:
         if not np.array_equal(guarded_box[2:4], best_box[2:4]):
             self.runtime_stats.ncc_flow_scale_adjustments += 1
         best_box = guarded_box
+        anchored_box = self._guard_ncc_scale_anchor(best_box, box, best_score)
+        if not np.array_equal(anchored_box[2:4], best_box[2:4]):
+            self.runtime_stats.ncc_scale_anchor_adjustments += 1
+        best_box = anchored_box
         best_box[0] = float(np.clip(best_box[0], 0.0, image_width - best_box[2]))
         best_box[1] = float(np.clip(best_box[1], 0.0, image_height - best_box[3]))
         momentum = float(np.clip(self.config.handcrafted_ncc_velocity_momentum, 0.0, 1.0))
         self._ncc_velocity = momentum * self._ncc_velocity + (1.0 - momentum) * measured_velocity
         self._ncc_bbox = best_box.astype(np.float32)
         self._ncc_last_score = float(best_score)
+        if best_score >= self.config.handcrafted_ncc_scale_anchor_score:
+            self._ncc_scale_anchor = best_box[2:4].copy()
         if best_score >= self.config.handcrafted_ncc_update_score:
             patch = self._crop_erp_box(gray, self._ncc_bbox)
             if patch is not None:
@@ -1530,6 +1542,33 @@ class PanoSOTTracker:
         center = candidate_box[:2] + 0.5 * candidate_box[2:4]
         guarded[2:4] = previous_box[2:4] * guarded_scale
         guarded[:2] = center - 0.5 * guarded[2:4]
+        return guarded
+
+    def _guard_ncc_scale_anchor(
+        self,
+        candidate_box: np.ndarray,
+        previous_box: np.ndarray,
+        score: float,
+    ) -> np.ndarray:
+        if (
+            self._deep_mode
+            or self._ncc_scale_anchor is None
+            or score >= self.config.handcrafted_ncc_scale_anchor_score
+            or max(float(previous_box[2]), float(previous_box[3]))
+            < self.config.handcrafted_ncc_flow_guard_min_size
+        ):
+            return candidate_box
+
+        min_ratio = float(np.clip(self.config.handcrafted_ncc_scale_anchor_min_ratio, 0.0, 1.0))
+        minimum_size = self._ncc_scale_anchor * min_ratio
+        guarded_size = np.maximum(candidate_box[2:4], minimum_size)
+        if np.array_equal(candidate_box[2:4], guarded_size):
+            return candidate_box
+
+        guarded = candidate_box.copy()
+        center = candidate_box[:2] + 0.5 * candidate_box[2:4]
+        guarded[2:4] = guarded_size
+        guarded[:2] = center - 0.5 * guarded_size
         return guarded
 
     def _estimate_ncc_flow(
