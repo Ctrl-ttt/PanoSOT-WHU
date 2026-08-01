@@ -9,7 +9,7 @@ import numpy as np
 from panosot.geometry import bilinear_sample, erp_bbox_to_state, state_to_erp_bbox, tangent_patch
 from panosot.models import build_similarity_head
 from panosot.tracker import PanoSOTTracker, TrackerConfig
-from tools.batch_evaluate import discover_sequences
+from tools.batch_evaluate import SeqResult, discover_sequences, summarize_results
 
 
 class HybridTrackerTests(unittest.TestCase):
@@ -18,6 +18,13 @@ class HybridTrackerTests(unittest.TestCase):
         tracker._deep_mode = True
         tracker.runtime_stats.last_psr = 1.0
 
+        self.assertAlmostEqual(tracker._handcrafted_confidence(0.18, "ncc"), 0.18)
+        self.assertEqual(
+            tracker._handcrafted_confidence(0.18, "flow"),
+            tracker.config.handcrafted_high_confidence,
+        )
+        self.assertEqual(tracker.config.handcrafted_ncc_low_score_commit_threshold, 0.55)
+        self.assertEqual(tracker.config.handcrafted_ncc_max_scale_step, 1.12)
         self.assertLess(tracker._state_trust(0.24), 0.5)
         self.assertEqual(tracker._state_trust(0.24, handcrafted_result=True), 1.0)
         self.assertEqual(tracker._high_confidence(True), tracker.config.handcrafted_high_confidence)
@@ -25,6 +32,45 @@ class HybridTrackerTests(unittest.TestCase):
             tracker._relocalize_confidence_threshold(True),
             tracker.config.handcrafted_relocalize_confidence_threshold,
         )
+
+    def test_ncc_rejects_low_texture_template(self) -> None:
+        first = np.zeros((180, 260, 3), dtype=np.float32)
+        first[70:110, 90:140, 0] = 1.0
+        second = np.zeros_like(first)
+        init_box = np.array([90.0, 70.0, 50.0, 40.0], dtype=np.float32)
+        tracker = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_parallel_workers=1,
+            handcrafted_ncc_flow_motion_trigger=10.0,
+            handcrafted_ncc_flow_score_trigger=-1.0,
+        ))
+        tracker.initialize(first, init_box)
+
+        _, score, reliable = tracker._predict_with_ncc(second)
+
+        self.assertFalse(reliable)
+        self.assertFalse(tracker._last_ncc_reliable)
+        self.assertEqual(score, -1.0)
+        self.assertTrue(np.array_equal(tracker._ncc_bbox, init_box))
+
+    def test_ncc_rejects_low_score_missing_textured_target(self) -> None:
+        rng = np.random.default_rng(456)
+        first = rng.random((180, 260, 3), dtype=np.float32) * 0.02
+        second = rng.random((180, 260, 3), dtype=np.float32)
+        first[70:110, 90:140] = rng.random((40, 50, 3), dtype=np.float32)
+        init_box = np.array([90.0, 70.0, 50.0, 40.0], dtype=np.float32)
+        tracker = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_parallel_workers=1,
+            handcrafted_ncc_flow_motion_trigger=10.0,
+            handcrafted_ncc_flow_score_trigger=-1.0,
+            handcrafted_ncc_reliable_score=0.35,
+        ))
+        tracker.initialize(first, init_box)
+
+        _, score, reliable = tracker._predict_with_ncc(second)
+
+        self.assertFalse(reliable)
+        self.assertLess(score, tracker.config.handcrafted_ncc_reliable_score)
+        self.assertTrue(np.array_equal(tracker._ncc_bbox, init_box))
 
     def test_deep_probe_interval_retries_after_low_psr(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(deep_probe_interval=5))
@@ -137,6 +183,30 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertEqual(tracker._current_relocalization_interval(), 20)
         tracker._consecutive_relocalization_rejects = 6
         self.assertEqual(tracker._current_relocalization_interval(), 80)
+
+    def test_deep_mode_relocalizes_with_deep_candidates_after_handcrafted_fallback(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
+        tracker._deep_mode = True
+        self.assertTrue(tracker._use_deep_relocalization())
+
+        tracker._deep_mode = False
+        self.assertFalse(tracker._use_deep_relocalization())
+
+    def test_relocalization_large_jump_waits_for_a_real_loss_streak(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            relocalize_jump_gate_frames=30,
+            relocalize_jump_gate_lost_frames=10,
+            relocalize_max_lon_jump_deg=40.0,
+            relocalize_max_lat_jump_deg=18.0,
+        ))
+        tracker._frame_count = 100
+        tracker.lost_frames = 0
+        tracker._consecutive_low_ncc = 1
+        self.assertTrue(tracker._relocalization_jump_is_gated(90.0, 25.0))
+
+        tracker._consecutive_low_ncc = 10
+        self.assertFalse(tracker._relocalization_jump_is_gated(90.0, 25.0))
+        self.assertFalse(tracker._relocalization_jump_is_gated(20.0, 10.0))
 
     def test_template_bank_batch_matches_individual_responses(self) -> None:
         import torch
@@ -322,12 +392,11 @@ class HybridTrackerTests(unittest.TestCase):
             candidate,
         ))
         tracker._deep_mode = True
-        self.assertTrue(np.array_equal(
-            tracker._guard_ncc_candidate_scale(
-                candidate, previous, np.array([1.12, 1.03]), 0.30,
-            ),
-            candidate,
-        ))
+        deep_guarded = tracker._guard_ncc_candidate_scale(
+            candidate, previous, np.array([1.12, 1.03]), 0.30,
+        )
+        self.assertGreater(float(deep_guarded[2]), float(candidate[2]))
+        self.assertGreater(float(deep_guarded[3]), float(candidate[3]))
 
     def test_ncc_low_score_scale_keeps_recent_confident_anchor(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(
@@ -346,14 +415,30 @@ class HybridTrackerTests(unittest.TestCase):
             float(guarded[0] + 0.5 * guarded[2]),
             float(candidate[0] + 0.5 * candidate[2]),
         )
-        self.assertTrue(np.array_equal(
-            tracker._guard_ncc_scale_anchor(candidate, previous, 0.75),
-            candidate,
-        ))
+        high_score_guarded = tracker._guard_ncc_scale_anchor(candidate, previous, 0.75)
+        self.assertGreaterEqual(float(high_score_guarded[2]), 117.0)
+        self.assertGreaterEqual(float(high_score_guarded[3]), 58.5)
         tracker._deep_mode = True
+        deep_guarded = tracker._guard_ncc_scale_anchor(candidate, previous, 0.30)
+        self.assertGreaterEqual(float(deep_guarded[2]), 117.0)
+        self.assertGreaterEqual(float(deep_guarded[3]), 58.5)
+
+    def test_ncc_temporal_scale_step_is_bounded(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(handcrafted_ncc_max_scale_step=1.12))
+        previous = np.array([100.0, 80.0, 180.0, 80.0], dtype=np.float64)
+        candidate = np.array([110.0, 85.0, 100.0, 44.0], dtype=np.float64)
+        size = np.maximum(previous[2:4], 1.0)
+        bounded = np.clip(candidate[2:4] / size, 1.0 / 1.12, 1.12)
+        self.assertTrue(np.allclose(bounded, [1.0 / 1.12, 1.0 / 1.12]))
+
+    def test_ncc_scale_anchor_does_not_shrink_on_high_score(self) -> None:
+        tracker = PanoSOTTracker()
+        tracker._ncc_scale_anchor = np.array([180.0, 90.0], dtype=np.float64)
+        tracker._ncc_scale_anchor = np.maximum(
+            tracker._ncc_scale_anchor, np.array([120.0, 60.0]),
+        )
         self.assertTrue(np.array_equal(
-            tracker._guard_ncc_scale_anchor(candidate, previous, 0.30),
-            candidate,
+            tracker._ncc_scale_anchor, np.array([180.0, 90.0]),
         ))
 
     def test_ncc_rejects_low_score_candidate_opposing_flow(self) -> None:
@@ -577,6 +662,23 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertEqual(discovered[0][0], "sequence")
         self.assertEqual(discovered[0][2].name, "init.txt")
         self.assertEqual(discovered[0][3].name, "gt.txt")
+
+    def test_batch_summary_handles_all_failed_sequences(self) -> None:
+        results = [
+            SeqResult("broken", 0, 0.0, 0.0, 0.0, 0.0, error="init_box: invalid"),
+        ]
+
+        valid, summary = summarize_results(results)
+
+        self.assertEqual(valid, [])
+        self.assertEqual(summary["total"], 1)
+        self.assertEqual(summary["succeeded"], 0)
+        self.assertEqual(summary["failed"], 1)
+        self.assertIsNone(summary["avg_success_rate"])
+        self.assertIsNone(summary["avg_auc"])
+        self.assertIsNone(summary["avg_mean_iou"])
+        self.assertEqual(summary["total_elapsed_sec"], 0.0)
+        self.assertIsNone(summary["avg_fps"])
 
 
 if __name__ == "__main__":

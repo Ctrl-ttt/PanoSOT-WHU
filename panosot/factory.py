@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from .deep_features import DeepFeatureExtractor, FeatureConfig
@@ -14,6 +15,10 @@ def build_tracker(
     **kwargs: Any,
 ) -> PanoSOTTracker:
     cache_dir = kwargs.pop("cache_dir", None)
+    if cache_dir is None:
+        project_cache = Path(__file__).resolve().parents[1] / ".cache" / "torch"
+        if project_cache.is_dir():
+            cache_dir = str(project_cache)
     config = TrackerConfig(use_deep_features=use_deep_features, backbone_name=backbone_name, device=device)
 
     for key, value in kwargs.items():

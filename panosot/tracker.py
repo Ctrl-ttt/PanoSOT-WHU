@@ -143,7 +143,7 @@ class TrackerConfig:
     deep_velocity_low_trust_threshold: float = 0.65
     deep_velocity_decay: float = 0.20
     deep_fallback_psr_threshold: float = 2.0
-    deep_probe_interval: int = 5
+    deep_probe_interval: int = 20
     deep_probe_backoff_after: int = 3
     deep_probe_backoff_multiplier: float = 2.0
     deep_probe_max_interval: int = 20
@@ -214,9 +214,12 @@ class TrackerConfig:
     handcrafted_ncc_enabled: bool = True
     handcrafted_ncc_search_factor: float = 3.0
     handcrafted_ncc_max_jump_ratio: float = 0.5
-    handcrafted_ncc_parallel_workers: int = 8
+    handcrafted_ncc_parallel_workers: int = 4
     handcrafted_ncc_update_rate: float = 0.10
     handcrafted_ncc_update_score: float = 0.55
+    handcrafted_ncc_reliable_score: float = 0.35
+    handcrafted_ncc_min_template_std: float = 3.0
+    handcrafted_ncc_min_search_std: float = 3.0
     handcrafted_ncc_distance_penalty: float = 0.30
     handcrafted_ncc_scale_penalty: float = 0.05
     handcrafted_ncc_flow_min_points: int = 8
@@ -235,6 +238,9 @@ class TrackerConfig:
     handcrafted_ncc_flow_scale_min_inlier_ratio: float = 0.50
     handcrafted_ncc_scale_anchor_score: float = 0.55
     handcrafted_ncc_scale_anchor_min_ratio: float = 0.65
+    handcrafted_ncc_low_score_commit_threshold: float = 0.55
+    handcrafted_ncc_relocalize_streak: int = 8
+    handcrafted_ncc_max_scale_step: float = 1.12
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -551,6 +557,15 @@ class PanoSOTTracker:
         else:
             self._consecutive_low_deep_probes = 0
 
+    def _handcrafted_confidence(self, score: float, source: str) -> float:
+        """Keep NCC confidence tied to its raw score; fallback motion is heuristic."""
+        if source == "ncc":
+            return float(score)
+        return float(self.config.handcrafted_high_confidence)
+
+    def _use_deep_relocalization(self) -> bool:
+        return bool(self._deep_mode)
+
     def _accept_relocalization_candidate(
         self,
         candidate_score: float,
@@ -566,6 +581,23 @@ class PanoSOTTracker:
         if candidate_is_deep and candidate_psr < self.config.deep_relocalize_accept_psr_threshold:
             return False
         return True
+
+    def _relocalization_jump_is_gated(
+        self,
+        lon_jump_deg: float,
+        lat_jump_deg: float,
+    ) -> bool:
+        jump_is_large = (
+            lon_jump_deg > self.config.relocalize_max_lon_jump_deg
+            or lat_jump_deg > self.config.relocalize_max_lat_jump_deg
+        )
+        if not jump_is_large:
+            return False
+        enough_loss = max(
+            self.lost_frames,
+            self._consecutive_low_ncc,
+        ) >= self.config.relocalize_jump_gate_lost_frames
+        return self._frame_count <= self.config.relocalize_jump_gate_frames or not enough_loss
 
     def _accept_handcrafted_fallback(self, hand_state: SphereState) -> None:
         if self._hand_state is None:
@@ -1166,7 +1198,7 @@ class PanoSOTTracker:
                 ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame)
                 if ncc_reliable:
                     best_state = ncc_state
-                    best_score = max(ncc_score, self.config.handcrafted_high_confidence)
+                    best_score = self._handcrafted_confidence(ncc_score, "ncc")
                 else:
                     best_state, best_score = self._local_search(frame, predicted)
             else:
@@ -1198,7 +1230,6 @@ class PanoSOTTracker:
                 self.runtime_stats.fallback_hand_score_sum += float(hand_score)
                 best_state, best_score = hand_state, hand_score
                 handcrafted_result = True
-                self._accept_handcrafted_fallback(hand_state)
             else:
                 self._last_deep_probe_frame = self._frame_count
                 best_state, best_score = self._local_search(frame, predicted)
@@ -1231,9 +1262,8 @@ class PanoSOTTracker:
                         self.runtime_stats.fallback_accepts += 1
                         best_state, best_score = hand_state, hand_score
                         handcrafted_result = True
-                        self._accept_handcrafted_fallback(hand_state)
         if self._deep_mode and handcrafted_result and fallback_source == "ncc":
-            if self._ncc_last_score < self.config.deep_semantic_trigger_ncc_score:
+            if self._ncc_last_score < self.config.handcrafted_ncc_low_score_commit_threshold:
                 self._consecutive_low_ncc += 1
             else:
                 self._consecutive_low_ncc = 0
@@ -1257,6 +1287,17 @@ class PanoSOTTracker:
                 handcrafted_result = False
                 semantic_recovery = True
                 self._consecutive_low_ncc = 0
+        ncc_low_confidence = (
+            self._deep_mode
+            and handcrafted_result
+            and fallback_source == "ncc"
+            and best_score < self.config.handcrafted_ncc_low_score_commit_threshold
+        )
+        ncc_relocalize_due = (
+            ncc_low_confidence
+            and self._consecutive_low_ncc
+            >= max(int(self.config.handcrafted_ncc_relocalize_streak), 1)
+        )
         candidate_trust = self._state_trust(best_score, handcrafted_result)
         deep_low_quality = (
             self._deep_mode
@@ -1280,11 +1321,11 @@ class PanoSOTTracker:
         relocalize_threshold = self._relocalize_confidence_threshold(handcrafted_result)
         update_quality_threshold = self._update_quality_threshold(handcrafted_result)
 
-        if best_score >= high_confidence:
+        if deep_low_quality:
+            self._occlusion_frames += 1
+        elif best_score >= high_confidence:
             self._occlusion_frames = 0
             self._last_high_conf_score = best_score
-        elif deep_low_quality:
-            self._occlusion_frames += 1
         elif best_score < occlusion_threshold or is_abnormal:
             self._occlusion_frames += 1
         else:
@@ -1304,7 +1345,7 @@ class PanoSOTTracker:
                 relocalize_start_frame = min(relocalize_start_frame, self.config.deep_relocalize_min_start_frame)
                 relocalize_lost_trigger = min(relocalize_lost_trigger, self.config.deep_relocalize_min_lost_frames)
         if self._frame_count >= relocalize_start_frame:
-            if best_score < relocalize_threshold:
+            if best_score < relocalize_threshold or ncc_relocalize_due:
                 if self._relocalize_cooldown_elapsed():
                     should_relocalize = True
 
@@ -1314,20 +1355,24 @@ class PanoSOTTracker:
                     should_relocalize = True
 
             if (
-                False  # FIX: 关闭 PSR 触发重定位，减少全局搜索噪音
-                and self._deep_mode
+                self._deep_mode
+                and not handcrafted_result
                 and not should_relocalize
                 and self.runtime_stats.last_psr < self.config.deep_relocalize_psr_threshold
-                and max(self.lost_frames, self._occlusion_frames) >= self.config.deep_relocalize_min_lost_frames
+                and max(self.lost_frames, self._occlusion_frames)
+                >= self.config.deep_relocalize_min_lost_frames
+                and self._relocalize_cooldown_elapsed()
             ):
-                if self._relocalize_cooldown_elapsed():
-                    should_relocalize = True
+                should_relocalize = True
+
 
         relocalize_applied = semantic_recovery
         if should_relocalize:
             self.runtime_stats.relocalizations += 1
             self._last_relocalize_attempt_frame = self._frame_count
-            deep_relocalization = self._deep_mode and not handcrafted_result
+            # Deep mode must keep relocalization in the same feature space even
+            # when the current frame arrived through the NCC fallback branch.
+            deep_relocalization = self._use_deep_relocalization()
             relocalized, relocalized_score, relocalized_psr = self._global_relocalize(
                 frame,
                 predicted,
@@ -1338,13 +1383,8 @@ class PanoSOTTracker:
             )
             lon_jump_deg = abs(math.degrees(lon_distance(relocalized.lon, predicted.lon)))
             lat_jump_deg = abs(math.degrees(relocalized.lat - predicted.lat))
-            large_jump_early = (
-                self._frame_count <= self.config.relocalize_jump_gate_frames
-                and self.lost_frames < self.config.relocalize_jump_gate_lost_frames
-                and (
-                    lon_jump_deg > self.config.relocalize_max_lon_jump_deg
-                    or lat_jump_deg > self.config.relocalize_max_lat_jump_deg
-                )
+            large_jump_early = self._relocalization_jump_is_gated(
+                lon_jump_deg, lat_jump_deg,
             )
             accept_relocalization = self._accept_relocalization_candidate(
                 relocalized_score,
@@ -1366,6 +1406,7 @@ class PanoSOTTracker:
                 handcrafted_result = not deep_relocalization
                 self._last_relocalize_frame = self._frame_count
                 relocalize_applied = True
+                ncc_low_confidence = False
 
                 # P4: 高置信重定位成功后重置模板
                 if (
@@ -1445,7 +1486,7 @@ class PanoSOTTracker:
         else:
             self._consecutive_good = 0
 
-        if best_score >= high_confidence:
+        if best_score >= high_confidence and not ncc_low_confidence:
             self.lost_frames = 0
         else:
             self.lost_frames += 1
@@ -1623,7 +1664,7 @@ class PanoSOTTracker:
         x1 = max(x0 + 1, min(x + width, hsv.shape[1]))
         y1 = max(y0 + 1, min(y + height, hsv.shape[0]))
         roi = hsv[y0:y1, x0:x1]
-        saturated = roi[..., 1] >= min(self.config.handcrafted_color_min_saturation, 50)
+        saturated = roi[..., 1] >= self.config.handcrafted_color_min_saturation
         if saturated.mean() < 0.30:
             return
 
@@ -1733,6 +1774,23 @@ class PanoSOTTracker:
                 raise RuntimeError("Tracker state is unavailable.")
             return self.state, -1.0, False
 
+        max_template_std = max(
+            float(np.std(self._ncc_short_template)),
+            float(np.std(self._ncc_initial_template)),
+        )
+        search_std = float(np.std(search))
+        if (
+            flow_delta is None
+            and (
+                max_template_std < self.config.handcrafted_ncc_min_template_std
+                or search_std < self.config.handcrafted_ncc_min_search_std
+            )
+        ):
+            self._ncc_last_score = -1.0
+            if self.state is None:
+                raise RuntimeError("Tracker state is unavailable.")
+            return self.state, -1.0, False
+
         scale_pairs = (
             (0.85, 0.85),
             (0.93, 0.93),
@@ -1827,6 +1885,12 @@ class PanoSOTTracker:
                 raise RuntimeError("Tracker state is unavailable.")
             return self.state, best_score, False
 
+        self._ncc_last_score = float(best_score)
+        if best_score < self.config.handcrafted_ncc_reliable_score:
+            if self.state is None:
+                raise RuntimeError("Tracker state is unavailable.")
+            return self.state, best_score, False
+
         if best_center_x is None or best_center_y is None:
             best_center_x = float(best_box[0] + 0.5 * best_box[2])
             best_center_y = float(best_box[1] + 0.5 * best_box[3])
@@ -1865,12 +1929,32 @@ class PanoSOTTracker:
         if not np.array_equal(anchored_box[2:4], best_box[2:4]):
             self.runtime_stats.ncc_scale_anchor_adjustments += 1
         best_box = anchored_box
+        previous_size = np.maximum(box[2:4], 1.0)
+        max_scale_step = max(float(self.config.handcrafted_ncc_max_scale_step), 1.01)
+        temporal_scale = best_box[2:4] / previous_size
+        guarded_temporal_scale = np.clip(
+            temporal_scale, 1.0 / max_scale_step, max_scale_step,
+        )
+        if not np.array_equal(temporal_scale, guarded_temporal_scale):
+            guarded = best_box.copy()
+            center = best_box[:2] + 0.5 * best_box[2:4]
+            guarded[2:4] = previous_size * guarded_temporal_scale
+            guarded[:2] = center - 0.5 * guarded[2:4]
+            best_box = guarded
+            self.runtime_stats.ncc_flow_scale_adjustments += 1
+        if best_score < self.config.handcrafted_ncc_low_score_commit_threshold:
+            # A weak NCC peak is an observation, not a new tracking anchor.
+            fallback_delta = reference_delta if reference_delta is not None else predicted_delta
+            if fallback_delta is None:
+                fallback_delta = np.zeros(2, dtype=np.float64)
+            best_box[0] = float((box[0] + fallback_delta[0]) % image_width)
+            best_box[1] = float(np.clip(box[1] + fallback_delta[1], 0.0, image_height - best_box[3]))
+            measured_velocity = np.asarray(fallback_delta, dtype=np.float64)
         best_box[0] = float(best_box[0] % image_width)
         best_box[1] = float(np.clip(best_box[1], 0.0, image_height - best_box[3]))
         momentum = float(np.clip(self.config.handcrafted_ncc_velocity_momentum, 0.0, 1.0))
         self._ncc_velocity = momentum * self._ncc_velocity + (1.0 - momentum) * measured_velocity
         self._ncc_bbox = best_box.astype(np.float32)
-        self._ncc_last_score = float(best_score)
         if best_score >= self.config.handcrafted_ncc_scale_anchor_score:
             self._ncc_scale_anchor = best_box[2:4].copy()
         if best_score >= self.config.handcrafted_ncc_update_score:
@@ -1930,8 +2014,7 @@ class PanoSOTTracker:
         score: float,
     ) -> np.ndarray:
         if (
-            self._deep_mode
-            or flow_scale is None
+            flow_scale is None
             or score >= self.config.handcrafted_ncc_flow_disagreement_score
             or max(float(previous_box[2]), float(previous_box[3]))
             < self.config.handcrafted_ncc_flow_guard_min_size
@@ -1959,9 +2042,7 @@ class PanoSOTTracker:
         score: float,
     ) -> np.ndarray:
         if (
-            self._deep_mode
-            or self._ncc_scale_anchor is None
-            or score >= self.config.handcrafted_ncc_scale_anchor_score
+            self._ncc_scale_anchor is None
             or max(float(previous_box[2]), float(previous_box[3]))
             < self.config.handcrafted_ncc_flow_guard_min_size
         ):
@@ -2767,7 +2848,7 @@ class PanoSOTTracker:
             ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame)
             if ncc_reliable:
                 self.runtime_stats.fallback_ncc_results += 1
-                return ncc_state, max(ncc_score, self.config.handcrafted_high_confidence), "ncc"
+                return ncc_state, self._handcrafted_confidence(ncc_score, "ncc"), "ncc"
             self.runtime_stats.fallback_local_search_results += 1
             state, score = self._local_search_handcrafted(frame, hand_predicted)
             return state, score, "local_search"
@@ -2776,7 +2857,7 @@ class PanoSOTTracker:
             if flow_reliable:
                 flow_score = self._score_state_handcrafted(frame, flow_state)
                 self.runtime_stats.fallback_flow_results += 1
-                return flow_state, max(flow_score, self.config.handcrafted_high_confidence), "flow"
+                return flow_state, self._handcrafted_confidence(flow_score, "flow"), "flow"
             color_state, color_reliable = self._predict_with_color(frame, hand_predicted)
             if color_reliable:
                 self.runtime_stats.fallback_color_results += 1
@@ -2824,7 +2905,7 @@ class PanoSOTTracker:
             ))
 
         coarse_features = self.deep_extractor.extract_search_features_batch(
-            coarse_patches, refine=False, chunk_size=1,
+            coarse_patches, refine=False, chunk_size=len(coarse_patches),
         )
         coarse_responses, coarse_reference = self._fused_template_responses_batch(coarse_features)
         coarse_scores, coarse_offsets, coarse_metadata = self._response_scores_offsets_batch(
@@ -2843,7 +2924,7 @@ class PanoSOTTracker:
             ))
 
         refine_features = self.deep_extractor.extract_search_features_batch(
-            refine_patches, refine=True, chunk_size=1,
+            refine_patches, refine=True, chunk_size=len(refine_patches),
         )
         refine_responses, refine_reference = self._fused_template_responses_batch(refine_features)
         refine_scores, refine_offsets, refine_metadata = self._response_scores_offsets_batch(
