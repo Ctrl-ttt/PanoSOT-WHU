@@ -217,6 +217,9 @@ class TrackerConfig:
     handcrafted_ncc_parallel_workers: int = 8
     handcrafted_ncc_update_rate: float = 0.10
     handcrafted_ncc_update_score: float = 0.55
+    handcrafted_ncc_reliable_score: float = 0.35
+    handcrafted_ncc_min_template_std: float = 3.0
+    handcrafted_ncc_min_search_std: float = 3.0
     handcrafted_ncc_distance_penalty: float = 0.30
     handcrafted_ncc_scale_penalty: float = 0.05
     handcrafted_ncc_flow_min_points: int = 8
@@ -1623,7 +1626,7 @@ class PanoSOTTracker:
         x1 = max(x0 + 1, min(x + width, hsv.shape[1]))
         y1 = max(y0 + 1, min(y + height, hsv.shape[0]))
         roi = hsv[y0:y1, x0:x1]
-        saturated = roi[..., 1] >= min(self.config.handcrafted_color_min_saturation, 50)
+        saturated = roi[..., 1] >= self.config.handcrafted_color_min_saturation
         if saturated.mean() < 0.30:
             return
 
@@ -1732,6 +1735,22 @@ class PanoSOTTracker:
             if self.state is None:
                 raise RuntimeError("Tracker state is unavailable.")
             return self.state, -1.0, False
+        max_template_std = max(
+            float(np.std(self._ncc_short_template)),
+            float(np.std(self._ncc_initial_template)),
+        )
+        search_std = float(np.std(search))
+        if (
+            flow_delta is None
+            and (
+                max_template_std < self.config.handcrafted_ncc_min_template_std
+                or search_std < self.config.handcrafted_ncc_min_search_std
+            )
+        ):
+            self._ncc_last_score = -1.0
+            if self.state is None:
+                raise RuntimeError("Tracker state is unavailable.")
+            return self.state, -1.0, False
 
         scale_pairs = (
             (0.85, 0.85),
@@ -1826,6 +1845,11 @@ class PanoSOTTracker:
             if self.state is None:
                 raise RuntimeError("Tracker state is unavailable.")
             return self.state, best_score, False
+        self._ncc_last_score = float(best_score)
+        if best_score < self.config.handcrafted_ncc_reliable_score:
+            if self.state is None:
+                raise RuntimeError("Tracker state is unavailable.")
+            return self.state, best_score, False
 
         if best_center_x is None or best_center_y is None:
             best_center_x = float(best_box[0] + 0.5 * best_box[2])
@@ -1870,7 +1894,6 @@ class PanoSOTTracker:
         momentum = float(np.clip(self.config.handcrafted_ncc_velocity_momentum, 0.0, 1.0))
         self._ncc_velocity = momentum * self._ncc_velocity + (1.0 - momentum) * measured_velocity
         self._ncc_bbox = best_box.astype(np.float32)
-        self._ncc_last_score = float(best_score)
         if best_score >= self.config.handcrafted_ncc_scale_anchor_score:
             self._ncc_scale_anchor = best_box[2:4].copy()
         if best_score >= self.config.handcrafted_ncc_update_score:

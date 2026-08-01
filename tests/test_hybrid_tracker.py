@@ -9,7 +9,7 @@ import numpy as np
 from panosot.geometry import bilinear_sample, erp_bbox_to_state, state_to_erp_bbox, tangent_patch
 from panosot.models import build_similarity_head
 from panosot.tracker import PanoSOTTracker, TrackerConfig
-from tools.batch_evaluate import discover_sequences
+from tools.batch_evaluate import SeqResult, discover_sequences, summarize_results
 
 
 class HybridTrackerTests(unittest.TestCase):
@@ -294,6 +294,45 @@ class HybridTrackerTests(unittest.TestCase):
         serial.close()
         parallel.close()
 
+    def test_ncc_rejects_low_texture_template(self) -> None:
+        first = np.zeros((180, 260, 3), dtype=np.float32)
+        first[70:110, 90:140, 0] = 1.0
+        second = np.zeros_like(first)
+        init_box = np.array([90.0, 70.0, 50.0, 40.0], dtype=np.float32)
+        tracker = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_parallel_workers=1,
+            handcrafted_ncc_flow_motion_trigger=10.0,
+            handcrafted_ncc_flow_score_trigger=-1.0,
+        ))
+        tracker.initialize(first, init_box)
+
+        _, score, reliable = tracker._predict_with_ncc(second)
+
+        self.assertFalse(reliable)
+        self.assertFalse(tracker._last_ncc_reliable)
+        self.assertEqual(score, -1.0)
+        self.assertTrue(np.array_equal(tracker._ncc_bbox, init_box))
+
+    def test_ncc_rejects_low_score_missing_textured_target(self) -> None:
+        rng = np.random.default_rng(456)
+        first = rng.random((180, 260, 3), dtype=np.float32) * 0.02
+        second = rng.random((180, 260, 3), dtype=np.float32)
+        first[70:110, 90:140] = rng.random((40, 50, 3), dtype=np.float32)
+        init_box = np.array([90.0, 70.0, 50.0, 40.0], dtype=np.float32)
+        tracker = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_parallel_workers=1,
+            handcrafted_ncc_flow_motion_trigger=10.0,
+            handcrafted_ncc_flow_score_trigger=-1.0,
+            handcrafted_ncc_reliable_score=0.35,
+        ))
+        tracker.initialize(first, init_box)
+
+        _, score, reliable = tracker._predict_with_ncc(second)
+
+        self.assertFalse(reliable)
+        self.assertLess(score, tracker.config.handcrafted_ncc_reliable_score)
+        self.assertTrue(np.array_equal(tracker._ncc_bbox, init_box))
+
     def test_ncc_low_score_scale_uses_reliable_flow_bounds(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(
             handcrafted_ncc_flow_scale_tolerance=0.10,
@@ -577,6 +616,23 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertEqual(discovered[0][0], "sequence")
         self.assertEqual(discovered[0][2].name, "init.txt")
         self.assertEqual(discovered[0][3].name, "gt.txt")
+
+    def test_batch_summary_handles_all_failed_sequences(self) -> None:
+        results = [
+            SeqResult("broken", 0, 0.0, 0.0, 0.0, 0.0, error="init_box: invalid"),
+        ]
+
+        valid, summary = summarize_results(results)
+
+        self.assertEqual(valid, [])
+        self.assertEqual(summary["total"], 1)
+        self.assertEqual(summary["succeeded"], 0)
+        self.assertEqual(summary["failed"], 1)
+        self.assertIsNone(summary["avg_success_rate"])
+        self.assertIsNone(summary["avg_auc"])
+        self.assertIsNone(summary["avg_mean_iou"])
+        self.assertEqual(summary["total_elapsed_sec"], 0.0)
+        self.assertIsNone(summary["avg_fps"])
 
 
 if __name__ == "__main__":

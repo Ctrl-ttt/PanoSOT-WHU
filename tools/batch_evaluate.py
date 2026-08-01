@@ -109,6 +109,33 @@ class SeqResult:
     prefix_metrics: Optional[dict[str, dict[str, float]]] = None
 
 
+def summarize_results(results: list[SeqResult]) -> tuple[list[SeqResult], dict[str, int | float | None]]:
+    valid = [r for r in results if r.error is None]
+    total_time = sum(r.elapsed_sec for r in valid)
+    if valid:
+        avg_fps = sum(r.num_frames / r.elapsed_sec for r in valid) / len(valid)
+        return valid, {
+            "total": len(results),
+            "succeeded": len(valid),
+            "failed": len(results) - len(valid),
+            "avg_success_rate": sum(r.success_rate for r in valid) / len(valid),
+            "avg_auc": sum(r.auc for r in valid) / len(valid),
+            "avg_mean_iou": sum(r.mean_iou for r in valid) / len(valid),
+            "total_elapsed_sec": total_time,
+            "avg_fps": avg_fps,
+        }
+    return valid, {
+        "total": len(results),
+        "succeeded": 0,
+        "failed": len(results),
+        "avg_success_rate": None,
+        "avg_auc": None,
+        "avg_mean_iou": None,
+        "total_elapsed_sec": 0.0,
+        "avg_fps": None,
+    }
+
+
 def evaluate_one(
     seq_name: str,
     image_dir: Path,
@@ -329,20 +356,14 @@ def main() -> None:
 
     # 汇总
     print("\n" + "=" * 70)
-    valid = [r for r in results if r.error is None]
+    valid, summary = summarize_results(results)
     if valid:
-        avg_sr = sum(r.success_rate for r in valid) / len(valid)
-        avg_auc = sum(r.auc for r in valid) / len(valid)
-        avg_iou = sum(r.mean_iou for r in valid) / len(valid)
-        total_time = sum(r.elapsed_sec for r in valid)
-        avg_fps = sum(r.num_frames / r.elapsed_sec for r in valid) / len(valid) if valid else 0
-
         print(f"总序列数: {len(results)}  (成功: {len(valid)}, 失败: {len(results) - len(valid)})")
-        print(f"平均 SR@0.5: {avg_sr:.6f}")
-        print(f"平均 AUC:    {avg_auc:.6f}")
-        print(f"平均 mIoU:   {avg_iou:.6f}")
-        print(f"总耗时:       {total_time:.1f}s")
-        print(f"平均 FPS:     {avg_fps:.2f}")
+        print(f"平均 SR@0.5: {summary['avg_success_rate']:.6f}")
+        print(f"平均 AUC:    {summary['avg_auc']:.6f}")
+        print(f"平均 mIoU:   {summary['avg_mean_iou']:.6f}")
+        print(f"总耗时:       {summary['total_elapsed_sec']:.1f}s")
+        print(f"平均 FPS:     {summary['avg_fps']:.2f}")
     else:
         print("所有序列评测失败")
 
@@ -365,16 +386,7 @@ def main() -> None:
     json_path = args.output and Path(args.output).with_suffix(".json") or None
     if json_path:
         json_results = {
-            "summary": {
-                "total": len(results),
-                "succeeded": len(valid),
-                "failed": len(results) - len(valid),
-                "avg_success_rate": avg_sr if valid else None,
-                "avg_auc": avg_auc if valid else None,
-                "avg_mean_iou": avg_iou if valid else None,
-                "total_elapsed_sec": total_time,
-                "avg_fps": avg_fps if valid else None,
-            },
+            "summary": summary,
             "sequences": [
                 {
                     "name": r.name,
