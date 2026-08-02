@@ -2,17 +2,132 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import math
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from panosot.geometry import bilinear_sample, erp_bbox_to_state, state_to_erp_bbox, tangent_patch
 from panosot.models import build_similarity_head
-from panosot.tracker import PanoSOTTracker, TrackerConfig
+from panosot.tracker import PanoSOTTracker, SphereState, TrackerConfig
 from tools.batch_evaluate import SeqResult, discover_sequences, summarize_results
 
 
 class HybridTrackerTests(unittest.TestCase):
+    def test_deep_refine_topk_selects_coarse_winners_and_handles_bounds(self) -> None:
+        scores = [0.20, 0.85, 0.40, 0.70, 0.55]
+
+        self.assertEqual(
+            PanoSOTTracker._select_deep_refine_indices(scores, 3),
+            [1, 3, 4],
+        )
+        self.assertEqual(
+            PanoSOTTracker._select_deep_refine_indices(scores, 0),
+            [0, 1, 2, 3, 4],
+        )
+        self.assertEqual(
+            PanoSOTTracker._select_deep_refine_indices(scores, 99),
+            [0, 1, 2, 3, 4],
+        )
+
+    def test_handcrafted_gray_is_reused_by_ncc(self) -> None:
+        first = np.zeros((80, 120, 3), dtype=np.float32)
+        first[20:50, 40:70] = 1.0
+        init_box = np.array([40.0, 20.0, 30.0, 30.0], dtype=np.float32)
+        tracker = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_parallel_workers=1,
+            handcrafted_ncc_flow_motion_trigger=10.0,
+            handcrafted_ncc_flow_score_trigger=-1.0,
+        ))
+        tracker.initialize(first, init_box)
+        gray = tracker._handcrafted_gray(first)
+        with patch.object(tracker, "_handcrafted_gray", side_effect=AssertionError("recomputed gray")):
+            tracker._predict_with_ncc(first, gray=gray)
+
+    def test_handcrafted_gray_fast_path_matches_safe_path(self) -> None:
+        from panosot.io import load_image
+
+        frame = load_image(
+            Path("data/360VOTS_unpacked/0060/image/000000.jpg"),
+        )
+        tracker = PanoSOTTracker()
+        safe = tracker._handcrafted_gray(frame)
+        fast = tracker._handcrafted_gray(frame, assume_normalized=True)
+        self.assertTrue(np.array_equal(safe, fast))
+
+    def test_opencv_thread_setting_is_scoped_and_restored(self) -> None:
+        import cv2
+
+        original = cv2.getNumThreads()
+        tracker = PanoSOTTracker(TrackerConfig(handcrafted_cv_threads=2))
+        self.assertEqual(cv2.getNumThreads(), 2)
+        tracker.close()
+        self.assertEqual(cv2.getNumThreads(), original)
+
+    def test_ncc_resize_cache_is_reused_and_short_cache_invalidates(self) -> None:
+        import cv2
+
+        tracker = PanoSOTTracker()
+        source = np.arange(20 * 30, dtype=np.uint8).reshape(20, 30)
+        first = tracker._resize_ncc_template("initial", source, 12, 8)
+        second = tracker._resize_ncc_template("initial", source, 12, 8)
+        self.assertIs(first, second)
+        self.assertEqual(len(tracker._ncc_initial_resize_cache), 1)
+
+        tracker._resize_ncc_template("short", source, 12, 8)
+        self.assertEqual(len(tracker._ncc_short_resize_cache), 1)
+        tracker._ncc_short_resize_cache.clear()
+        refreshed = tracker._resize_ncc_template("short", source, 12, 8)
+        self.assertIsNot(refreshed, first)
+        self.assertTrue(np.array_equal(refreshed, cv2.resize(source, (12, 8))))
+
+    def test_ncc_flow_mask_is_reused_for_the_same_frame_shape(self) -> None:
+        first = np.zeros((80, 120, 3), dtype=np.float32)
+        first[20:50, 40:70] = 1.0
+        tracker = PanoSOTTracker()
+        tracker.initialize(
+            first,
+            np.array([40.0, 20.0, 30.0, 30.0], dtype=np.float32),
+        )
+        mask = tracker._ncc_flow_mask
+        self.assertIsNotNone(mask)
+        tracker._estimate_ncc_flow(tracker._handcrafted_gray(first), tracker._ncc_bbox)
+        self.assertIs(tracker._ncc_flow_mask, mask)
+
+    def test_deep_preprocess_fast_path_preserves_normalized_patch(self) -> None:
+        from panosot.deep_features import DeepFeatureExtractor
+
+        extractor = DeepFeatureExtractor.__new__(DeepFeatureExtractor)
+        extractor._torch = __import__("torch")
+        extractor.device = extractor._torch.device("cpu")
+        extractor._mean = extractor._torch.zeros(1, 3, 1, 1)
+        extractor._std = extractor._torch.ones(1, 3, 1, 1)
+        patch = np.full((8, 9, 3), 0.5, dtype=np.float32)
+
+        safe = extractor.preprocess_patch(patch.copy(), 8)
+        fast = extractor.preprocess_patch(patch, 8, assume_normalized=True)
+
+        self.assertTrue(__import__("torch").equal(safe, fast))
+        self.assertTrue(np.all(patch == 0.5))
+
+    def test_load_image_inplace_normalization_matches_reference(self) -> None:
+        from panosot.io import load_image
+
+        image = np.array([
+            [[0, 32, 255], [64, 128, 192]],
+            [[17, 89, 233], [41, 177, 211]],
+        ], dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample.png"
+            Image.fromarray(image, mode="RGB").save(path)
+            actual = load_image(path)
+
+        expected = np.asarray(image, dtype=np.float32) / 255.0
+        self.assertEqual(actual.dtype, np.float32)
+        self.assertTrue(np.array_equal(actual, expected))
+
     def test_handcrafted_result_uses_handcrafted_confidence_scale(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
         tracker._deep_mode = True
@@ -31,6 +146,115 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertEqual(
             tracker._relocalize_confidence_threshold(True),
             tracker.config.handcrafted_relocalize_confidence_threshold,
+        )
+
+    def test_deep_fallback_requires_independent_handcrafted_evidence(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
+        tracker._deep_mode = True
+
+        self.assertFalse(tracker._accept_deep_fallback(0.12, 0.05, "ncc"))
+        self.assertFalse(tracker._accept_deep_fallback(0.20, 0.19, "ncc"))
+        self.assertTrue(tracker._accept_deep_fallback(0.24, 0.18, "ncc"))
+        self.assertTrue(tracker._accept_deep_fallback(0.20, 0.01, "flow"))
+
+    def test_initial_template_update_rate_is_zero(self) -> None:
+        handcrafted = PanoSOTTracker()
+        deep = PanoSOTTracker(TrackerConfig(use_deep_features=True))
+        deep._deep_mode = True
+
+        self.assertEqual(handcrafted._template_update_rate("init", True), 0.0)
+        self.assertEqual(deep._template_update_rate("init", True), 0.0)
+
+    def test_low_confidence_deep_state_freezes_scale_after_position_guard(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
+        tracker._deep_mode = True
+        tracker.frame_shape = (1920, 3840)
+        tracker._init_equatorial_width = math.radians(12.0)
+        tracker._init_angular_height = math.radians(8.0)
+        tracker.state = SphereState(0.0, 0.0, math.radians(3.0), math.radians(2.0))
+        predicted = tracker.state
+        candidate = SphereState(0.1, 0.02, math.radians(10.0), math.radians(6.0))
+
+        guarded = tracker._guard_low_confidence_state(predicted, candidate, 0.50)
+        frozen = tracker._freeze_state_scale(guarded)
+        self.assertEqual(frozen.equatorial_width, tracker.state.equatorial_width)
+        self.assertEqual(frozen.angular_height, tracker.state.angular_height)
+        self.assertNotEqual(frozen.equatorial_width, candidate.equatorial_width)
+        self.assertNotEqual(frozen.angular_height, candidate.angular_height)
+
+    def test_small_target_detection_uses_area_ratio(self) -> None:
+        frame = np.zeros((1920, 3840, 3), dtype=np.float32)
+        tracker = PanoSOTTracker()
+        tracker.initialize(frame, np.array([100.0, 100.0, 24.0, 57.0], dtype=np.float32))
+
+        self.assertTrue(tracker._is_small_target(tracker.state))
+
+    def test_small_target_uses_wider_handcrafted_local_search_grid(self) -> None:
+        tracker = PanoSOTTracker()
+        tracker.frame_shape = (1920, 3840)
+        state = erp_bbox_to_state(
+            np.array([100.0, 100.0, 24.0, 57.0], dtype=np.float32),
+            3840,
+            1920,
+        )
+        self.assertTrue(tracker._is_small_target(state))
+        self.assertGreater(
+            tracker.config.small_target_local_grid_radius,
+            tracker.config.local_grid_radius,
+        )
+
+    def test_early_deep_relocalization_jump_requires_strong_evidence(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
+        tracker._deep_mode = True
+
+        tracker._frame_count = 6
+        self.assertFalse(tracker._allow_early_deep_relocalization_jump(0.80, 0.40, 1.90))
+        tracker._frame_count = 25
+        self.assertFalse(tracker._allow_early_deep_relocalization_jump(0.60, 0.40, 1.80))
+        self.assertTrue(tracker._allow_early_deep_relocalization_jump(0.80, 0.40, 1.90))
+
+    def test_recent_deep_probe_is_required_for_ncc_jump_support(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True, deep_probe_interval=20))
+        tracker._deep_mode = True
+        tracker._frame_count = 40
+        tracker._last_deep_probe_frame = 20
+        tracker._last_deep_probe_state = SphereState(0.0, 0.0, 0.1, 0.1)
+        tracker._last_deep_probe_score = 0.54
+        self.assertFalse(tracker._recent_deep_probe_supports_jump())
+        tracker._last_deep_probe_score = 0.60
+        self.assertTrue(tracker._recent_deep_probe_supports_jump())
+        self.assertTrue(
+            tracker._recent_deep_probe_supports_jump(SphereState(0.1, 0.1, 0.1, 0.1))
+        )
+        self.assertFalse(
+            tracker._recent_deep_probe_supports_jump(SphereState(1.0, 0.1, 0.1, 0.1))
+        )
+        tracker._frame_count = 61
+        self.assertFalse(tracker._recent_deep_probe_supports_jump())
+
+    def test_deep_relocalization_rejects_probe_inconsistent_peak(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
+        tracker._deep_mode = True
+        tracker._frame_count = 40
+        tracker._last_deep_probe_frame = 20
+        tracker._last_deep_probe_state = SphereState(0.0, 0.0, 0.1, 0.1)
+        tracker._last_deep_probe_score = 0.60
+
+        inconsistent = SphereState(math.radians(5.0), math.radians(30.0), 0.1, 0.1)
+        self.assertFalse(tracker._recent_deep_probe_supports_jump(inconsistent))
+
+    def test_deep_probe_does_not_override_stronger_ncc(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
+        tracker._deep_mode = True
+        tracker._last_deep_probe_state = SphereState(0.0, 0.0, 0.1, 0.1)
+        tracker._last_deep_probe_score = 0.60
+        ncc_state = SphereState(math.radians(20.0), 0.0, 0.1, 0.1)
+
+        self.assertFalse(
+            tracker._deep_probe_disagrees_with_ncc(ncc_state, "ncc", hand_score=0.89)
+        )
+        self.assertTrue(
+            tracker._deep_probe_disagrees_with_ncc(ncc_state, "ncc", hand_score=0.50)
         )
 
     def test_ncc_rejects_low_texture_template(self) -> None:
@@ -271,6 +495,15 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertGreater(float(predicted[0]), float(init_box[0]))
         self.assertGreater(float(predicted[1]), float(init_box[1]))
 
+    def test_small_target_ncc_jump_ratio_is_wider(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(small_target_ncc_max_jump_ratio=2.0))
+        tracker.frame_shape = (1920, 3840)
+        small_box = np.array([100.0, 100.0, 24.0, 57.0], dtype=np.float64)
+        area_ratio = (small_box[2] * small_box[3]) / (3840.0 * 1920.0)
+
+        self.assertLess(area_ratio, tracker.config.small_target_threshold)
+        self.assertEqual(tracker.config.small_target_ncc_max_jump_ratio, 2.0)
+
     def test_ncc_flow_estimates_consistent_translation(self) -> None:
         tracker = PanoSOTTracker()
         first = np.zeros((160, 240, 3), dtype=np.float32)
@@ -440,6 +673,45 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertTrue(np.array_equal(
             tracker._ncc_scale_anchor, np.array([180.0, 90.0]),
         ))
+
+    def test_deep_ncc_scale_collapse_is_detected(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
+        tracker._deep_mode = True
+        tracker._init_bbox_width_px = 120.0
+        tracker._init_bbox_height_px = 82.0
+        tracker._ncc_bbox = np.array([100.0, 80.0, 50.0, 40.0], dtype=np.float32)
+
+        self.assertTrue(tracker._ncc_scale_collapsed())
+
+    def test_deep_ncc_scale_anchor_keeps_initial_size_floor(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            deep_ncc_scale_collapse_ratio=0.55,
+        ))
+        tracker._deep_mode = True
+        tracker._init_bbox_width_px = 120.0
+        tracker._init_bbox_height_px = 82.0
+        tracker._ncc_scale_anchor = np.array([120.0, 82.0], dtype=np.float64)
+        previous = np.array([100.0, 80.0, 80.0, 60.0], dtype=np.float64)
+        candidate = np.array([110.0, 85.0, 40.0, 30.0], dtype=np.float64)
+
+        guarded = tracker._guard_ncc_scale_anchor(candidate, previous, 0.30)
+
+        self.assertGreaterEqual(float(guarded[2]), 66.0)
+        self.assertGreaterEqual(float(guarded[3]), 45.1)
+
+    def test_deep_probe_ncc_disagreement_requires_deep_evidence(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
+        tracker._deep_mode = True
+        tracker._last_deep_probe_state = SphereState(0.0, 0.0, 0.1, 0.1)
+        tracker._last_deep_probe_score = 0.70
+        hand_state = SphereState(math.radians(20.0), 0.0, 0.1, 0.1)
+
+        self.assertTrue(tracker._deep_probe_disagrees_with_ncc(hand_state, "ncc"))
+        self.assertFalse(tracker._deep_probe_disagrees_with_ncc(hand_state, "color"))
+
+        tracker._last_deep_probe_score = 0.40
+        self.assertFalse(tracker._deep_probe_disagrees_with_ncc(hand_state, "ncc"))
 
     def test_ncc_rejects_low_score_candidate_opposing_flow(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(

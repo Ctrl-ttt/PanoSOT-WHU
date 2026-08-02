@@ -17,7 +17,9 @@ def load_image(path: str | Path, max_size: int | None = None) -> np.ndarray:
         if max(w, h) > max_size:
             scale = max_size / max(w, h)
             image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-    return np.asarray(image, dtype=np.float32) / 255.0
+    pixels = np.asarray(image, dtype=np.float32)
+    pixels /= np.float32(255.0)
+    return pixels
 
 
 def load_sequence(sequence_dir: str | Path, max_size: int | None = 960) -> List[np.ndarray]:

@@ -225,6 +225,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root",
         required=True,
+        action="append",
         help="数据根目录，内含多个序列子目录（每个序列含 image/、init_box.txt、groundtruth.txt）。",
     )
     parser.add_argument(
@@ -266,14 +267,51 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _print_runtime_info(device: str) -> None:
+    """Print the torch/CUDA runtime selected by the current interpreter."""
+    print(f"Python: {sys.executable}")
+    if device == "cpu":
+        print("Device: cpu")
+        return
+    try:
+        import torch
+    except ImportError:
+        if device.startswith("cuda"):
+            raise SystemExit("--device cuda requires a PyTorch CUDA build")
+        print("Torch: unavailable")
+        return
+    available = bool(torch.cuda.is_available())
+    print(f"Torch: {torch.__version__}")
+    print(f"Torch CUDA runtime: {torch.version.cuda or 'none'}")
+    print(f"CUDA available: {available}")
+    if device.startswith("cuda") and not available:
+        raise SystemExit(
+            "--device cuda requested, but this interpreter has no usable CUDA."
+        )
+    if available:
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+
 def main() -> None:
     args = parse_args()
-    data_root = Path(args.data_root)
+    data_roots = [Path(root) for root in args.data_root]
+    data_root = data_roots[0]
+    for extra_root in data_roots[1:]:
+        if not extra_root.is_dir():
+            raise SystemExit(f"Data root does not exist: {extra_root}")
+    _print_runtime_info(args.device)
     if not data_root.is_dir():
         print(f"错误：数据根目录不存在 {data_root}", file=sys.stderr)
         raise SystemExit(1)
 
-    sequences = discover_sequences(data_root)
+    sequences = []
+    seen_sequences: set[tuple[str, str]] = set()
+    for root in data_roots:
+        for sequence in discover_sequences(root):
+            key = (sequence[0], str(sequence[1].resolve()))
+            if key not in seen_sequences:
+                sequences.append(sequence)
+                seen_sequences.add(key)
     if not sequences:
         print(f"未找到任何有效序列（需要 image/ + init_box.txt + groundtruth.txt）in {data_root}")
         raise SystemExit(1)

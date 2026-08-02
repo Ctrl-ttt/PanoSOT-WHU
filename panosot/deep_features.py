@@ -97,14 +97,26 @@ class DeepFeatureExtractor:
             return torch.autocast(device_type="cuda", dtype=torch.float16)
         return nullcontext()
 
-    def preprocess_patch(self, patch: np.ndarray, out_size: int) -> Any:
+    def preprocess_patch(
+        self,
+        patch: np.ndarray,
+        out_size: int,
+        *,
+        assume_normalized: bool = False,
+    ) -> Any:
+        """Convert one RGB patch to a model input tensor.
+
+        Tracker-generated tangent patches are already float32 in [0, 1].
+        Callers handling external data should keep the default safe path.
+        """
         if patch.ndim != 3 or patch.shape[2] != 3:
             raise ValueError("Expected patch to have shape [H, W, 3].")
 
         torch = self._torch
         if patch.dtype != np.float32:
             patch = patch.astype(np.float32)
-        patch = np.clip(patch, 0.0, 1.0, out=patch)
+        if not assume_normalized:
+            patch = np.clip(patch, 0.0, 1.0, out=patch)
 
         tensor = torch.from_numpy(patch).permute(2, 0, 1).unsqueeze(0).to(self.device)
         tensor = torch.nn.functional.interpolate(
@@ -116,7 +128,13 @@ class DeepFeatureExtractor:
         tensor = (tensor - self._mean) / self._std
         return tensor
 
-    def preprocess_patches(self, patches: list[np.ndarray], out_size: int) -> Any:
+    def preprocess_patches(
+        self,
+        patches: list[np.ndarray],
+        out_size: int,
+        *,
+        assume_normalized: bool = False,
+    ) -> Any:
         if not patches:
             raise ValueError("patches must not be empty.")
         if any(patch.ndim != 3 or patch.shape[2] != 3 for patch in patches):
@@ -126,7 +144,9 @@ class DeepFeatureExtractor:
         for patch in patches:
             if patch.dtype != np.float32:
                 patch = patch.astype(np.float32)
-            normalized.append(np.clip(patch, 0.0, 1.0))
+            normalized.append(
+                patch if assume_normalized else np.clip(patch, 0.0, 1.0)
+            )
 
         torch = self._torch
         tensor = torch.from_numpy(np.stack(normalized, axis=0)).permute(0, 3, 1, 2).to(self.device)
@@ -138,8 +158,16 @@ class DeepFeatureExtractor:
         )
         return (tensor - self._mean) / self._std
 
-    def _forward(self, patch: np.ndarray, out_size: int) -> Any:
-        tensor = self.preprocess_patch(patch, out_size)
+    def _forward(
+        self,
+        patch: np.ndarray,
+        out_size: int,
+        *,
+        assume_normalized: bool = False,
+    ) -> Any:
+        tensor = self.preprocess_patch(
+            patch, out_size, assume_normalized=assume_normalized,
+        )
         self.forward_calls += 1
         with self._torch.inference_mode():
             with self._amp_context():
@@ -153,21 +181,47 @@ class DeepFeatureExtractor:
     def reset_stats(self) -> None:
         self.forward_calls = 0
 
-    def extract_template_feature(self, patch: np.ndarray) -> Any:
-        return self._forward(patch, self.config.template_size)
+    def extract_template_feature(
+        self,
+        patch: np.ndarray,
+        *,
+        assume_normalized: bool = False,
+    ) -> Any:
+        return self._forward(
+            patch,
+            self.config.template_size,
+            assume_normalized=assume_normalized,
+        )
 
-    def extract_search_feature(self, patch: np.ndarray, refine: bool = False) -> Any:
+    def extract_search_feature(
+        self,
+        patch: np.ndarray,
+        refine: bool = False,
+        *,
+        assume_normalized: bool = False,
+    ) -> Any:
         out_size = self.config.refine_search_size if refine else self.config.coarse_search_size
-        return self._forward(patch, out_size)
+        return self._forward(patch, out_size, assume_normalized=assume_normalized)
 
-    def _forward_batch(self, patches: list[np.ndarray], out_size: int, chunk_size: int = 32) -> Any:
+    def _forward_batch(
+        self,
+        patches: list[np.ndarray],
+        out_size: int,
+        chunk_size: int = 32,
+        *,
+        assume_normalized: bool = False,
+    ) -> Any:
         if not patches:
             raise ValueError("patches must not be empty.")
 
         torch = self._torch
         features_by_chunk: list[Any] = []
         for start in range(0, len(patches), chunk_size):
-            tensor = self.preprocess_patches(patches[start : start + chunk_size], out_size)
+            tensor = self.preprocess_patches(
+                patches[start : start + chunk_size],
+                out_size,
+                assume_normalized=assume_normalized,
+            )
             self.forward_calls += 1
             with torch.inference_mode():
                 with self._amp_context():
@@ -186,14 +240,28 @@ class DeepFeatureExtractor:
         self,
         patches: list[np.ndarray],
         chunk_size: int = 32,
+        *,
+        assume_normalized: bool = False,
     ) -> Any:
-        return self._forward_batch(patches, self.config.template_size, chunk_size)
+        return self._forward_batch(
+            patches,
+            self.config.template_size,
+            chunk_size,
+            assume_normalized=assume_normalized,
+        )
 
     def extract_search_features_batch(
         self,
         patches: list[np.ndarray],
         refine: bool = False,
         chunk_size: int = 32,
+        *,
+        assume_normalized: bool = False,
     ) -> Any:
         out_size = self.config.refine_search_size if refine else self.config.coarse_search_size
-        return self._forward_batch(patches, out_size, chunk_size)
+        return self._forward_batch(
+            patches,
+            out_size,
+            chunk_size,
+            assume_normalized=assume_normalized,
+        )

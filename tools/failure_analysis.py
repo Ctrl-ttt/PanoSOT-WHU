@@ -17,6 +17,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from types import MethodType
 
 import numpy as np
 
@@ -30,10 +31,128 @@ from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
 from panosot.models import build_similarity_head
 
 
+def _state_to_xywh(tracker: PanoSOTTracker, state) -> list[float] | None:
+    if state is None or tracker.frame_shape is None:
+        return None
+    height, width = tracker.frame_shape
+    return tracker._state_to_output_bbox(state, width, height).astype(float).tolist()
+
+
+def _install_candidate_probe(tracker: PanoSOTTracker, rows: list[dict]) -> None:
+    """Capture deep/NCC handoff decisions without changing tracker behavior."""
+    original_local_search = tracker._local_search
+    original_ncc = tracker._predict_with_ncc
+    original_fallback = tracker._try_handcrafted_fallback
+    original_track = tracker.track
+
+    def local_search(self, frame, predicted):
+        state, score = original_local_search(frame, predicted)
+        rows.append({
+            "frame": self._frame_count,
+            "kind": "deep_probe",
+            "score": float(score),
+            "bbox": _state_to_xywh(self, state),
+            "psr": float(self.runtime_stats.last_psr),
+        })
+        return state, score
+
+    def predict_with_ncc(self, frame, gray=None):
+        state, score, reliable = original_ncc(frame, gray=gray)
+        rows.append({
+            "frame": self._frame_count,
+            "kind": "ncc",
+            "score": float(score),
+            "bbox": _state_to_xywh(self, state),
+            "reliable": bool(reliable),
+            "ncc_bbox": self._ncc_bbox.astype(float).tolist() if self._ncc_bbox is not None else None,
+        })
+        return state, score, reliable
+
+    def fallback(self, frame, predicted, gray=None):
+        state, score, source = original_fallback(frame, predicted, gray=gray)
+        rows.append({
+            "frame": self._frame_count,
+            "kind": "fallback",
+            "source": source,
+            "score": float(score),
+            "bbox": _state_to_xywh(self, state),
+        })
+        return state, score, source
+
+    def track(self, frame):
+        result = original_track(frame)
+        rows.append({
+            "frame": self._frame_count,
+            "kind": "final",
+            "score": float(self.runtime_stats.last_score),
+            "bbox": result.astype(float).tolist(),
+            "source": "ncc" if self._last_ncc_reliable else "deep_or_motion",
+            "last_psr": float(self.runtime_stats.last_psr),
+            "fallback_accepts": int(self.runtime_stats.fallback_accepts),
+        })
+        return result
+
+    tracker._local_search = MethodType(local_search, tracker)
+    tracker._predict_with_ncc = MethodType(predict_with_ncc, tracker)
+    tracker._try_handcrafted_fallback = MethodType(fallback, tracker)
+    tracker.track = MethodType(track, tracker)
+
+
+def _summarize_candidate_probe(rows: list[dict], gt_boxes: np.ndarray, image_width: float) -> dict:
+    by_frame: dict[int, dict[str, dict]] = {}
+    for row in rows:
+        by_frame.setdefault(int(row["frame"]), {})[str(row["kind"])] = row
+
+    disagreements = []
+    for frame, entries in sorted(by_frame.items()):
+        deep = entries.get("deep_probe")
+        ncc = entries.get("ncc")
+        final = entries.get("final")
+        if deep is None or ncc is None:
+            continue
+        deep_iou = None
+        ncc_iou = None
+        final_iou = None
+        gt_index = min(frame, len(gt_boxes) - 1)
+        if gt_index >= 0:
+            gt = gt_boxes[gt_index]
+            if deep.get("bbox") is not None:
+                deep_iou = float(circular_iou_xywh(np.asarray(deep["bbox"]), gt, image_width))
+            if ncc.get("bbox") is not None:
+                ncc_iou = float(circular_iou_xywh(np.asarray(ncc["bbox"]), gt, image_width))
+            if final is not None and final.get("bbox") is not None:
+                final_iou = float(circular_iou_xywh(np.asarray(final["bbox"]), gt, image_width))
+        if deep_iou is not None and ncc_iou is not None and abs(deep_iou - ncc_iou) >= 0.20:
+            disagreements.append({
+                "frame": frame,
+                "deep_score": deep["score"],
+                "ncc_score": ncc["score"],
+                "deep_iou": deep_iou,
+                "ncc_iou": ncc_iou,
+                "final_iou": final_iou,
+                "deep_bbox": deep["bbox"],
+                "ncc_bbox": ncc["bbox"],
+                "fallback": entries.get("fallback", {}).get("source"),
+            })
+
+    return {
+        "rows": rows,
+        "disagreement_count": len(disagreements),
+        "largest_disagreements": sorted(
+            disagreements,
+            key=lambda item: abs(item["deep_iou"] - item["ncc_iou"]),
+            reverse=True,
+        )[:20],
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="失败帧分析")
     parser.add_argument("--seq", required=True, help="序列目录路径，如 data/0027")
     parser.add_argument("--output-dir", default="results", help="输出目录")
+    parser.add_argument("--device", default="auto", help="device (auto / cpu / cuda)")
+    parser.add_argument("--backbone", default="mobilenet_v3_small", help="deep backbone")
+    parser.add_argument("--max-frames", type=int, default=0, help="maximum frames; 0 means all")
     return parser.parse_args()
 
 
@@ -58,13 +177,26 @@ def segment_stats(ious, gt_area, gt_lat, gt_speed, gt_scale_change, img_area,
     }
 
 
-def analyze_one(seq_dir: Path, output_dir: Path) -> dict:
+def analyze_one(
+    seq_dir: Path,
+    output_dir: Path,
+    *,
+    device: str = "auto",
+    backbone: str = "mobilenet_v3_small",
+    max_frames: int = 0,
+) -> dict:
     seq_name = seq_dir.name
     image_dir = seq_dir / "image"
     init_box_path = seq_dir / "init_box.txt"
+    if not init_box_path.is_file():
+        init_box_path = seq_dir / "init.txt"
     gt_path = seq_dir / "groundtruth.txt"
+    if not gt_path.is_file():
+        gt_path = seq_dir / "gt.txt"
 
     frame_paths = sorted(p for p in image_dir.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+    if max_frames > 0:
+        frame_paths = frame_paths[:max_frames]
     init_box = load_boxes(str(init_box_path))[0]
     gt_boxes = load_boxes(str(gt_path))
 
@@ -82,9 +214,29 @@ def analyze_one(seq_dir: Path, output_dir: Path) -> dict:
         confirmation_frames=2,
         update_quality_threshold=0.65,
     )
-    fe = DeepFeatureExtractor(FeatureConfig())
+    resolved_device = device
+    if resolved_device == "auto":
+        import torch
+        resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if resolved_device.startswith("cuda"):
+        import torch
+        if not torch.cuda.is_available():
+            raise SystemExit("--device cuda requested, but this interpreter has no usable CUDA.")
+    fe = DeepFeatureExtractor(FeatureConfig(
+        backbone_name=backbone,
+        device=resolved_device,
+        use_amp=resolved_device.startswith("cuda"),
+        feature_layer=cfg.deep_feature_layer,
+        normalize_features=cfg.normalize_deep_features,
+        template_size=cfg.deep_template_size,
+        coarse_search_size=cfg.coarse_search_size,
+        refine_search_size=cfg.refine_search_size,
+        cache_dir=str(PROJECT_ROOT / ".cache" / "torch"),
+    ))
     sh = build_similarity_head("depthwise_xcorr")
     tracker = PanoSOTTracker(config=cfg, deep_extractor=fe, similarity_head=sh)
+    candidate_rows: list[dict] = []
+    _install_candidate_probe(tracker, candidate_rows)
 
     t0 = time.perf_counter()
     predictions = tracker.track_sequence((load_image(p) for p in frame_paths), init_box)
@@ -178,6 +330,8 @@ def analyze_one(seq_dir: Path, output_dir: Path) -> dict:
         },
         "segments": segments,
         "worst_frames": worst_frames,
+        "runtime_stats": tracker.get_runtime_stats(),
+        "candidate_probe": _summarize_candidate_probe(candidate_rows, gts, img_w),
     }
 
     # 打印报告
@@ -230,7 +384,13 @@ def main() -> None:
         print(f"错误：序列目录不存在 {seq_dir}")
         raise SystemExit(1)
 
-    analyze_one(seq_dir, output_dir)
+    analyze_one(
+        seq_dir,
+        output_dir,
+        device=args.device,
+        backbone=args.backbone,
+        max_frames=args.max_frames,
+    )
 
 
 if __name__ == "__main__":
