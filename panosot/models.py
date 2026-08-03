@@ -60,14 +60,22 @@ class DepthwiseXCorrHead:
         if template_feat.shape[1] != search_feat.shape[1]:
             raise ValueError("Template and search features must have the same channel count.")
 
+        # Compute all KxN template/search pairs in one grouped convolution.  The
+        # previous implementation launched one convolution per template, which
+        # is especially expensive for CUDA during global re-localization.
         num_searches = int(search_feat.shape[0])
+        num_templates = int(template_feat.shape[0])
+        channels = int(template_feat.shape[1])
         area = max(int(template_feat.shape[-2]) * int(template_feat.shape[-1]), 1)
-        responses = []
-        for index in range(int(template_feat.shape[0])):
-            template = template_feat[index : index + 1].expand(num_searches, -1, -1, -1)
-            response = self._channelwise_conv(template, search_feat)
-            responses.append(response.mean(dim=1, keepdim=True) / area)
-        return self._torch.stack(responses, dim=1)
+
+        # Pair order is [search0/template0..K-1, search1/template0..K-1, ...].
+        kernels = template_feat.unsqueeze(0).expand(num_searches, -1, -1, -1, -1)
+        kernels = kernels.reshape(num_searches * num_templates, channels, *template_feat.shape[-2:])
+        searches = search_feat.unsqueeze(1).expand(-1, num_templates, -1, -1, -1)
+        searches = searches.reshape(1, num_searches * num_templates * channels, *search_feat.shape[-2:])
+        response = self._channelwise_conv(kernels, searches)
+        response = response.mean(dim=1, keepdim=True) / area
+        return response.reshape(num_searches, num_templates, 1, response.shape[-2], response.shape[-1])
 
 
 def build_backbone(name: str, pretrained: bool = True, feature_layer: int | None = 12) -> Any:

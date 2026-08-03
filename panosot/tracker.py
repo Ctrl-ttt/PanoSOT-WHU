@@ -170,6 +170,8 @@ class TrackerConfig:
     deep_probe_ncc_disagreement_lat_deg: float = 8.0
     deep_probe_ncc_min_deep_score: float = 0.55
     deep_probe_ncc_override_margin: float = 0.05
+    deep_probe_recovery_max_lon_deg: float = 14.0
+    deep_probe_recovery_max_lat_deg: float = 10.0
     # A global deep peak must remain close to the latest independent probe;
     # this blocks high-scoring background peaks after NCC loses scale.
     deep_relocalize_probe_max_lon_gap_deg: float = 30.0
@@ -1505,10 +1507,29 @@ class PanoSOTTracker:
                         best_state, best_score = hand_state, hand_score
                         handcrafted_result = True
                     else:
-                        # Keep the prior motion prediction and let the loss
-                        # and relocalization logic handle this weak frame.
-                        best_state = predicted
-                        best_score = deep_score_before_fallback
+                        # If the handcrafted fallback is weak, prefer a
+                        # recent, independently-scored deep probe that is
+                        # still near the current prediction.  Holding the
+                        # prediction here used to let a bad NCC/colour frame
+                        # poison the motion state for many subsequent frames.
+                        probe = self._last_deep_probe_state
+                        probe_age = self._frame_count - self._last_deep_probe_frame
+                        if (
+                            probe is not None
+                            and probe_age <= max(int(self.config.deep_probe_interval) * 2, 1)
+                            and self._last_deep_probe_score >= self.config.deep_probe_ncc_min_deep_score
+                            and abs(math.degrees(lon_distance(probe.lon, predicted.lon)))
+                            <= self.config.deep_probe_recovery_max_lon_deg
+                            and abs(math.degrees(probe.lat - predicted.lat))
+                            <= self.config.deep_probe_recovery_max_lat_deg
+                        ):
+                            best_state = probe
+                            best_score = self._last_deep_probe_score
+                        else:
+                            # Keep the prior motion prediction and let the
+                            # loss/relocalization state machine handle it.
+                            best_state = predicted
+                            best_score = deep_score_before_fallback
         if self._deep_mode and handcrafted_result and fallback_source == "ncc":
             if self._ncc_last_score < self.config.handcrafted_ncc_low_score_commit_threshold:
                 self._consecutive_low_ncc += 1
@@ -1662,6 +1683,19 @@ class PanoSOTTracker:
                 large_jump_early,
                 deep_relocalization,
             )
+            # A global deep peak can be very sharp on a distractor.  For a
+            # large jump, require agreement with a recent local deep probe
+            # regardless of which loss trigger requested re-localization.
+            # Previously this guard only ran for NCC-triggered recovery, so a
+            # low-score/low-PSR trigger could still jump to background.
+            if (
+                accept_relocalization
+                and deep_relocalization
+                and (lon_jump_deg > self.config.relocalize_max_lon_jump_deg
+                     or lat_jump_deg > self.config.relocalize_max_lat_jump_deg)
+                and not self._recent_deep_probe_supports_jump(relocalized)
+            ):
+                accept_relocalization = False
             # A weak NCC streak is not an independent confirmation for a
             # global deep peak. Without a recent strong probe, keep the local
             # track rather than replacing it with a plausible distractor.
@@ -1744,7 +1778,10 @@ class PanoSOTTracker:
         # P1 fix: 深度模式后台维护手工独立状态，避免完全失活
         if self._deep_mode and self._hand_state is not None and not handcrafted_result:
             # 深度可信时（高分数 + 高PSR），手工速度跟随深度
-            deep_reliable = best_score >= self.config.deep_high_confidence and self.runtime_stats.last_psr >= 2.0
+            deep_reliable = (
+                best_score >= self.config.deep_high_confidence
+                and self.runtime_stats.last_psr >= self.config.deep_velocity_low_psr_threshold
+            )
             hand_uninitialized = self._frame_count <= 3 and np.all(self._hand_velocity == 0)
             if deep_reliable or hand_uninitialized:
                 self._hand_velocity[0] = self.velocity[0]
