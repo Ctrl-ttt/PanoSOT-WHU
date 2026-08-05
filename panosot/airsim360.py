@@ -11,15 +11,19 @@ import numpy as np
 
 
 def decode_argb_instance_ids(image: np.ndarray) -> np.ndarray:
-    """Decode AirSim's RGBA/ARGB instance colour into one uint32 id per pixel."""
+    """Decode AirSim's ARGB instance colour into one uint32 id per pixel.
+
+    Pillow returns PNG data in RGBA channel order, while AirSim stores the
+    instance colour as an AARRGGBB integer.
+    """
     if image.ndim != 3 or image.shape[2] != 4:
         raise ValueError("Expected AirSim instance image with shape [H, W, 4].")
     rgba = image.astype(np.uint32, copy=False)
     return (
-        rgba[..., 0]
+        (rgba[..., 3] << 24)
+        | (rgba[..., 0] << 16)
         | (rgba[..., 1] << 8)
-        | (rgba[..., 2] << 16)
-        | (rgba[..., 3] << 24)
+        | rgba[..., 2]
     )
 
 

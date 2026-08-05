@@ -10,7 +10,7 @@ from panosot.airsim360 import decode_argb_instance_ids, extract_instance_boxes
 class AirSim360InstanceTests(unittest.TestCase):
     def test_decodes_rgba_bytes_as_airsim_argb_id(self) -> None:
         rgba = np.array([[[0x11, 0x22, 0x33, 0x44]]], dtype=np.uint8)
-        self.assertEqual(decode_argb_instance_ids(rgba).item(), 0x44332211)
+        self.assertEqual(decode_argb_instance_ids(rgba).item(), 0x44112233)
 
     def test_extracts_usable_instances_and_skips_background(self) -> None:
         ids = np.zeros((8, 10), dtype=np.uint32)
