@@ -16,6 +16,28 @@ from tools.batch_evaluate import SeqResult, discover_sequences, summarize_result
 
 
 class HybridTrackerTests(unittest.TestCase):
+    def test_tracking_adapter_runs_on_inference_features(self) -> None:
+        import tempfile
+        import torch
+
+        from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
+        from panosot.models import TrackingProjection
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "adapter.pt"
+            adapter = TrackingProjection(8)
+            torch.save({"channels": 8, "state_dict": adapter.state_dict()}, checkpoint)
+            extractor = DeepFeatureExtractor.__new__(DeepFeatureExtractor)
+            extractor._torch = torch
+            extractor.device = torch.device("cpu")
+            extractor.config = FeatureConfig()
+            extractor.adapter = None
+            extractor.load_tracking_adapter(checkpoint)
+            with torch.inference_mode():
+                features = torch.randn(1, 8, 3, 3)
+            output = extractor._postprocess_features(features)
+            self.assertEqual(tuple(output.shape), (1, 8, 3, 3))
+
     def test_deep_refine_topk_selects_coarse_winners_and_handles_bounds(self) -> None:
         scores = [0.20, 0.85, 0.40, 0.70, 0.55]
 

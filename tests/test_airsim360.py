@@ -41,6 +41,14 @@ class AirSim360InstanceTests(unittest.TestCase):
         pairs = {instance: raw for raw, instance in [(raw_name, instance_name)]}
         self.assertEqual(pairs[instance_name], raw_name)
 
+    def test_training_resize_makes_variable_crops_batchable(self) -> None:
+        from tools.train_airsim360_adapter import _resize_patch
+
+        first = _resize_patch(np.zeros((8, 13, 3), dtype=np.float32))
+        second = _resize_patch(np.zeros((20, 7, 3), dtype=np.float32))
+        self.assertEqual(first.shape, (128, 128, 3))
+        self.assertEqual(second.shape, (128, 128, 3))
+
 
 if __name__ == "__main__":
     unittest.main()

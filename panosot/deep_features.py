@@ -118,7 +118,12 @@ class DeepFeatureExtractor:
         if isinstance(features, (list, tuple)):
             features = features[-1]
         if self.adapter is not None:
-            features = self.adapter(features)
+            # Backbone features are produced under inference_mode. Keep the
+            # frozen adapter in the same mode; otherwise Conv2d attempts to
+            # save backward state for an inference tensor at runtime.
+            with self._torch.inference_mode():
+                with self._amp_context():
+                    features = self.adapter(features)
         if self.config.normalize_features:
             features = self._torch.nn.functional.normalize(features, p=2, dim=1, eps=1e-6)
         return features

@@ -239,6 +239,11 @@ def parse_args() -> argparse.Namespace:
         help="深度特征 backbone 名。",
     )
     parser.add_argument(
+        "--tracking-adapter",
+        default=None,
+        help="AirSim360-trained tracking adapter checkpoint (.pt). Requires --deep.",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         help="计算设备 (auto / cpu / cuda)。",
@@ -363,10 +368,13 @@ def main() -> None:
             coarse_search_size=config.coarse_search_size,
             refine_search_size=config.refine_search_size,
             cache_dir=str(Path(__file__).resolve().parents[1] / ".cache" / "torch"),
+            tracking_adapter_path=args.tracking_adapter,
         )
         config.device = resolved_device
         deep_extractor = DeepFeatureExtractor(feat_config)
         similarity_head = build_similarity_head("depthwise_xcorr")
+        if args.tracking_adapter:
+            print(f"AirSim360 adapter: {args.tracking_adapter}")
         print(f"深度特征模式: backbone={args.backbone}, device={resolved_device}")
 
     # 逐条评测

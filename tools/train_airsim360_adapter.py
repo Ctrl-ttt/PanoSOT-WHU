@@ -22,6 +22,21 @@ from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
 from panosot.models import TrackingProjection
 
 
+def _resize_patch(image: np.ndarray, size: int = 128) -> np.ndarray:
+    """Resize variable-size instance crops before forming a CUDA batch."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise ImportError("Pillow is required for AirSim360 training.") from exc
+    if image.shape[:2] == (size, size):
+        return image
+    image_u8 = np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
+    resized = Image.fromarray(image_u8, mode="RGB").resize(
+        (size, size), Image.Resampling.BILINEAR
+    )
+    return np.asarray(resized, dtype=np.float32) / 255.0
+
+
 def _augment(image: np.ndarray, rng: random.Random) -> np.ndarray:
     """Apply inexpensive RGB correspondence augmentations."""
     patch = image.astype(np.float32) / 255.0
@@ -29,7 +44,7 @@ def _augment(image: np.ndarray, rng: random.Random) -> np.ndarray:
         patch = patch[:, ::-1].copy()
     gain = rng.uniform(0.7, 1.3)
     bias = rng.uniform(-0.08, 0.08)
-    return np.clip(patch * gain + bias, 0.0, 1.0)
+    return _resize_patch(np.clip(patch * gain + bias, 0.0, 1.0))
 
 
 def _batch_tensor(extractor: DeepFeatureExtractor, patches: list[np.ndarray], size: int):
