@@ -17,9 +17,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from panosot.airsim360 import AirSim360PairDataset, AirSim360TrainingArchive
+from panosot.airsim360 import (
+    AirSim360PairDataset,
+    AirSim360TemporalPairDataset,
+    AirSim360TrainingArchive,
+)
 from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
-from panosot.models import TrackingProjection
+from panosot.models import DepthwiseXCorrHead, TrackingProjection
 
 
 def _resize_patch(image: np.ndarray, size: int = 128) -> np.ndarray:
@@ -51,6 +55,31 @@ def _batch_tensor(extractor: DeepFeatureExtractor, patches: list[np.ndarray], si
     return extractor.preprocess_patches(patches, size, assume_normalized=True)
 
 
+def localization_loss(response, torch, target_fractions, logit_scale: float = 1000.0):
+    """Cross-entropy against each target's XCorr-map location."""
+    if response.ndim != 4 or response.shape[1] != 1:
+        raise ValueError("Expected response map [B, 1, H, W].")
+    batch, _, height, width = response.shape
+    target_fractions = torch.as_tensor(
+        target_fractions, dtype=torch.float32, device=response.device
+    )
+    if target_fractions.shape != (batch, 2):
+        raise ValueError("Expected target fractions with shape [B, 2].")
+    # Search features are twice the template spatial size in this pipeline.
+    # A centre target maps to the centre of the valid XCorr response.
+    target_x = torch.floor(
+        target_fractions[:, 0] * (2 * (width - 1)) - 0.5 * (width - 1) + 0.5
+    ).long().clamp_(0, width - 1)
+    target_y = torch.floor(
+        target_fractions[:, 1] * (2 * (height - 1)) - 0.5 * (height - 1) + 0.5
+    ).long().clamp_(0, height - 1)
+    labels = target_y * width + target_x
+    # DepthwiseXCorrHead averages channels and template area for stable
+    # runtime confidence values; restore gradient scale for CE training.
+    logits = response.reshape(batch, height * width) * logit_scale
+    return torch.nn.functional.cross_entropy(logits, labels)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train AirSim360 tracker adapter.")
     parser.add_argument("--raw", type=Path, required=True, help="Path to nyc_Raw.zip")
@@ -66,8 +95,19 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-samples", type=int, default=20000)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--feature-layer",
+        type=int,
+        default=7,
+        help="MobileNet feature layer. 7 gives an 8x8 XCorr map for 112/224 inputs.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--temporal",
+        action="store_true",
+        help="Use persistent instance IDs in consecutive AirSim360 frames.",
+    )
     args = parser.parse_args()
 
     import torch
@@ -81,9 +121,11 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     archive = AirSim360TrainingArchive(args.raw, args.instance)
-    dataset = AirSim360PairDataset(
-        archive, max_samples=args.max_samples, seed=args.seed
-    )
+    dataset_class = AirSim360TemporalPairDataset if args.temporal else AirSim360PairDataset
+    dataset_kwargs = {"max_samples": args.max_samples}
+    if not args.temporal:
+        dataset_kwargs["seed"] = args.seed
+    dataset = dataset_class(archive, **dataset_kwargs)
     if not dataset:
         raise SystemExit("No matched RGB/instance samples were found.")
     print(f"Training samples: {len(dataset)}")
@@ -93,6 +135,7 @@ def main() -> None:
             device=args.device,
             use_amp=args.device.startswith("cuda"),
             normalize_features=True,
+            feature_layer=args.feature_layer,
         )
     )
     for parameter in extractor.model.parameters():
@@ -102,6 +145,7 @@ def main() -> None:
         example = _batch_tensor(extractor, [_augment(dataset[0][0], random)], 112)
         channels = int(extractor.model(example).shape[1])
     adapter = TrackingProjection(channels).to(extractor.device).train()
+    xcorr = DepthwiseXCorrHead()
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=extractor.device.type == "cuda")
 
@@ -111,11 +155,13 @@ def main() -> None:
         losses: list[float] = []
         for start in range(0, len(indices), args.batch_size):
             batch_indices = indices[start : start + args.batch_size]
-            templates, searches = zip(*(dataset[index] for index in batch_indices))
+            templates, searches, target_fractions = zip(
+                *(dataset[index] for index in batch_indices)
+            )
             templates = [_augment(patch, random) for patch in templates]
             searches = [_augment(patch, random) for patch in searches]
             template_tensor = _batch_tensor(extractor, templates, 112)
-            search_tensor = _batch_tensor(extractor, searches, 112)
+            search_tensor = _batch_tensor(extractor, searches, 224)
             with torch.no_grad():
                 with extractor._amp_context():
                     template_features = extractor.model(template_tensor)
@@ -131,12 +177,11 @@ def main() -> None:
                 search_features = torch.nn.functional.normalize(
                     adapter(search_features), dim=1
                 )
-                logits = template_features.mean((-1, -2)) @ search_features.mean((-1, -2)).T
-                labels = torch.arange(len(batch_indices), device=extractor.device)
-                loss = 0.5 * (
-                    torch.nn.functional.cross_entropy(logits * 10.0, labels)
-                    + torch.nn.functional.cross_entropy(logits.T * 10.0, labels)
-                )
+                response = xcorr(template_features, search_features)
+                # The positive response must peak at target centre. This is
+                # the same operation used by the runtime tracker, unlike the
+                # previous pooled embedding loss.
+                loss = localization_loss(response, torch, target_fractions)
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -147,6 +192,7 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"channels": channels, "state_dict": adapter.eval().state_dict()}, args.output)
     print("Saved adapter:", args.output.resolve())
+    archive.close()
 
 
 if __name__ == "__main__":

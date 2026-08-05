@@ -244,6 +244,12 @@ def parse_args() -> argparse.Namespace:
         help="AirSim360-trained tracking adapter checkpoint (.pt). Requires --deep.",
     )
     parser.add_argument(
+        "--feature-layer",
+        type=int,
+        default=12,
+        help="MobileNet feature layer used for deep tracking.",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         help="计算设备 (auto / cpu / cuda)。",
@@ -336,6 +342,7 @@ def main() -> None:
         use_deep_features=args.deep,
         backbone_name=args.backbone,
         device=args.device,
+        deep_feature_layer=args.feature_layer,
         deep_template_enlarge=4.0,
         confirmation_frames=2,
         update_quality_threshold=0.65,

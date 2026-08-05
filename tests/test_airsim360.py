@@ -8,6 +8,7 @@ from panosot.airsim360 import (
     crop_erp_wrapped,
     decode_argb_instance_ids,
     extract_instance_boxes,
+    temporal_target_fraction,
 )
 
 
@@ -48,6 +49,34 @@ class AirSim360InstanceTests(unittest.TestCase):
         second = _resize_patch(np.zeros((20, 7, 3), dtype=np.float32))
         self.assertEqual(first.shape, (128, 128, 3))
         self.assertEqual(second.shape, (128, 128, 3))
+
+    def test_localization_loss_target_is_the_response_center(self) -> None:
+        import torch
+
+        from tools.train_airsim360_adapter import localization_loss
+
+        response = torch.full((1, 1, 3, 5), -8.0)
+        response[0, 0, 1, 2] = 8.0
+        self.assertLess(localization_loss(response, torch, [(0.5, 0.5)]).item(), 0.01)
+
+    def test_localization_loss_uses_shifted_target_location(self) -> None:
+        import torch
+
+        from tools.train_airsim360_adapter import localization_loss
+
+        response = torch.full((1, 1, 8, 8), -8.0)
+        response[0, 0, 4, 6] = 8.0
+        self.assertLess(localization_loss(response, torch, [(0.65, 0.5)]).item(), 0.01)
+
+    def test_temporal_pairs_are_built_only_for_consecutive_numbers(self) -> None:
+        numbered = {0: "panorama_0.png", 1: "panorama_1.png", 3: "panorama_3.png"}
+        consecutive = [(number, number + 1) for number in sorted(numbered) if number + 1 in numbered]
+        self.assertEqual(consecutive, [(0, 1)])
+
+    def test_temporal_target_fraction_tracks_wrapped_motion(self) -> None:
+        fraction = temporal_target_fraction((1990, 100, 20, 20), (2, 100, 20, 20), 2048)
+        self.assertAlmostEqual(fraction[0], 1.25)
+        self.assertAlmostEqual(fraction[1], 0.5)
 
 
 if __name__ == "__main__":
