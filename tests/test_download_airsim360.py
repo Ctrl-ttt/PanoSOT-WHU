@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from tools.download_airsim360 import build_allow_patterns
+from tools.download_airsim360 import build_allow_patterns, download_with_curl
 
 
 class AirSim360DownloadTests(unittest.TestCase):
@@ -33,6 +34,20 @@ class AirSim360DownloadTests(unittest.TestCase):
                 "Omni360-Scene/CityPark/citypark_Raw_Part3.zip",
             ],
         )
+
+    def test_curl_download_keeps_partial_file_on_failure(self) -> None:
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "raw.zip"
+            with patch("tools.download_airsim360.subprocess.run") as run:
+                run.return_value.returncode = 28
+                with self.assertRaises(RuntimeError):
+                    download_with_curl("https://example.invalid/raw.zip", destination)
+                self.assertFalse(destination.exists())
+                command = run.call_args.args[0]
+                self.assertTrue(str(command[command.index("--output") + 1]).endswith("raw.zip.part"))
 
 
 if __name__ == "__main__":

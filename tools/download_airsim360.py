@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import subprocess
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +64,41 @@ def build_allow_patterns(scenes: list[str], components: list[str]) -> list[str]:
     return patterns
 
 
+def download_with_curl(url: str, destination: Path) -> None:
+    """Use curl continue mode when snapshot_download is unsuitable.
+
+    This fallback is useful on networks where Hugging Face's Xet transfer
+    client cannot establish a large-file connection. The final archive stays
+    in .part until curl succeeds, preventing an interrupted file from being
+    treated as usable data.
+    """
+    partial = destination.with_suffix(destination.suffix + ".part")
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            "curl.exe",
+            "--fail",
+            "--location",
+            "--continue-at",
+            "-",
+            "--retry",
+            "8",
+            "--retry-delay",
+            "10",
+            "--output",
+            str(partial),
+            url,
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"curl failed for {destination.name} (exit {result.returncode}); "
+            f"resume later from {partial}."
+        )
+    partial.replace(destination)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Download official AirSim360 Omni360-Scene data with resume support."
@@ -93,6 +129,12 @@ def main() -> None:
         action="store_true",
         help="Print the requested official repository files without downloading.",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["hub", "curl"],
+        default="hub",
+        help="hub uses Hugging Face's client; curl is a resumable HTTPS fallback.",
+    )
     args = parser.parse_args()
 
     patterns = build_allow_patterns(args.scene, args.components)
@@ -101,6 +143,18 @@ def main() -> None:
     for pattern in patterns:
         print(" -", pattern)
     if args.dry_run:
+        return
+
+    if args.transport == "curl":
+        for pattern in patterns:
+            destination = args.output / pattern
+            url = (
+                f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/"
+                f"{pattern}?download=true"
+            )
+            print("Downloading with curl:", destination.name, flush=True)
+            download_with_curl(url, destination)
+        print("Download complete:", args.output.resolve())
         return
 
     try:
