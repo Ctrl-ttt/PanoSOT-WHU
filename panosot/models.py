@@ -78,6 +78,46 @@ class DepthwiseXCorrHead:
         return response.reshape(num_searches, num_templates, 1, response.shape[-2], response.shape[-1])
 
 
+class TrackingProjection:
+    """Small trainable feature adapter placed before cross-correlation.
+
+    The ImageNet backbone remains a useful generic visual prior while this
+    layer adapts its channels to object correspondence in panoramic imagery.
+    """
+
+    def __init__(self, channels: int) -> None:
+        torch, nn = _require_torch()
+        self._module = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def __call__(self, features: Any) -> Any:
+        return self._module(features)
+
+    def parameters(self) -> Any:
+        return self._module.parameters()
+
+    def to(self, *args: Any, **kwargs: Any) -> Any:
+        self._module.to(*args, **kwargs)
+        return self
+
+    def train(self, mode: bool = True) -> Any:
+        self._module.train(mode)
+        return self
+
+    def eval(self) -> Any:
+        self._module.eval()
+        return self
+
+    def state_dict(self) -> Any:
+        return self._module.state_dict()
+
+    def load_state_dict(self, state_dict: Any) -> Any:
+        return self._module.load_state_dict(state_dict)
+
+
 def build_backbone(name: str, pretrained: bool = True, feature_layer: int | None = 12) -> Any:
     torch, nn = _require_torch()
     normalized_name = name.strip().lower()

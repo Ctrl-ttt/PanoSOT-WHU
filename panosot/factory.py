@@ -15,6 +15,7 @@ def build_tracker(
     **kwargs: Any,
 ) -> PanoSOTTracker:
     cache_dir = kwargs.pop("cache_dir", None)
+    tracking_adapter_path = kwargs.pop("tracking_adapter_path", None)
     if cache_dir is None:
         project_cache = Path(__file__).resolve().parents[1] / ".cache" / "torch"
         if project_cache.is_dir():
@@ -47,6 +48,7 @@ def build_tracker(
             coarse_search_size=config.coarse_search_size,
             refine_search_size=config.refine_search_size,
             cache_dir=cache_dir,
+            tracking_adapter_path=tracking_adapter_path,
         )
         deep_extractor = DeepFeatureExtractor(feat_config)
         similarity_head = build_similarity_head("depthwise_xcorr")

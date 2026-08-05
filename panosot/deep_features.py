@@ -37,6 +37,7 @@ class FeatureConfig:
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)
     pretrained: bool = True
     cache_dir: str | None = None
+    tracking_adapter_path: str | None = None
 
 
 class DeepFeatureExtractor:
@@ -55,6 +56,9 @@ class DeepFeatureExtractor:
         torch = self._torch
         self._mean = torch.tensor(config.mean, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
         self._std = torch.tensor(config.std, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+        self.adapter = None
+        if config.tracking_adapter_path:
+            self.load_tracking_adapter(config.tracking_adapter_path)
 
     def _configure_cache_dir(self, cache_dir: str | None) -> None:
         if not cache_dir:
@@ -96,6 +100,28 @@ class DeepFeatureExtractor:
         if self.config.use_amp and self.device.type == "cuda":
             return torch.autocast(device_type="cuda", dtype=torch.float16)
         return nullcontext()
+
+    def load_tracking_adapter(self, checkpoint_path: str | Path) -> None:
+        """Load a trained 1x1 tracking adapter without changing the backbone."""
+        from .models import TrackingProjection
+
+        checkpoint = self._torch.load(
+            checkpoint_path, map_location=self.device, weights_only=True
+        )
+        channels = int(checkpoint["channels"])
+        adapter = TrackingProjection(channels).to(self.device)
+        adapter.load_state_dict(checkpoint["state_dict"])
+        adapter.eval()
+        self.adapter = adapter
+
+    def _postprocess_features(self, features: Any) -> Any:
+        if isinstance(features, (list, tuple)):
+            features = features[-1]
+        if self.adapter is not None:
+            features = self.adapter(features)
+        if self.config.normalize_features:
+            features = self._torch.nn.functional.normalize(features, p=2, dim=1, eps=1e-6)
+        return features
 
     def preprocess_patch(
         self,
@@ -172,11 +198,7 @@ class DeepFeatureExtractor:
         with self._torch.inference_mode():
             with self._amp_context():
                 features = self.model(tensor)
-        if isinstance(features, (list, tuple)):
-            features = features[-1]
-        if self.config.normalize_features:
-            features = self._torch.nn.functional.normalize(features, p=2, dim=1, eps=1e-6)
-        return features
+        return self._postprocess_features(features)
 
     def reset_stats(self) -> None:
         self.forward_calls = 0
@@ -226,11 +248,7 @@ class DeepFeatureExtractor:
             with torch.inference_mode():
                 with self._amp_context():
                     features = self.model(tensor)
-            if isinstance(features, (list, tuple)):
-                features = features[-1]
-            if self.config.normalize_features:
-                features = torch.nn.functional.normalize(features, p=2, dim=1, eps=1e-6)
-            features_by_chunk.append(features)
+            features_by_chunk.append(self._postprocess_features(features))
 
         if len(features_by_chunk) == 1:
             return features_by_chunk[0]
