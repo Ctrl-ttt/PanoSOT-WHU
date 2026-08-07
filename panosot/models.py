@@ -118,6 +118,19 @@ class TrackingProjection:
         return self._module.load_state_dict(state_dict)
 
 
+class ResidualTrackingProjection(TrackingProjection):
+    """Low-risk adapter that starts exactly as the identity mapping."""
+
+    def __init__(self, channels: int, scale: float = 0.20) -> None:
+        torch, nn = _require_torch()
+        self._scale = float(scale)
+        self._module = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        nn.init.zeros_(self._module.weight)
+
+    def __call__(self, features: Any) -> Any:
+        return features + self._scale * self._module(features)
+
+
 def build_backbone(name: str, pretrained: bool = True, feature_layer: int | None = 12) -> Any:
     torch, nn = _require_torch()
     normalized_name = name.strip().lower()

@@ -279,6 +279,234 @@ class HybridTrackerTests(unittest.TestCase):
             tracker._deep_probe_disagrees_with_ncc(ncc_state, "ncc", hand_score=0.50)
         )
 
+    def test_deep_ncc_fusion_is_bounded_and_keeps_ncc_scale(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            deep_ncc_fusion_enabled=True,
+            deep_ncc_fusion_psr_floor=1.0,
+            deep_ncc_fusion_psr_ceiling=2.0,
+            deep_ncc_fusion_max_weight=0.35,
+        ))
+        tracker._deep_mode = True
+        deep = SphereState(math.radians(2.0), math.radians(1.0), 0.20, 0.15)
+        ncc = SphereState(0.0, 0.0, 0.10, 0.08)
+
+        fused = tracker._fuse_deep_ncc_candidates(deep, 1.0, 2.0, ncc, 0.80)
+
+        self.assertIsNotNone(fused)
+        state, score = fused
+        self.assertAlmostEqual(math.degrees(state.lon), 0.70, places=3)
+        self.assertAlmostEqual(math.degrees(state.lat), 0.35, places=3)
+        self.assertEqual(state.equatorial_width, ncc.equatorial_width)
+        self.assertEqual(state.angular_height, ncc.angular_height)
+        self.assertEqual(score, 0.80)
+        self.assertEqual(tracker.runtime_stats.deep_ncc_fusion_accepts, 1)
+
+    def test_deep_ncc_fusion_rejects_disagreement(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            deep_ncc_fusion_enabled=True,
+            deep_ncc_fusion_max_lon_gap_deg=3.0,
+        ))
+        tracker._deep_mode = True
+        deep = SphereState(math.radians(8.0), 0.0, 0.1, 0.1)
+        ncc = SphereState(0.0, 0.0, 0.1, 0.1)
+
+        self.assertIsNone(tracker._fuse_deep_ncc_candidates(deep, 0.9, 1.8, ncc, 0.8))
+        self.assertEqual(tracker.runtime_stats.deep_ncc_fusion_spatial_rejects, 1)
+
+    def test_spherical_ncc_correction_is_bounded_and_keeps_ncc_scale(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            spherical_ncc_enabled=True,
+            spherical_ncc_correction_margin=0.0,
+            spherical_ncc_correction_max_weight=0.25,
+        ))
+        tracker._deep_mode = True
+        hand = SphereState(0.0, 0.0, 0.20, 0.15)
+        spherical = SphereState(math.radians(8.0), math.radians(4.0), 0.50, 0.40)
+        with patch.object(tracker, "_spherical_ncc_due", return_value=True), patch.object(
+            tracker,
+            "_predict_with_spherical_ncc",
+            return_value=(spherical, 0.90, True),
+        ):
+            corrected, score, source = tracker._maybe_spherical_ncc_correction(
+                np.zeros((8, 8, 3), dtype=np.float32),
+                hand,
+                hand,
+                0.50,
+                "ncc",
+            )
+        self.assertEqual(source, "spherical_ncc_correction")
+        self.assertGreater(score, 0.50)
+        self.assertEqual(corrected.equatorial_width, hand.equatorial_width)
+        self.assertEqual(corrected.angular_height, hand.angular_height)
+        self.assertLessEqual(math.degrees(corrected.lon), 2.1)
+
+    def test_spherical_ncc_correction_rejects_large_disagreement(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            spherical_ncc_enabled=True,
+            spherical_ncc_correction_margin=0.0,
+        ))
+        tracker._deep_mode = True
+        hand = SphereState(0.0, 0.0, 0.20, 0.15)
+        spherical = SphereState(math.radians(40.0), 0.0, 0.20, 0.15)
+        with patch.object(tracker, "_spherical_ncc_due", return_value=True), patch.object(
+            tracker,
+            "_predict_with_spherical_ncc",
+            return_value=(spherical, 0.95, True),
+        ):
+            corrected, score, source = tracker._maybe_spherical_ncc_correction(
+                np.zeros((8, 8, 3), dtype=np.float32),
+                hand,
+                hand,
+                0.50,
+                "ncc",
+            )
+        self.assertEqual(source, "ncc")
+        self.assertEqual(score, 0.50)
+        self.assertEqual(corrected.lon, hand.lon)
+
+    def test_ncc_scale_pairs_default_preserves_existing_asymmetric_search(self) -> None:
+        config = TrackerConfig()
+        self.assertIn((1.0, 1.0), config.handcrafted_ncc_scale_pairs)
+        self.assertIn((1.35, 0.85), config.handcrafted_ncc_scale_pairs)
+        self.assertFalse(config.handcrafted_ncc_flow_every_frame)
+
+    def test_small_target_ncc_scale_anchor_prevents_excessive_collapse(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            handcrafted_ncc_small_target_min_scale_ratio=0.90,
+            handcrafted_ncc_flow_guard_min_size=1.0,
+        ))
+        tracker.frame_shape = (1920, 3840)
+        tracker._ncc_scale_anchor = np.array([24.0, 57.0], dtype=np.float64)
+        previous = np.array([100.0, 100.0, 24.0, 57.0], dtype=np.float64)
+        candidate = np.array([100.0, 100.0, 10.0, 20.0], dtype=np.float64)
+        guarded = tracker._guard_ncc_scale_anchor(candidate, previous, 0.8)
+        self.assertGreaterEqual(float(guarded[2]), 21.6)
+        self.assertGreaterEqual(float(guarded[3]), 51.3)
+
+    def test_polar_output_can_preserve_full_erp_width(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(polar_output_full_width=True))
+        tracker._init_bbox_width_px = 300.0
+        tracker._init_bbox_height_px = 150.0
+        state = SphereState(
+            lon=0.0,
+            lat=math.radians(-70.0),
+            equatorial_width=math.radians(30.0),
+            angular_height=math.radians(50.0),
+        )
+
+        bbox = tracker._state_to_output_bbox(state, 3840, 1920)
+
+        self.assertEqual(float(bbox[2]), 3840.0)
+
+    def test_geometric_polar_output_recovers_full_width_without_touching_pole(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            polar_geometric_full_width=True,
+            polar_geometric_min_lat_deg=45.0,
+            polar_geometric_min_height_ratio=0.35,
+        ))
+        tracker._init_bbox_width_px = 300.0
+        tracker._init_bbox_height_px = 150.0
+        state = SphereState(
+            lon=0.0,
+            lat=math.radians(-55.0),
+            equatorial_width=math.radians(15.0),
+            angular_height=math.radians(70.0),
+        )
+
+        bbox = tracker._state_to_output_bbox(state, 3840, 1920)
+
+        self.assertEqual(float(bbox[2]), 3840.0)
+
+    def test_polar_erp_recovery_uses_narrow_tall_ncc_vertical_interval(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            polar_erp_recovery_enabled=True,
+            polar_erp_recovery_early_growth_enabled=True,
+        ))
+        tracker._init_bbox_width_px = 300.0
+        tracker._init_bbox_height_px = 150.0
+        tracker._ncc_bbox = np.array([1500.0, 650.0, 400.0, 940.0], dtype=np.float32)
+        state = SphereState(0.0, 0.0, 0.10, 0.10)
+
+        bbox = tracker._state_to_output_bbox(state, 3840, 1920)
+
+        self.assertEqual(float(bbox[0]), 0.0)
+        self.assertEqual(float(bbox[2]), 3840.0)
+        self.assertAlmostEqual(float(bbox[1]), 1074.0, places=3)
+        self.assertAlmostEqual(float(bbox[3]), 846.0, places=3)
+
+    def test_polar_erp_recovery_supports_early_scale_growth(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            polar_erp_recovery_enabled=True,
+            polar_erp_recovery_early_growth_enabled=True,
+        ))
+        tracker._init_bbox_width_px = 247.0
+        tracker._init_bbox_height_px = 178.0
+        tracker._ncc_bbox = np.array([620.0, 838.0, 339.0, 299.0], dtype=np.float32)
+        bbox = tracker._state_to_output_bbox(
+            SphereState(0.0, 0.0, 0.10, 0.10), 3840, 1920,
+        )
+        self.assertEqual(float(bbox[2]), 3840.0)
+        self.assertAlmostEqual(float(bbox[1]), 838.0, places=3)
+        self.assertAlmostEqual(float(bbox[3]), 1082.0, places=3)
+
+    def test_polar_erp_motion_reversal_requires_explicit_flag(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            polar_erp_recovery_enabled=True,
+            polar_erp_recovery_motion_reversal_enabled=True,
+        ))
+        tracker._init_bbox_width_px = 247.0
+        tracker._init_bbox_height_px = 178.0
+        tracker._ncc_bbox = np.array([620.0, 838.0, 339.0, 299.0], dtype=np.float32)
+        tracker._ncc_velocity_reversed = True
+        bbox = tracker._state_to_output_bbox(SphereState(0.0, 0.0, 0.10, 0.10), 3840, 1920)
+        self.assertEqual(float(bbox[2]), 3840.0)
+
+    def test_ncc_aspect_scale_guard_filters_vertical_collapse_pair(self) -> None:
+        config = TrackerConfig(handcrafted_ncc_min_aspect_scale_ratio=0.95)
+        filtered = [
+            (width_scale, height_scale)
+            for width_scale, height_scale in config.handcrafted_ncc_scale_pairs
+            if width_scale / height_scale >= config.handcrafted_ncc_min_aspect_scale_ratio
+        ]
+
+        self.assertNotIn((0.90, 1.10), filtered)
+        self.assertIn((1.0, 1.0), filtered)
+
+    def test_deep_ncc_jump_guard_can_require_direction_reversal(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            deep_ncc_max_jump_ratio=0.35,
+            deep_ncc_jump_requires_direction_reversal=True,
+        ))
+        tracker._deep_mode = True
+        tracker._ncc_velocity = np.array([0.0, 40.0])
+        box = np.array([0.0, 0.0, 100.0, 100.0])
+
+        self.assertTrue(tracker._ncc_candidate_consistent(
+            np.array([0.0, 50.0]), None, box, 0.60,
+        ))
+        self.assertFalse(tracker._ncc_candidate_consistent(
+            np.array([0.0, -50.0]), None, box, 0.60,
+        ))
+
+    def test_deep_ncc_jump_guard_can_be_limited_to_polar_latitudes(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            deep_ncc_max_jump_ratio=0.35,
+            deep_ncc_jump_min_abs_lat_deg=45.0,
+        ))
+        tracker._deep_mode = True
+        tracker.frame_shape = (1920, 3840)
+        box = np.array([0.0, 900.0, 100.0, 100.0])
+
+        self.assertTrue(tracker._ncc_candidate_consistent(
+            np.array([0.0, 50.0]), None, box, 0.60,
+        ))
+
     def test_ncc_rejects_low_texture_template(self) -> None:
         first = np.zeros((180, 260, 3), dtype=np.float32)
         first[70:110, 90:140, 0] = 1.0

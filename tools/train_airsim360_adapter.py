@@ -23,7 +23,7 @@ from panosot.airsim360 import (
     AirSim360TrainingArchive,
 )
 from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
-from panosot.models import DepthwiseXCorrHead, TrackingProjection
+from panosot.models import DepthwiseXCorrHead, ResidualTrackingProjection
 
 
 def _resize_patch(image: np.ndarray, size: int = 128) -> np.ndarray:
@@ -53,6 +53,49 @@ def _augment(image: np.ndarray, rng: random.Random) -> np.ndarray:
 
 def _batch_tensor(extractor: DeepFeatureExtractor, patches: list[np.ndarray], size: int):
     return extractor.preprocess_patches(patches, size, assume_normalized=True)
+
+
+def _build_cached_temporal_pairs(archive, max_samples: int, output: Path) -> None:
+    """Materialize fixed-size temporal pairs once, avoiding ZIP random I/O."""
+    dataset = AirSim360TemporalPairDataset(archive, max_samples=max_samples)
+    if not dataset:
+        raise SystemExit("No temporal AirSim360 pairs were found.")
+    templates: list[np.ndarray] = []
+    searches: list[np.ndarray] = []
+    targets: list[tuple[float, float]] = []
+    for index in range(len(dataset)):
+        template, search, target = dataset[index]
+        templates.append(_resize_patch(template, 112))
+        searches.append(_resize_patch(search, 224))
+        targets.append(target)
+        if (index + 1) % 100 == 0 or index + 1 == len(dataset):
+            print(f"Caching pairs: {index + 1}/{len(dataset)}", flush=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        output,
+        templates=np.asarray(templates, dtype=np.float16),
+        searches=np.asarray(searches, dtype=np.float16),
+        targets=np.asarray(targets, dtype=np.float32),
+    )
+    print("Saved pair cache:", output.resolve())
+
+
+class _CachedPairDataset:
+    def __init__(self, path: Path) -> None:
+        data = np.load(path)
+        self.templates = data["templates"]
+        self.searches = data["searches"]
+        self.targets = data["targets"]
+
+    def __len__(self) -> int:
+        return int(self.targets.shape[0])
+
+    def __getitem__(self, index: int):
+        return (
+            self.templates[index].astype(np.float32),
+            self.searches[index].astype(np.float32),
+            tuple(float(x) for x in self.targets[index]),
+        )
 
 
 def localization_loss(response, torch, target_fractions, logit_scale: float = 1000.0):
@@ -108,6 +151,20 @@ def main() -> None:
         action="store_true",
         help="Use persistent instance IDs in consecutive AirSim360 frames.",
     )
+    parser.add_argument("--residual", action="store_true", help="Train an identity-initialized residual adapter.")
+    parser.add_argument("--feature-reg", type=float, default=0.05, help="Feature preservation regularization weight.")
+    parser.add_argument(
+        "--cache-pairs",
+        type=Path,
+        default=None,
+        help="Load fixed-size pairs from an NPZ cache instead of ZIP decoding.",
+    )
+    parser.add_argument(
+        "--write-cache",
+        type=Path,
+        default=None,
+        help="Build an NPZ temporal-pair cache and exit.",
+    )
     args = parser.parse_args()
 
     import torch
@@ -121,11 +178,19 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     archive = AirSim360TrainingArchive(args.raw, args.instance)
+    if args.write_cache is not None:
+        _build_cached_temporal_pairs(archive, args.max_samples, args.write_cache)
+        archive.close()
+        return
     dataset_class = AirSim360TemporalPairDataset if args.temporal else AirSim360PairDataset
     dataset_kwargs = {"max_samples": args.max_samples}
     if not args.temporal:
         dataset_kwargs["seed"] = args.seed
-    dataset = dataset_class(archive, **dataset_kwargs)
+    dataset = (
+        _CachedPairDataset(args.cache_pairs)
+        if args.cache_pairs is not None
+        else dataset_class(archive, **dataset_kwargs)
+    )
     if not dataset:
         raise SystemExit("No matched RGB/instance samples were found.")
     print(f"Training samples: {len(dataset)}")
@@ -144,7 +209,7 @@ def main() -> None:
     with torch.no_grad():
         example = _batch_tensor(extractor, [_augment(dataset[0][0], random)], 112)
         channels = int(extractor.model(example).shape[1])
-    adapter = TrackingProjection(channels).to(extractor.device).train()
+    adapter = ResidualTrackingProjection(channels).to(extractor.device).train()
     xcorr = DepthwiseXCorrHead()
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=extractor.device.type == "cuda")
@@ -166,6 +231,8 @@ def main() -> None:
                 with extractor._amp_context():
                     template_features = extractor.model(template_tensor)
                     search_features = extractor.model(search_tensor)
+            raw_template_features = template_features.detach()
+            raw_search_features = search_features.detach()
             with torch.autocast(
                 device_type=extractor.device.type,
                 dtype=torch.float16,
@@ -182,6 +249,11 @@ def main() -> None:
                 # the same operation used by the runtime tracker, unlike the
                 # previous pooled embedding loss.
                 loss = localization_loss(response, torch, target_fractions)
+                if args.feature_reg > 0:
+                    loss = loss + float(args.feature_reg) * (
+                        torch.nn.functional.mse_loss(template_features, raw_template_features)
+                        + torch.nn.functional.mse_loss(search_features, raw_search_features)
+                    )
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -190,7 +262,15 @@ def main() -> None:
         print(f"epoch={epoch + 1}/{args.epochs} loss={sum(losses) / len(losses):.4f}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"channels": channels, "state_dict": adapter.eval().state_dict()}, args.output)
+    torch.save(
+        {
+            "channels": channels,
+            "feature_layer": int(args.feature_layer),
+            "residual": True,
+            "state_dict": adapter.eval().state_dict(),
+        },
+        args.output,
+    )
     print("Saved adapter:", args.output.resolve())
     archive.close()
 

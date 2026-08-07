@@ -103,13 +103,14 @@ class DeepFeatureExtractor:
 
     def load_tracking_adapter(self, checkpoint_path: str | Path) -> None:
         """Load a trained 1x1 tracking adapter without changing the backbone."""
-        from .models import TrackingProjection
+        from .models import ResidualTrackingProjection, TrackingProjection
 
         checkpoint = self._torch.load(
             checkpoint_path, map_location=self.device, weights_only=True
         )
         channels = int(checkpoint["channels"])
-        adapter = TrackingProjection(channels).to(self.device)
+        adapter_cls = ResidualTrackingProjection if checkpoint.get("residual", False) else TrackingProjection
+        adapter = adapter_cls(channels).to(self.device)
         adapter.load_state_dict(checkpoint["state_dict"])
         adapter.eval()
         self.adapter = adapter
@@ -226,9 +227,10 @@ class DeepFeatureExtractor:
         refine: bool = False,
         *,
         assume_normalized: bool = False,
+        out_size: int | None = None,
     ) -> Any:
-        out_size = self.config.refine_search_size if refine else self.config.coarse_search_size
-        return self._forward(patch, out_size, assume_normalized=assume_normalized)
+        size = int(out_size or (self.config.refine_search_size if refine else self.config.coarse_search_size))
+        return self._forward(patch, size, assume_normalized=assume_normalized)
 
     def _forward_batch(
         self,
@@ -280,11 +282,12 @@ class DeepFeatureExtractor:
         chunk_size: int = 32,
         *,
         assume_normalized: bool = False,
+        out_size: int | None = None,
     ) -> Any:
-        out_size = self.config.refine_search_size if refine else self.config.coarse_search_size
+        size = int(out_size or (self.config.refine_search_size if refine else self.config.coarse_search_size))
         return self._forward_batch(
             patches,
-            out_size,
+            size,
             chunk_size,
             assume_normalized=assume_normalized,
         )

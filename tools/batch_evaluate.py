@@ -250,6 +250,103 @@ def parse_args() -> argparse.Namespace:
         help="MobileNet feature layer used for deep tracking.",
     )
     parser.add_argument(
+        "--deep-ncc-fusion",
+        action="store_true",
+        help="Experimentally fuse spatially consistent deep and NCC positions.",
+    )
+    parser.add_argument(
+        "--force-deep-probe",
+        action="store_true",
+        help="With --deep-ncc-fusion, run the deep local probe every frame.",
+    )
+    parser.add_argument(
+        "--ncc-isotropic-scale",
+        action="store_true",
+        help="Experimentally restrict NCC scale search to aspect-ratio-preserving boxes.",
+    )
+    parser.add_argument(
+        "--ncc-flow-every-frame",
+        action="store_true",
+        help="Experimentally run NCC optical-flow prediction on every frame.",
+    )
+    parser.add_argument("--small-target-ncc-min-scale-ratio", type=float, default=None)
+    parser.add_argument(
+        "--polar-output-full-width",
+        action="store_true",
+        help="Emit full-width ERP boxes when the spherical state crosses a pole.",
+    )
+    parser.add_argument(
+        "--polar-geometric-full-width",
+        action="store_true",
+        help="Experimentally emit a full-width ERP box from polar spherical geometry.",
+    )
+    parser.add_argument(
+        "--polar-erp-recovery",
+        action="store_true",
+        help="Experimentally recover full-width output from a narrow/tall polar NCC box.",
+    )
+    parser.add_argument(
+        "--polar-erp-early-growth",
+        action="store_true",
+        help="Also enable the unvalidated early scale-growth polar recovery experiment.",
+    )
+    parser.add_argument("--polar-erp-motion-reversal", action="store_true")
+    parser.add_argument("--polar-erp-adaptive-height", action="store_true")
+    parser.add_argument("--disable-polar-erp-adaptive-height", action="store_true")
+    parser.add_argument("--polar-erp-early-min-aspect", type=float, default=None)
+    parser.add_argument(
+        "--disable-polar-erp-recovery",
+        action="store_true",
+        help="Disable the default deep-mode narrow/tall polar ERP recovery.",
+    )
+    parser.add_argument(
+        "--spherical-ncc",
+        action="store_true",
+        help="Experimentally use tangent-plane NCC as a polar fallback in deep mode.",
+    )
+    parser.add_argument(
+        "--spherical-ncc-trigger-lat-deg",
+        type=float,
+        default=None,
+        help="Latitude at which tangent-plane NCC becomes eligible.",
+    )
+    parser.add_argument("--spherical-ncc-correction-margin", type=float, default=None)
+    parser.add_argument("--spherical-ncc-correction-max-weight", type=float, default=None)
+    parser.add_argument(
+        "--deep-probe-interval",
+        type=int,
+        default=None,
+        help="Override the low-PSR deep probe interval for a regression experiment.",
+    )
+    parser.add_argument(
+        "--ncc-min-aspect-scale-ratio",
+        type=float,
+        default=0.0,
+        help="Reject NCC scale pairs whose width/height scale ratio is below this value.",
+    )
+    parser.add_argument(
+        "--ncc-polar-growth",
+        action="store_true",
+        help="Experimentally widen NCC scale/search coverage for polar projection growth.",
+    )
+    parser.add_argument(
+        "--deep-ncc-max-jump-ratio",
+        type=float,
+        default=None,
+        help="Override the low-score deep-mode NCC jump guard ratio for regression testing.",
+    )
+    parser.add_argument(
+        "--deep-ncc-jump-reversal-only",
+        action="store_true",
+        help="Apply the deep-mode NCC jump guard only when motion reverses direction.",
+    )
+    parser.add_argument(
+        "--deep-ncc-jump-min-abs-lat-deg",
+        type=float,
+        default=0.0,
+        help="Only apply the deep-mode NCC jump guard at or above this absolute ERP latitude.",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         help="计算设备 (auto / cpu / cuda)。",
@@ -352,6 +449,68 @@ def main() -> None:
         deep_template_update_ema=0.08,
         deep_template_update_background=0.02,
         deep_motion_momentum=0.5,
+        deep_ncc_fusion_enabled=args.deep_ncc_fusion,
+        deep_ncc_fusion_force_deep_probe=args.force_deep_probe,
+        handcrafted_ncc_scale_pairs=(
+            (0.85, 0.85), (0.93, 0.93), (1.0, 1.0), (1.08, 1.08), (1.16, 1.16),
+        ) if args.ncc_isotropic_scale else TrackerConfig.handcrafted_ncc_scale_pairs,
+        handcrafted_ncc_flow_every_frame=args.ncc_flow_every_frame,
+        handcrafted_ncc_small_target_min_scale_ratio=(
+            args.small_target_ncc_min_scale_ratio
+            if args.small_target_ncc_min_scale_ratio is not None
+            else TrackerConfig.handcrafted_ncc_small_target_min_scale_ratio
+        ),
+        polar_output_full_width=args.polar_output_full_width,
+        polar_geometric_full_width=args.polar_geometric_full_width,
+        polar_erp_recovery_enabled=(
+            not args.disable_polar_erp_recovery
+            and (args.deep or args.polar_erp_recovery)
+        ),
+        polar_erp_recovery_early_growth_enabled=args.polar_erp_early_growth,
+        polar_erp_recovery_motion_reversal_enabled=args.polar_erp_motion_reversal,
+        polar_erp_recovery_adaptive_height=(
+            not args.disable_polar_erp_recovery
+            and not args.disable_polar_erp_adaptive_height
+            and args.deep
+        ) or args.polar_erp_adaptive_height,
+        polar_erp_recovery_early_min_aspect=(
+            args.polar_erp_early_min_aspect
+            if args.polar_erp_early_min_aspect is not None
+            else TrackerConfig.polar_erp_recovery_early_min_aspect
+        ),
+        spherical_ncc_enabled=args.spherical_ncc,
+        spherical_ncc_trigger_lat_deg=(
+            args.spherical_ncc_trigger_lat_deg
+            if args.spherical_ncc_trigger_lat_deg is not None
+            else TrackerConfig.spherical_ncc_trigger_lat_deg
+        ),
+        spherical_ncc_correction_margin=(
+            args.spherical_ncc_correction_margin
+            if args.spherical_ncc_correction_margin is not None
+            else TrackerConfig.spherical_ncc_correction_margin
+        ),
+        spherical_ncc_correction_max_weight=(
+            args.spherical_ncc_correction_max_weight
+            if args.spherical_ncc_correction_max_weight is not None
+            else TrackerConfig.spherical_ncc_correction_max_weight
+        ),
+        deep_probe_interval=(
+            args.deep_probe_interval
+            if args.deep_probe_interval is not None else TrackerConfig.deep_probe_interval
+        ),
+        handcrafted_ncc_min_aspect_scale_ratio=args.ncc_min_aspect_scale_ratio,
+        handcrafted_ncc_search_factor=(5.0 if args.ncc_polar_growth else TrackerConfig.handcrafted_ncc_search_factor),
+        deep_ncc_growth_min_init_ratio=(0.75 if args.ncc_polar_growth else TrackerConfig.deep_ncc_growth_min_init_ratio),
+        deep_ncc_growth_max_scale_step=(3.5 if args.ncc_polar_growth else TrackerConfig.deep_ncc_growth_max_scale_step),
+        deep_ncc_growth_scale_pairs=(
+            (1.35, 1.0), (1.60, 1.0), (1.90, 1.0), (2.20, 1.0), (2.80, 1.0), (3.50, 1.0),
+        ) if args.ncc_polar_growth else TrackerConfig.deep_ncc_growth_scale_pairs,
+        deep_ncc_max_jump_ratio=(
+            args.deep_ncc_max_jump_ratio
+            if args.deep_ncc_max_jump_ratio is not None else TrackerConfig.deep_ncc_max_jump_ratio
+        ),
+        deep_ncc_jump_requires_direction_reversal=args.deep_ncc_jump_reversal_only,
+        deep_ncc_jump_min_abs_lat_deg=args.deep_ncc_jump_min_abs_lat_deg,
     )
 
     deep_extractor = None
@@ -382,6 +541,47 @@ def main() -> None:
         similarity_head = build_similarity_head("depthwise_xcorr")
         if args.tracking_adapter:
             print(f"AirSim360 adapter: {args.tracking_adapter}")
+        if args.deep_ncc_fusion:
+            print(
+                "Deep/NCC fusion: enabled"
+                + (" (per-frame deep probes)" if args.force_deep_probe else "")
+            )
+        if args.ncc_isotropic_scale:
+            print("NCC scale search: isotropic only")
+        if args.ncc_flow_every_frame:
+            print("NCC flow prediction: every frame")
+        if args.polar_output_full_width:
+            print("Polar ERP output: full width at pole crossings")
+        if args.polar_geometric_full_width:
+            print("Polar ERP output: geometric full-width recovery")
+        if config.polar_erp_recovery_enabled:
+            print("Polar ERP output: narrow/tall NCC recovery")
+        if args.polar_erp_early_growth:
+            print("Polar ERP output: early scale-growth experiment")
+        if args.polar_erp_motion_reversal:
+            print("Polar ERP output: motion-reversal experiment")
+        if args.polar_erp_adaptive_height:
+            print("Polar ERP output: adaptive height experiment")
+        if args.spherical_ncc:
+            print(
+                "Polar tangent-NCC fallback: enabled"
+                + (
+                    f" at |latitude| >= {args.spherical_ncc_trigger_lat_deg} deg"
+                    if args.spherical_ncc_trigger_lat_deg is not None else ""
+                )
+            )
+        if args.deep_probe_interval is not None:
+            print(f"Deep probe interval: {args.deep_probe_interval} frames")
+        if args.ncc_min_aspect_scale_ratio > 0:
+            print(f"NCC minimum aspect-scale ratio: {args.ncc_min_aspect_scale_ratio}")
+        if args.ncc_polar_growth:
+            print("NCC polar growth: widened scale and search coverage")
+        if args.deep_ncc_max_jump_ratio is not None:
+            print(f"Deep-mode NCC max jump ratio: {args.deep_ncc_max_jump_ratio}")
+        if args.deep_ncc_jump_reversal_only:
+            print("Deep-mode NCC jump guard: direction reversal only")
+        if args.deep_ncc_jump_min_abs_lat_deg > 0:
+            print(f"Deep-mode NCC jump guard minimum |latitude|: {args.deep_ncc_jump_min_abs_lat_deg} deg")
         print(f"深度特征模式: backbone={args.backbone}, device={resolved_device}")
 
     # 逐条评测
