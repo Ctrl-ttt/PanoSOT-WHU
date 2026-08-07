@@ -38,6 +38,11 @@ class FeatureConfig:
     pretrained: bool = True
     cache_dir: str | None = None
     tracking_adapter_path: str | None = None
+    # MobileNet convolution blocks benefit from channels-last tensors on CUDA.
+    # Keep this opt-in at the config level but enabled by the tracker CLI when
+    # CUDA is requested; CPU behavior remains unchanged.
+    use_channels_last: bool = True
+    cudnn_benchmark: bool = True
 
 
 class DeepFeatureExtractor:
@@ -46,14 +51,25 @@ class DeepFeatureExtractor:
     def __init__(self, config: FeatureConfig) -> None:
         self.config = config
         self._torch = _require_torch()
+        torch = self._torch
         self.device = self._resolve_device(config.device)
         self._configure_cache_dir(config.cache_dir)
         self.model = self._build_model_with_fallback()
         self.model.to(self.device)
         self.model.eval()
+        if self.device.type == "cuda":
+            if config.cudnn_benchmark:
+                torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
+            if config.use_channels_last:
+                try:
+                    self.model.to(memory_format=torch.channels_last)
+                except Exception:
+                    # Some optional backbones do not expose a channels-last
+                    # compatible parameter layout; fall back transparently.
+                    pass
         self.forward_calls = 0
 
-        torch = self._torch
         self._mean = torch.tensor(config.mean, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
         self._std = torch.tensor(config.std, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
         self.adapter = None
@@ -158,6 +174,8 @@ class DeepFeatureExtractor:
             align_corners=False,
         )
         tensor = (tensor - self._mean) / self._std
+        if self.device.type == "cuda" and self.config.use_channels_last:
+            tensor = tensor.contiguous(memory_format=torch.channels_last)
         return tensor
 
     def preprocess_patches(
@@ -188,7 +206,10 @@ class DeepFeatureExtractor:
             mode="bilinear",
             align_corners=False,
         )
-        return (tensor - self._mean) / self._std
+        tensor = (tensor - self._mean) / self._std
+        if self.device.type == "cuda" and self.config.use_channels_last:
+            tensor = tensor.contiguous(memory_format=torch.channels_last)
+        return tensor
 
     def _forward(
         self,

@@ -187,15 +187,42 @@ class TrackerConfig:
     deep_velocity_low_psr_threshold: float = 1.85
     deep_velocity_low_trust_threshold: float = 0.65
     deep_velocity_decay: float = 0.20
+    # Keep a short, independently-validated motion history.  Low-PSR deep
+    # responses should not erase the last useful direction in one frame.
+    reliable_velocity_history_size: int = 7
+    reliable_velocity_min_score: float = 0.52
+    reliable_velocity_min_psr: float = 1.85
+    deep_velocity_hold_decay: float = 0.88
+    deep_velocity_hold_min_ratio: float = 0.28
+    deep_velocity_hold_max_frames: int = 8
+    relocalization_velocity_reset_enabled: bool = True
+    relocalization_velocity_max_jump_deg: float = 25.0
     deep_fallback_psr_threshold: float = 2.0
     # A low deep PSR only requests a fallback; it must not force-accept a
     # weak handcrafted candidate and overwrite the tracking state.
     deep_fallback_min_hand_score: float = 0.18
     deep_fallback_score_margin: float = 0.03
+    # Tiny compact targets need one-frame fallback acceptance when the deep
+    # peak is low-PSR but still provides a much better scale hypothesis.
+    tiny_target_growth_fallback_enabled: bool = False
+    tiny_target_growth_fallback_min_score: float = 0.45
+    tiny_target_growth_fallback_min_scale_ratio: float = 1.20
     deep_probe_interval: int = 20
     deep_probe_backoff_after: int = 3
     deep_probe_backoff_multiplier: float = 2.0
     deep_probe_max_interval: int = 20
+    # When independent deep probes remain ambiguous, temporarily quarantine
+    # the adaptive NCC branch.  This breaks the long-sequence feedback loop
+    # where a wrong short-template match is EMA-updated every frame.
+    ncc_quarantine_enabled: bool = False
+    ncc_quarantine_after_low_probe_count: int = 3
+    ncc_quarantine_probe_interval: int = 5
+    ncc_quarantine_max_anchor_gap_deg: float = 18.0
+    ncc_quarantine_min_initial_score: float = 0.42
+    ncc_quarantine_short_margin: float = 0.10
+    ncc_quarantine_freeze_short_updates: bool = True
+    compact_target_persistent_deep_probe_enabled: bool = False
+    compact_target_deep_probe_interval: int = 0
     # Experimental deep/NCC fusion.  MobileNet's layer-12 response map is
     # only 4x4, so its PSR is not robust enough to make an all-or-nothing
     # decision.  Keep this opt-in until it wins a sequence-level regression.
@@ -264,6 +291,15 @@ class TrackerConfig:
     deep_semantic_history_ncc_score: float = 0.55
     deep_semantic_trigger_ncc_score: float = 0.40
     deep_semantic_trigger_frames: int = 8
+    deep_semantic_low_probe_trigger_count: int = 3
+    deep_semantic_low_probe_min_interval: int = 60
+    deep_semantic_low_probe_trigger_enabled: bool = False
+    deep_semantic_low_probe_min_score: float = 0.38
+    deep_semantic_low_probe_verify_psr: float = 1.20
+    deep_semantic_force_recovery_enabled: bool = False
+    deep_semantic_force_recovery_min_semantic: float = 0.55
+    deep_semantic_force_recovery_min_score: float = 0.58
+    deep_semantic_force_recovery_min_psr: float = 2.50
     deep_semantic_min_interval: int = 20
     deep_semantic_min_score: float = 0.58
     deep_semantic_topk: int = 3
@@ -314,6 +350,11 @@ class TrackerConfig:
     handcrafted_flow_small_target_padding: float = 3.0
     handcrafted_flow_small_target_max_init_pixels: float = 24.0
     deep_fallback_flow_tiny_enabled: bool = True
+    # For compact targets, the tiny-target flow fallback tends to preserve a
+    # stale initialization box after rapid growth. Keep the fallback for thin
+    # targets, but disable it by default for compact targets.
+    deep_fallback_flow_tiny_compact_enabled: bool = False
+    compact_fallback_flow_position_blend: float = 0.0
     deep_fallback_flow_tiny_max_init_pixels: float = 48.0
     # A weak ERP-NCC match is often a background repeat.  Do not let it move
     # the independent handcrafted anchor unless the match is substantially
@@ -372,6 +413,8 @@ class TrackerConfig:
     handcrafted_ncc_parallel_workers: int = 4
     handcrafted_ncc_update_rate: float = 0.10
     handcrafted_ncc_update_score: float = 0.55
+    ncc_short_update_identity_gate_enabled: bool = False
+    ncc_short_update_min_initial_score_gap: float = 0.08
     handcrafted_ncc_reliable_score: float = 0.35
     handcrafted_ncc_min_template_std: float = 3.0
     handcrafted_ncc_min_search_std: float = 3.0
@@ -430,6 +473,10 @@ class TrackerConfig:
     small_target_bootstrap_frames: int = 8
     small_target_bootstrap_max_scale_step: float = 5.0
     small_target_bootstrap_flow_enabled: bool = True
+    # Compact tiny targets often grow too quickly for the direct-flow warm-up
+    # shortcut.  Keep this opt-in until a broader regression validates it;
+    # thin targets such as polar trajectories retain the direct-flow path.
+    small_target_compact_deep_bootstrap_enabled: bool = False
     small_target_bootstrap_max_init_pixels: float = 64.0
     small_target_growth_phase_enabled: bool = False
     small_target_growth_phase_frames: int = 40
@@ -449,6 +496,29 @@ class TrackerConfig:
     scale_trend_min_ratio: float = 1.08
     scale_trend_max_step: float = 1.45
     scale_trend_max_frames: int = 80
+    # In a compact-target growth phase, trust a consistent scale trend even
+    # when the current appearance branch is handcrafted.  Position remains
+    # governed by the normal motion/deep arbitration.
+    scale_trend_apply_to_handcrafted: bool = True
+    scale_trend_handcrafted_min_score: float = 0.20
+    scale_trend_handcrafted_max_frames: int = 120
+    scale_trend_max_growth_ratio: float = 1.80
+    deep_joint_scale_search_enabled: bool = False
+    deep_joint_scale_search_start_frame: int = 14
+    deep_joint_scale_search_max_frames: int = 80
+    deep_joint_scale_search_interval: int = 4
+    deep_joint_scale_search_psr_max: float = 1.90
+    deep_joint_scale_search_min_score: float = 0.40
+    deep_joint_scale_search_min_growth: float = 1.12
+    deep_joint_scale_search_min_margin: float = 0.015
+    deep_joint_scale_search_scale_factors: tuple[float, ...] = (
+        1.20, 1.35, 1.55, 1.80, 2.10, 2.50,
+    )
+    deep_adaptive_template_enabled: bool = False
+    deep_adaptive_template_min_score: float = 0.80
+    deep_adaptive_template_min_psr: float = 1.50
+    deep_adaptive_template_min_growth: float = 1.35
+    deep_adaptive_template_interval: int = 5
     small_target_local_grid_radius: int = 4
     small_target_local_step_factor: float = 0.65
 
@@ -515,6 +585,10 @@ class TrackerRuntimeStats:
     last_peak: float = 0.0
     last_psr: float = 0.0
     last_apce: float = 0.0
+    ncc_short_best_score: float = 0.0
+    ncc_initial_best_score: float = 0.0
+    ncc_quarantine_frames: int = 0
+    ncc_quarantine_rejects: int = 0
     deep_forward_calls_start: int = 0
 
 
@@ -643,7 +717,13 @@ class PanoSOTTracker:
         self._last_deep_probe_state = None
         self._last_deep_probe_score = 0.0
         self._bootstrap_velocity_deltas: list[np.ndarray] = []
+        self._reliable_velocity_history: list[np.ndarray] = []
+        self._reliable_velocity: np.ndarray = np.zeros(2, dtype=np.float32)
+        self._low_quality_velocity_frames: int = 0
         self._scale_history: list[np.ndarray] = []
+        self._last_adaptive_template_frame = -10**9
+        self._last_joint_scale_search_frame = -10**9
+        self._last_joint_scale_search_frame = -10**9
         self._previous_frame_gray: np.ndarray | None = None
         self._last_flow_reliable = False
         self._last_flow_inlier_ratio = 0.0
@@ -663,6 +743,8 @@ class PanoSOTTracker:
         self._ncc_frames_since_flow = self.config.handcrafted_ncc_flow_grace_frames + 1
         self._ncc_last_score = 1.0
         self._last_ncc_reliable = False
+        self._last_ncc_short_best_score = 0.0
+        self._last_ncc_initial_best_score = 0.0
         self._ncc_executor: ThreadPoolExecutor | None = None
         self._ncc_initial_resize_cache: dict[tuple[int, int], np.ndarray] = {}
         self._ncc_short_resize_cache: dict[tuple[int, int], np.ndarray] = {}
@@ -798,6 +880,10 @@ class PanoSOTTracker:
             "last_peak": stats.last_peak,
             "last_psr": stats.last_psr,
             "last_apce": stats.last_apce,
+            "ncc_short_best_score": stats.ncc_short_best_score,
+            "ncc_initial_best_score": stats.ncc_initial_best_score,
+            "ncc_quarantine_frames": stats.ncc_quarantine_frames,
+            "ncc_quarantine_rejects": stats.ncc_quarantine_rejects,
             "deep_forward_calls": current_forward_calls - stats.deep_forward_calls_start,
         }
 
@@ -834,7 +920,24 @@ class PanoSOTTracker:
 
     def _deep_probe_due(self) -> bool:
         interval = self._current_deep_probe_interval()
+        # Recovery mode is intentionally more eager than the normal probe
+        # backoff.  The extra deep work is paid only after a sustained loss.
+        if (
+            self._deep_mode
+            and self.config.ncc_quarantine_enabled
+            and self._consecutive_low_deep_probes
+                >= max(int(self.config.ncc_quarantine_after_low_probe_count), 1)
+        ):
+            interval = min(interval, max(int(self.config.ncc_quarantine_probe_interval), 1))
         return self._frame_count - self._last_deep_probe_frame >= interval
+
+    def _ncc_quarantined(self) -> bool:
+        """Return whether adaptive NCC must be treated as a weak proposal."""
+        if not self._deep_mode or not self.config.ncc_quarantine_enabled:
+            return False
+        return self._consecutive_low_deep_probes >= max(
+            int(self.config.ncc_quarantine_after_low_probe_count), 1,
+        )
 
     def _current_deep_probe_interval(self) -> int:
         base_interval = max(int(self.config.deep_probe_interval), 1)
@@ -871,6 +974,18 @@ class PanoSOTTracker:
             # every useful polar match unreachable.
             return hand_score >= self.config.spherical_ncc_reliable_score
         if source in {"flow", "color"}:
+            return True
+        if (
+            source == "ncc"
+            and self.config.tiny_target_growth_fallback_enabled
+            and self._small_target_bootstrap_near_square()
+            and self._frame_count <= max(int(self.config.small_target_bootstrap_frames), 0)
+            and deep_score is not None
+            and float(deep_score) >= float(self.config.tiny_target_growth_fallback_min_score)
+            and self._ncc_bbox is not None
+            and self._init_bbox_width_px is not None
+            and self._ncc_bbox[2] >= self._init_bbox_width_px * float(self.config.tiny_target_growth_fallback_min_scale_ratio)
+        ):
             return True
         if deep_score is None:
             return True
@@ -1173,6 +1288,16 @@ class PanoSOTTracker:
             and self._frame_count - self._last_semantic_proposal_frame
             >= max(int(self.config.early_semantic_recovery_min_interval), 1)
         )
+        persistent_low_probe_due = (
+            self._deep_mode
+            and self.config.deep_semantic_low_probe_trigger_enabled
+            and self.runtime_stats.deep_psr_samples > 0
+            and self._consecutive_low_deep_probes
+                >= max(int(self.config.deep_semantic_low_probe_trigger_count), 1)
+            and self._frame_count - self._last_semantic_proposal_frame
+                >= max(int(self.config.deep_semantic_low_probe_min_interval), 1)
+            and self._frame_count >= max(int(self.config.deep_semantic_min_interval), 1)
+        )
         return (
             self._deep_mode
             and self.config.deep_semantic_proposal_enabled
@@ -1180,6 +1305,7 @@ class PanoSOTTracker:
             and self._semantic_size_anchor is not None
             and (
                 early_recovery_due
+                or persistent_low_probe_due
                 or (
                     self._consecutive_low_ncc >= max(int(self.config.deep_semantic_trigger_frames), 1)
                     and self._frame_count - self._last_semantic_proposal_frame
@@ -1217,6 +1343,7 @@ class PanoSOTTracker:
         self,
         states: list[SphereState],
         scores: Any,
+        min_score: float | None = None,
     ) -> list[tuple[SphereState, float]]:
         ranked = sorted(
             zip(states, (float(score) for score in scores)),
@@ -1225,8 +1352,9 @@ class PanoSOTTracker:
         )
         selected: list[tuple[SphereState, float]] = []
         min_distance = math.radians(max(float(self.config.deep_semantic_nms_deg), 0.0))
+        threshold = self.config.deep_semantic_min_score if min_score is None else float(min_score)
         for state, score in ranked:
-            if score < self.config.deep_semantic_min_score:
+            if score < threshold:
                 break
             if any(
                 math.hypot(
@@ -1281,7 +1409,18 @@ class PanoSOTTracker:
             chunk_size=max(int(self.config.deep_semantic_batch_size), 1),
             assume_normalized=True,
         )
-        return self._select_semantic_topk(states, self._semantic_score_features(features))
+        low_probe_mode = (
+            self._consecutive_low_deep_probes
+            >= max(int(self.config.deep_semantic_low_probe_trigger_count), 1)
+            and self._small_target_bootstrap_near_square()
+        )
+        min_score = (
+            max(float(self.config.deep_semantic_low_probe_min_score), 0.0)
+            if low_probe_mode else None
+        )
+        return self._select_semantic_topk(
+            states, self._semantic_score_features(features), min_score=min_score,
+        )
 
     def _refine_semantic_proposals(
         self,
@@ -1388,12 +1527,28 @@ class PanoSOTTracker:
             refined, refined_semantic_score, score, psr, ranked_score = (
                 refined_result
             )
-            if ranked_score > best_ranked_score and psr >= self.config.deep_semantic_verify_psr:
+            verify_psr = float(self.config.deep_semantic_verify_psr)
+            if (
+                self._consecutive_low_deep_probes
+                >= max(int(self.config.deep_semantic_low_probe_trigger_count), 1)
+                and self._small_target_bootstrap_near_square()
+            ):
+                verify_psr = min(verify_psr, float(self.config.deep_semantic_low_probe_verify_psr))
+            low_probe_force_candidate = (
+                self.config.deep_semantic_force_recovery_enabled
+                and self._small_target_bootstrap_near_square()
+                and self._consecutive_low_deep_probes
+                    >= max(int(self.config.deep_semantic_low_probe_trigger_count), 1)
+                and refined_semantic_score >= float(self.config.deep_semantic_force_recovery_min_semantic)
+                and float(score) >= float(self.config.deep_semantic_force_recovery_min_score)
+                and psr >= float(self.config.deep_semantic_force_recovery_min_psr)
+            )
+            if (ranked_score > best_ranked_score or low_probe_force_candidate) and psr >= verify_psr:
                 best_state = SphereState(
                     refined.lon,
                     refined.lat,
-                    current.equatorial_width,
-                    current.angular_height,
+                    refined.equatorial_width,
+                    refined.angular_height,
                 )
                 best_score = float(score)
                 best_ranked_score = ranked_score
@@ -1414,6 +1569,16 @@ class PanoSOTTracker:
             and best_ranked_score
             >= current_ranked_score + self.config.deep_semantic_verify_score_margin
         )
+        force_recovery = (
+            self.config.deep_semantic_force_recovery_enabled
+            and self._small_target_bootstrap_near_square()
+            and self._consecutive_low_deep_probes
+                >= max(int(self.config.deep_semantic_low_probe_trigger_count), 1)
+            and best_semantic_score >= float(self.config.deep_semantic_force_recovery_min_semantic)
+            and best_score >= float(self.config.deep_semantic_force_recovery_min_score)
+            and best_psr >= float(self.config.deep_semantic_force_recovery_min_psr)
+        )
+        accepted = accepted or force_recovery
         if not accepted:
             (
                 self.runtime_stats.last_score,
@@ -1681,7 +1846,11 @@ class PanoSOTTracker:
         self._last_deep_probe_state = None
         self._last_deep_probe_score = 0.0
         self._bootstrap_velocity_deltas.clear()
+        self._reliable_velocity_history.clear()
+        self._reliable_velocity[:] = 0.0
+        self._low_quality_velocity_frames = 0
         self._scale_history.clear()
+        self._last_adaptive_template_frame = -10**9
         self.reset_runtime_stats()
 
         self._add_template(frame, self.state, template_type="init")
@@ -1815,8 +1984,17 @@ class PanoSOTTracker:
         return area < self.config.small_target_threshold * w * h
 
     def _small_target_bootstrap_due(self, state: SphereState) -> bool:
+        # Once the initialized target is tiny, keep the bootstrap motion path
+        # active while its estimate is still compact.  A deep low-PSR frame
+        # must not disable the only temporally grounded cue by making the
+        # current box slightly too large/small.
         if not self._is_small_target(state):
-            return False
+            if self._init_bbox_width_px is None or self._init_bbox_height_px is None:
+                return False
+            if min(self._init_bbox_width_px, self._init_bbox_height_px) > float(self.config.small_target_bootstrap_max_init_pixels):
+                return False
+            if self._frame_count > max(int(self.config.small_target_bootstrap_frames), 0):
+                return False
         width = self._init_bbox_width_px
         height = self._init_bbox_height_px
         limit = float(self.config.small_target_bootstrap_max_init_pixels)
@@ -1845,6 +2023,70 @@ class PanoSOTTracker:
             angular_height=height,
         )
 
+    def _maybe_joint_scale_search(
+        self,
+        frame: np.ndarray,
+        predicted: SphereState,
+        candidate: SphereState,
+        score: float,
+    ) -> SphereState:
+        """Search scale around a trusted position without re-searching location."""
+        if (
+            not self._deep_mode
+            or not self.config.deep_joint_scale_search_enabled
+            or self.frame_shape is None
+            or self._init_bbox_width_px is None
+            or self._init_bbox_height_px is None
+            or not self._small_target_bootstrap_near_square()
+            or self._frame_count < int(self.config.deep_joint_scale_search_start_frame)
+            or self._frame_count > int(self.config.deep_joint_scale_search_max_frames)
+            or self.runtime_stats.last_psr > float(self.config.deep_joint_scale_search_psr_max)
+            or float(score) < float(self.config.deep_joint_scale_search_min_score)
+            or self._frame_count - self._last_joint_scale_search_frame
+                < max(int(self.config.deep_joint_scale_search_interval), 1)
+            or self.state is None
+        ):
+            return candidate
+        if (
+            candidate.equatorial_width >= predicted.equatorial_width * float(self.config.deep_joint_scale_search_min_growth)
+            and candidate.angular_height >= predicted.angular_height * float(self.config.deep_joint_scale_search_min_growth)
+        ):
+            return candidate
+
+        self._last_joint_scale_search_frame = self._frame_count
+        base = candidate
+        scales = tuple(float(x) for x in self.config.deep_joint_scale_search_scale_factors)
+        states = []
+        patches = []
+        for factor in (1.0,) + scales:
+            width, height = self._clamp_target_size(
+                base.equatorial_width * factor,
+                base.angular_height * factor,
+            )
+            state = SphereState(base.lon, base.lat, width, height)
+            fov_x, fov_y = state_size_to_fov(state, enlarge=self.config.small_target_search_enlarge)
+            states.append(state)
+            patches.append(self._extract_search_patch(
+                frame, base.lon, base.lat, fov_x, fov_y,
+                refine=True, output_size=self.config.small_target_deep_refine_size,
+            ))
+        features = self.deep_extractor.extract_search_features_batch(
+            patches, refine=True, chunk_size=len(patches), assume_normalized=True,
+            out_size=self.config.small_target_deep_refine_size,
+        )
+        responses, reference = self._fused_template_responses_batch(features)
+        scores, _, metadata = self._response_scores_offsets_batch(responses, reference, features)
+        best_idx = int(np.argmax(scores))
+        if float(scores[best_idx]) < float(score) + float(self.config.deep_joint_scale_search_min_margin):
+            return candidate
+        chosen = states[best_idx]
+        return SphereState(
+            lon=base.lon,
+            lat=base.lat,
+            equatorial_width=chosen.equatorial_width,
+            angular_height=chosen.angular_height,
+        )
+
     def _record_scale_history(self, state: SphereState, score: float, handcrafted_result: bool) -> None:
         """Keep a short confidence-filtered history of observed target size."""
         if not self.config.scale_trend_enabled:
@@ -1869,6 +2111,64 @@ class PanoSOTTracker:
         if np.all(trend <= 1.001):
             return None
         return np.asarray([state.equatorial_width * trend[0], state.angular_height * trend[1]], dtype=np.float64)
+
+    def _update_reliable_velocity_history(
+        self,
+        delta: np.ndarray,
+        score: float,
+        handcrafted_result: bool,
+        flow_reliable: bool,
+        fallback_source: str,
+    ) -> bool:
+        """Update motion only from independently trustworthy observations.
+
+        A deep response with a low PSR is useful for appearance/scale
+        bookkeeping but is not a valid velocity measurement.  Keeping its
+        displacement out of this buffer prevents one bad frame from changing
+        the direction used during the following recovery frames.
+        """
+        psr = float(self.runtime_stats.last_psr)
+        reliable = bool(flow_reliable)
+        if not reliable and handcrafted_result:
+            reliable = (
+                fallback_source in {"ncc", "spherical_ncc", "flow"}
+                and float(score) >= float(self.config.reliable_velocity_min_score)
+            )
+        if not reliable and self._deep_mode and not handcrafted_result:
+            reliable = (
+                float(score) >= float(self.config.reliable_velocity_min_score)
+                and psr >= float(self.config.reliable_velocity_min_psr)
+            )
+        if not reliable or not np.all(np.isfinite(delta)):
+            self._low_quality_velocity_frames += 1
+            return False
+
+        measured = np.asarray(delta, dtype=np.float32)
+        # Ignore isolated implausible jumps; global recovery handles those.
+        if np.linalg.norm(measured) > math.radians(45.0):
+            self._low_quality_velocity_frames += 1
+            return False
+        self._reliable_velocity_history.append(measured.copy())
+        keep = max(int(self.config.reliable_velocity_history_size), 2)
+        del self._reliable_velocity_history[:-keep]
+        self._reliable_velocity[:] = np.median(
+            np.stack(self._reliable_velocity_history), axis=0,
+        )
+        self._low_quality_velocity_frames = 0
+        return True
+
+    def _held_reliable_velocity(self) -> np.ndarray | None:
+        """Return a gently decayed velocity for a low-confidence streak."""
+        if not self._reliable_velocity_history:
+            return None
+        frames = min(
+            max(int(self._low_quality_velocity_frames), 0),
+            max(int(self.config.deep_velocity_hold_max_frames), 1),
+        )
+        decay = float(np.clip(self.config.deep_velocity_hold_decay, 0.0, 1.0))
+        floor = float(np.clip(self.config.deep_velocity_hold_min_ratio, 0.0, 1.0))
+        factor = max(floor, decay ** frames)
+        return (self._reliable_velocity * factor).astype(np.float32, copy=False)
 
     def _state_to_output_bbox(self, state: SphereState, image_width: int, image_height: int) -> np.ndarray:
         bbox = state_to_erp_bbox(state, image_width, image_height)
@@ -2061,6 +2361,10 @@ class PanoSOTTracker:
                 and self._small_target_bootstrap_due(predicted)
                 and self._frame_count <= max(int(self.config.small_target_bootstrap_frames), 0)
                 and self.config.handcrafted_flow_enabled
+                and not (
+                    self.config.small_target_compact_deep_bootstrap_enabled
+                    and self._small_target_bootstrap_near_square()
+                )
             )
             if bootstrap_flow:
                 frame_gray = self._handcrafted_gray(frame, assume_normalized=True)
@@ -2088,6 +2392,15 @@ class PanoSOTTracker:
              skip_deep_probe = (
                 last_probe_low
                 and not self._deep_probe_due()
+                and not (
+                    self.config.compact_target_persistent_deep_probe_enabled
+                    and self._small_target_bootstrap_near_square()
+                )
+                and not (
+                    int(self.config.compact_target_deep_probe_interval) > 0
+                    and self._small_target_bootstrap_near_square()
+                    and self._frame_count % int(self.config.compact_target_deep_probe_interval) == 0
+                )
                 and not (
                     self._small_target_bootstrap_due(predicted)
                     and self._frame_count <= max(int(self.config.small_target_bootstrap_frames), 0)
@@ -2165,6 +2478,27 @@ class PanoSOTTracker:
                         fallback_source,
                         hand_score=hand_score,
                     )
+                    # During tiny-target warm-up, a flow/NCC fallback can
+                    # remain pinned to the initial box while the deep probe
+                    # already sees the rapidly growing target.  Prefer the
+                    # independently localized deep proposal when it has both
+                    # a score margin and a substantial scale increase.
+                    probe_growth_disagrees = (
+                        self._small_target_bootstrap_due(predicted)
+                        and self._small_target_bootstrap_near_square()
+                        and self._frame_count <= max(int(self.config.small_target_bootstrap_frames), 0)
+                        and fallback_source in {"flow", "ncc"}
+                        and self._last_deep_probe_state is not None
+                        and deep_score_before_fallback
+                            >= float(hand_score) + float(self.config.deep_probe_ncc_override_margin)
+                        and (
+                            self._last_deep_probe_state.equatorial_width
+                                > predicted.equatorial_width * 1.25
+                            or self._last_deep_probe_state.angular_height
+                                > predicted.angular_height * 1.25
+                        )
+                    )
+                    probe_disagrees = probe_disagrees or probe_growth_disagrees
                     fallback_confirmed = self._confirm_low_psr_fallback(
                         predicted, hand_state, fallback_source,
                     )
@@ -2182,10 +2516,21 @@ class PanoSOTTracker:
                         handcrafted_result = True
                         self.runtime_stats.fallback_accepts += 1
                     elif probe_disagrees:
-                        best_state, best_score = (
-                            self._last_deep_probe_state,
-                            self._last_deep_probe_score,
-                        )
+                        if probe_growth_disagrees and fallback_source == "flow":
+                            # Keep the temporally grounded flow position but
+                            # take the deep probe's expanding size estimate.
+                            best_state = SphereState(
+                                lon=hand_state.lon,
+                                lat=hand_state.lat,
+                                equatorial_width=self._last_deep_probe_state.equatorial_width,
+                                angular_height=self._last_deep_probe_state.angular_height,
+                            )
+                            best_score = self._last_deep_probe_score
+                        else:
+                            best_state, best_score = (
+                                self._last_deep_probe_state,
+                                self._last_deep_probe_score,
+                            )
                         handcrafted_result = False
                     elif fallback_confirmed and self._accept_deep_fallback(
                         hand_score,
@@ -2363,6 +2708,19 @@ class PanoSOTTracker:
         handcrafted_low_quality = (
             not self._deep_mode
             and candidate_trust < 0.35
+        )
+        deep_fallback_low_quality = (
+            self._deep_mode
+            and handcrafted_result
+            and not semantic_recovery
+            and not flow_reliable
+            and (
+                float(best_score) < float(self.config.reliable_velocity_min_score)
+                or (
+                    fallback_source == "ncc"
+                    and self._ncc_last_score < self.config.handcrafted_ncc_low_score_commit_threshold
+                )
+            )
         )
 
         score_drop = self._last_high_conf_score - best_score
@@ -2587,6 +2945,20 @@ class PanoSOTTracker:
                 self._last_relocalize_frame = self._frame_count
                 relocalize_applied = True
                 ncc_low_confidence = False
+                if self.config.relocalization_velocity_reset_enabled:
+                    recovery_delta = np.asarray([
+                        lon_distance(relocalized.lon, self.state.lon),
+                        relocalized.lat - self.state.lat,
+                    ], dtype=np.float32)
+                    max_jump = math.radians(max(float(self.config.relocalization_velocity_max_jump_deg), 1.0))
+                    if np.linalg.norm(recovery_delta) <= max_jump:
+                        self.velocity[:] = recovery_delta
+                    else:
+                        held = self._held_reliable_velocity()
+                        self.velocity[:] = 0.0 if held is None else held
+                    self._reliable_velocity_history.clear()
+                    self._reliable_velocity[:] = self.velocity
+                    self._low_quality_velocity_frames = 0
 
                 # P4: 高置信重定位成功后重置模板
                 if (
@@ -2618,13 +2990,22 @@ class PanoSOTTracker:
             candidate = self._make_candidate(best_state, best_score, source="prediction")
 
         best_state = self._clamp_state_size(best_state)
+        best_state = self._maybe_joint_scale_search(frame, predicted, best_state, best_score)
         trend_scale = self._predict_scale_trend(predicted)
         if (
             trend_scale is not None
             and self._deep_mode
             and self._small_target_bootstrap_near_square()
             and self._frame_count <= max(int(self.config.scale_trend_max_frames), 1)
-            and best_score >= float(self.config.scale_trend_min_confidence)
+            and (
+                best_score >= float(self.config.scale_trend_min_confidence)
+                or (
+                    self.config.scale_trend_apply_to_handcrafted
+                    and handcrafted_result
+                    and best_score >= float(self.config.scale_trend_handcrafted_min_score)
+                    and self._frame_count <= max(int(self.config.scale_trend_handcrafted_max_frames), 1)
+                )
+            )
             and (
                 best_state.equatorial_width < trend_scale[0] * 0.90
                 or best_state.angular_height < trend_scale[1] * 0.90
@@ -2632,11 +3013,19 @@ class PanoSOTTracker:
         ):
             # Preserve the independently localized position while using the
             # monotonic scale trend only as a bounded size proposal.
+            trend_width = min(
+                float(trend_scale[0]),
+                float(predicted.equatorial_width) * max(float(self.config.scale_trend_max_growth_ratio), 1.0),
+            )
+            trend_height = min(
+                float(trend_scale[1]),
+                float(predicted.angular_height) * max(float(self.config.scale_trend_max_growth_ratio), 1.0),
+            )
             best_state = SphereState(
                 lon=best_state.lon,
                 lat=best_state.lat,
-                equatorial_width=float(max(best_state.equatorial_width, trend_scale[0])),
-                angular_height=float(max(best_state.angular_height, trend_scale[1])),
+                equatorial_width=float(max(best_state.equatorial_width, trend_width)),
+                angular_height=float(max(best_state.angular_height, trend_height)),
             )
         bootstrap_scale = (
             self._deep_mode
@@ -2685,12 +3074,23 @@ class PanoSOTTracker:
         if self._occlusion_frames > self.config.occlusion_suppress_frames:
             momentum = min(momentum, 0.1)
 
+        reliable_motion = self._update_reliable_velocity_history(
+            np.asarray([lon_delta, lat_delta], dtype=np.float32),
+            best_score,
+            handcrafted_result,
+            flow_reliable,
+            fallback_source,
+        )
         if semantic_recovery:
             self.velocity[:] = 0.0
-        elif deep_low_quality:
-            decay = float(np.clip(self.config.deep_velocity_decay, 0.0, 1.0))
-            self.velocity[0] = decay * self.velocity[0]
-            self.velocity[1] = decay * self.velocity[1]
+        elif deep_low_quality or deep_fallback_low_quality:
+            held = self._held_reliable_velocity()
+            if held is not None:
+                self.velocity[:] = held
+            else:
+                decay = float(np.clip(self.config.deep_velocity_decay, 0.0, 1.0))
+                self.velocity[0] = decay * self.velocity[0]
+                self.velocity[1] = decay * self.velocity[1]
         elif handcrafted_low_quality:
             self.velocity *= 0.25
         else:
@@ -2760,6 +3160,22 @@ class PanoSOTTracker:
         ):
             self.runtime_stats.template_updates += 1
             self._update_templates(frame, best_state, best_score)
+        elif (
+            self._deep_mode
+            and self.config.deep_adaptive_template_enabled
+            and not handcrafted_result
+            and best_score >= self.config.deep_adaptive_template_min_score
+            and self.runtime_stats.last_psr >= self.config.deep_adaptive_template_min_psr
+            and self._frame_count - self._last_adaptive_template_frame
+                >= max(int(self.config.deep_adaptive_template_interval), 1)
+            and self._init_bbox_width_px is not None
+            and best_state.equatorial_width
+                >= self.state.equatorial_width * self.config.deep_adaptive_template_min_growth
+        ):
+            # Adapt only the non-init short/long templates. The immutable init
+            # bank remains available for global recovery and identity checks.
+            self._update_templates(frame, best_state, best_score)
+            self._last_adaptive_template_frame = self._frame_count
         else:
             for i in range(len(self._template_ages)):
                 self._template_ages[i] += 1
@@ -3275,9 +3691,13 @@ class PanoSOTTracker:
         best_box: np.ndarray | None = None
         best_center_x: float | None = None
         best_center_y: float | None = None
+        best_source_name = ""
+        best_short_score = -1.0
+        best_initial_score = -1.0
         candidates: list[
             tuple[float, float, int, int, np.ndarray, int, int, int, int]
         ] = []
+        candidate_sources: list[str] = []
         for width_scale, height_scale in scale_pairs:
             width = max(12, int(round(box[2] * width_scale)))
             height = max(12, int(round(box[3] * height_scale)))
@@ -3320,6 +3740,7 @@ class PanoSOTTracker:
                         allowed_x0, allowed_y0, allowed_x1, allowed_y1,
                     ),
                 )
+                candidate_sources.append(source_name)
 
         def match_candidate(
             item: tuple[float, float, int, int, np.ndarray, int, int, int, int],
@@ -3350,8 +3771,13 @@ class PanoSOTTracker:
                 width_scale, height_scale, width, height, candidate_template,
                 allowed_x0, allowed_y0, _, _,
             ) = candidate
+            source_name = candidate_sources[candidate_index]
             response = responses[candidate_index]
             _, raw_score, _, local_location = cv2.minMaxLoc(response)
+            if source_name == "short":
+                best_short_score = max(best_short_score, float(raw_score))
+            else:
+                best_initial_score = max(best_initial_score, float(raw_score))
             location_x = allowed_x0 + local_location[0]
             location_y = allowed_y0 + local_location[1]
             candidate_start_x = x0 + location_x
@@ -3391,6 +3817,7 @@ class PanoSOTTracker:
                 )
                 best_center_x = candidate_center_x
                 best_center_y = candidate_center_y
+                best_source_name = source_name
 
         if best_box is None:
             if self.state is None:
@@ -3398,6 +3825,29 @@ class PanoSOTTracker:
             return self.state, best_score, False
 
         self._ncc_last_score = float(best_score)
+        self.runtime_stats.ncc_short_best_score = float(best_short_score)
+        self.runtime_stats.ncc_initial_best_score = float(best_initial_score)
+        quarantined = self._ncc_quarantined()
+        if quarantined:
+            self.runtime_stats.ncc_quarantine_frames += 1
+            # A high coefficient from the adaptive template is not enough
+            # during recovery.  Require the immutable initial appearance to
+            # be competitive and keep the candidate close to the independent
+            # handcrafted/deep anchor.
+            # Do not reject every NCC observation while quarantined: on
+            # difficult but still trackable targets NCC can be the only useful
+            # temporal signal.  Quarantine primarily freezes EMA contamination;
+            # only an implausible displacement is rejected below.
+            anchor = self._hand_state if self._hand_state is not None else self.state
+            if anchor is not None and best_initial_score >= float(self.config.ncc_quarantine_min_initial_score):
+                candidate_state = erp_bbox_to_state(best_box, image_width, image_height)
+                anchor_gap = max(
+                    abs(math.degrees(lon_distance(candidate_state.lon, anchor.lon))),
+                    abs(math.degrees(candidate_state.lat - anchor.lat)),
+                )
+                if anchor_gap > float(self.config.ncc_quarantine_max_anchor_gap_deg):
+                    self.runtime_stats.ncc_quarantine_rejects += 1
+                    return self.state, min(float(best_score), 0.0), False
         if best_score < self.config.handcrafted_ncc_reliable_score:
             if self.state is None:
                 raise RuntimeError("Tracker state is unavailable.")
@@ -3490,7 +3940,18 @@ class PanoSOTTracker:
         self._ncc_bbox = best_box.astype(np.float32)
         if best_score >= self.config.handcrafted_ncc_scale_anchor_score:
             self._ncc_scale_anchor = best_box[2:4].copy()
-        if best_score >= self.config.handcrafted_ncc_update_score:
+        allow_short_update = not (
+            quarantined and self.config.ncc_quarantine_freeze_short_updates
+        )
+        if (
+            self.config.ncc_short_update_identity_gate_enabled
+            and best_source_name == "short"
+        ):
+            allow_short_update = (
+                best_initial_score >= best_short_score
+                    - float(self.config.ncc_short_update_min_initial_score_gap)
+            )
+        if best_score >= self.config.handcrafted_ncc_update_score and allow_short_update:
             patch = self._crop_erp_box(gray, self._ncc_bbox)
             if patch is not None:
                 patch = cv2.resize(
@@ -4592,6 +5053,10 @@ class PanoSOTTracker:
             and min(self._init_bbox_width_px, self._init_bbox_height_px)
             <= float(self.config.deep_fallback_flow_tiny_max_init_pixels)
             and self._previous_frame_gray is not None
+            and (
+                self.config.deep_fallback_flow_tiny_compact_enabled
+                or not self._small_target_bootstrap_near_square()
+            )
             # During the warm-up, let the deep multi-scale search establish
             # object growth; optical flow preserves the tiny initialization
             # box too aggressively before enough feature support exists.
@@ -4605,6 +5070,25 @@ class PanoSOTTracker:
             if flow_reliable:
                 self.runtime_stats.fallback_flow_results += 1
                 flow_score = self._score_state_handcrafted(frame, flow_state)
+                if (
+                    self._ncc_bbox is not None
+                    and self.config.compact_fallback_flow_position_blend > 0.0
+                ):
+                    # Keep NCC scale/appearance, but use only a bounded part
+                    # of the flow displacement as a position correction.
+                    ncc_state = erp_bbox_to_state(
+                        self._ncc_bbox,
+                        self.frame_shape[1],
+                        self.frame_shape[0],
+                    ) if self.frame_shape is not None else hand_predicted
+                    weight = float(np.clip(self.config.compact_fallback_flow_position_blend, 0.0, 1.0))
+                    flow_state = self._blend_state_position(ncc_state, flow_state, weight)
+                    flow_state = SphereState(
+                        flow_state.lon,
+                        flow_state.lat,
+                        ncc_state.equatorial_width,
+                        ncc_state.angular_height,
+                    )
                 return flow_state, max(flow_score, self.config.handcrafted_high_confidence), "flow"
         if self._color_hue is None:
             ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame, gray=gray)

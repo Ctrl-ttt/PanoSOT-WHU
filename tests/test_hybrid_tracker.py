@@ -16,6 +16,50 @@ from tools.batch_evaluate import SeqResult, discover_sequences, summarize_result
 
 
 class HybridTrackerTests(unittest.TestCase):
+    def test_reliable_velocity_is_held_during_low_quality_frames(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            reliable_velocity_history_size=5,
+            deep_velocity_hold_decay=0.9,
+            deep_velocity_hold_min_ratio=0.25,
+        ))
+        tracker._update_reliable_velocity_history(
+            np.array([0.04, -0.02], dtype=np.float32),
+            0.8,
+            True,
+            True,
+            "flow",
+        )
+        tracker._update_reliable_velocity_history(
+            np.array([0.05, -0.03], dtype=np.float32),
+            0.8,
+            True,
+            True,
+            "flow",
+        )
+        tracker._update_reliable_velocity_history(
+            np.zeros(2, dtype=np.float32),
+            0.0,
+            False,
+            False,
+            "prediction",
+        )
+        held = tracker._held_reliable_velocity()
+        self.assertIsNotNone(held)
+        self.assertGreater(float(np.linalg.norm(held)), 0.0)
+        self.assertLessEqual(float(np.linalg.norm(held)), float(np.linalg.norm(tracker._reliable_velocity)) + 1e-6)
+
+    def test_untrusted_jump_does_not_enter_velocity_history(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig())
+        accepted = tracker._update_reliable_velocity_history(
+            np.array([2.0, 0.0], dtype=np.float32),
+            0.1,
+            False,
+            False,
+            "prediction",
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(len(tracker._reliable_velocity_history), 0)
+
     def test_tracking_adapter_runs_on_inference_features(self) -> None:
         import tempfile
         import torch
@@ -134,6 +178,13 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertTrue(__import__("torch").equal(safe, fast))
         self.assertTrue(np.all(patch == 0.5))
 
+    def test_deep_feature_config_exposes_cuda_layout_controls(self) -> None:
+        from panosot.deep_features import FeatureConfig
+
+        config = FeatureConfig()
+        self.assertTrue(config.use_channels_last)
+        self.assertTrue(config.cudnn_benchmark)
+
     def test_load_image_inplace_normalization_matches_reference(self) -> None:
         from panosot.io import load_image
 
@@ -178,6 +229,33 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertFalse(tracker._accept_deep_fallback(0.20, 0.19, "ncc"))
         self.assertTrue(tracker._accept_deep_fallback(0.24, 0.18, "ncc"))
         self.assertTrue(tracker._accept_deep_fallback(0.20, 0.01, "flow"))
+
+    def test_ncc_quarantine_accelerates_probe_recovery(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            ncc_quarantine_enabled=True,
+            deep_probe_interval=20,
+            ncc_quarantine_after_low_probe_count=3,
+            ncc_quarantine_probe_interval=5,
+        ))
+        tracker._deep_mode = True
+        tracker._frame_count = 25
+        tracker._last_deep_probe_frame = 10
+        tracker._consecutive_low_deep_probes = 3
+        self.assertTrue(tracker._ncc_quarantined())
+        self.assertTrue(tracker._deep_probe_due())
+
+    def test_ncc_quarantine_is_disabled_for_normal_mode(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(ncc_quarantine_enabled=True))
+        tracker._frame_count = 4
+        tracker._last_deep_probe_frame = 0
+        tracker._consecutive_low_deep_probes = 10
+        self.assertFalse(tracker._ncc_quarantined())
+
+    def test_scale_trend_handcrafted_option_is_configurable(self) -> None:
+        config = TrackerConfig(scale_trend_apply_to_handcrafted=True)
+        self.assertTrue(config.scale_trend_apply_to_handcrafted)
+        self.assertGreater(config.scale_trend_handcrafted_max_frames, 0)
 
     def test_initial_template_update_rate_is_zero(self) -> None:
         handcrafted = PanoSOTTracker()

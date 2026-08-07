@@ -135,6 +135,24 @@ def main() -> None:
         help="AirSim360-trained projection checkpoint; requires --deep.",
     )
     parser.add_argument("--small-target-max-scale-step", type=float, default=None)
+    parser.add_argument(
+        "--disable-small-target-bootstrap-flow",
+        action="store_true",
+        help="Use deep search from frame 1 and disable tiny-target flow fallback.",
+    )
+    parser.add_argument(
+        "--enable-compact-fallback-flow",
+        action="store_true",
+        help="Enable optical-flow fallback for compact tiny targets after warm-up.",
+    )
+    parser.add_argument(
+        "--enable-compact-persistent-probe",
+        action="store_true",
+        help="Run deep probes every frame for compact tiny targets.",
+    )
+    parser.add_argument("--compact-deep-probe-interval", type=int, default=0)
+    parser.add_argument("--compact-flow-position-blend", type=float, default=0.0)
+    parser.add_argument("--enable-ncc-identity-gate", action="store_true")
     parser.add_argument("--early-semantic-recovery", action="store_true")
     parser.add_argument("--subset", default=None)
     parser.add_argument(
@@ -172,6 +190,13 @@ def main() -> None:
         device=args.device,
         polar_erp_recovery_enabled=bool(args.deep),
         polar_erp_recovery_adaptive_height=bool(args.deep),
+        small_target_bootstrap_flow_enabled=not args.disable_small_target_bootstrap_flow,
+        deep_fallback_flow_tiny_enabled=not args.disable_small_target_bootstrap_flow,
+        deep_fallback_flow_tiny_compact_enabled=bool(args.enable_compact_fallback_flow),
+        compact_target_persistent_deep_probe_enabled=bool(args.enable_compact_persistent_probe),
+        compact_target_deep_probe_interval=max(int(args.compact_deep_probe_interval), 0),
+        compact_fallback_flow_position_blend=float(np.clip(args.compact_flow_position_blend, 0.0, 1.0)),
+        ncc_short_update_identity_gate_enabled=bool(args.enable_ncc_identity_gate),
     )
     if args.small_target_max_scale_step is not None:
         config.small_target_max_scale_step = float(args.small_target_max_scale_step)
@@ -185,6 +210,8 @@ def main() -> None:
         extractor = DeepFeatureExtractor(FeatureConfig(
             device=args.device,
             use_amp=args.device.startswith("cuda"),
+            use_channels_last=args.device.startswith("cuda"),
+            cudnn_benchmark=args.device.startswith("cuda"),
             feature_layer=args.deep_feature_layer,
             cache_dir=str(PROJECT_ROOT / ".cache" / "torch"),
             tracking_adapter_path=(
