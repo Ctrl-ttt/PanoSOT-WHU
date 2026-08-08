@@ -16,6 +16,17 @@ from tools.batch_evaluate import SeqResult, discover_sequences, summarize_result
 
 
 class HybridTrackerTests(unittest.TestCase):
+    def test_long_thin_bootstrap_excludes_compact_target(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            deep_fallback_flow_long_thin_enabled=True,
+        ))
+        tracker._init_bbox_width_px = 78.0
+        tracker._init_bbox_height_px = 50.0
+        self.assertFalse(tracker._small_target_bootstrap_long_thin())
+        tracker._init_bbox_width_px = 104.0
+        tracker._init_bbox_height_px = 21.0
+        self.assertTrue(tracker._small_target_bootstrap_long_thin())
+
     def test_reliable_velocity_is_held_during_low_quality_frames(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(
             reliable_velocity_history_size=5,
