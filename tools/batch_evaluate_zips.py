@@ -129,6 +129,11 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--deep-feature-layer", type=int, default=12)
     parser.add_argument(
+        "--deep-multiscale",
+        action="store_true",
+        help="Fuse MobileNet layer-7 spatial detail with layer-12 semantics.",
+    )
+    parser.add_argument(
         "--tracking-adapter",
         type=Path,
         default=None,
@@ -141,18 +146,92 @@ def main() -> None:
         help="Use deep search from frame 1 and disable tiny-target flow fallback.",
     )
     parser.add_argument(
+        "--disable-deep-fallback-flow",
+        action="store_true",
+        help="Disable optical-flow fallback only in deep mode.",
+    )
+    parser.add_argument(
+        "--disable-deep-fallback-color",
+        action="store_true",
+        help="Disable colour fallback only in deep mode.",
+    )
+    parser.add_argument(
+        "--enable-deep-fallback-color",
+        action="store_true",
+        help="Re-enable colour fallback in deep mode for comparison runs.",
+    )
+    parser.add_argument(
+        "--enable-deep-fallback-ncc-before-color",
+        action="store_true",
+        help="Try ERP-NCC before colour in deep fallback mode.",
+    )
+    parser.add_argument(
+        "--disable-deep-flow-appearance-score",
+        action="store_true",
+        help="Use legacy fixed flow confidence in deep fallback mode.",
+    )
+    parser.add_argument(
         "--enable-compact-fallback-flow",
         action="store_true",
         help="Enable optical-flow fallback for compact tiny targets after warm-up.",
     )
+    parser.add_argument(
+        "--enable-compact-deep-keep",
+        action="store_true",
+        help="Keep bounded low-PSR deep proposals during compact-target warm-up.",
+    )
+    parser.add_argument("--compact-deep-keep-max-aspect", type=float, default=None)
+    parser.add_argument(
+        "--enable-long-thin-flow",
+        action="store_true",
+        help="Enable bounded optical flow for small elongated targets.",
+    )
+    parser.add_argument(
+        "--long-thin-full-width-ncc",
+        action="store_true",
+        help="Experimental: search full ERP width for elongated tiny-target NCC.",
+    )
+    parser.add_argument(
+        "--enable-long-thin-global-ncc",
+        action="store_true",
+        help="Experimental: low-frequency full-ERP NCC recovery for elongated targets.",
+    )
+    parser.add_argument("--enable-long-thin-global-color", action="store_true")
+    parser.add_argument("--enable-long-thin-early-global-ncc", action="store_true")
     parser.add_argument(
         "--enable-compact-persistent-probe",
         action="store_true",
         help="Run deep probes every frame for compact tiny targets.",
     )
     parser.add_argument("--compact-deep-probe-interval", type=int, default=0)
+    parser.add_argument(
+        "--deep-probe-interval",
+        type=int,
+        default=None,
+        help="Override periodic deep-probe interval for ablation runs.",
+    )
     parser.add_argument("--compact-flow-position-blend", type=float, default=0.0)
     parser.add_argument("--enable-ncc-identity-gate", action="store_true")
+    parser.add_argument(
+        "--deep-adapter-compact-only",
+        action="store_true",
+        help="Apply a loaded tracking adapter only to compact initial targets.",
+    )
+    parser.add_argument("--deep-adapter-compact-max-aspect", type=float, default=None)
+    parser.add_argument("--deep-adapter-compact-min-area", type=float, default=None)
+    parser.add_argument(
+        "--enable-ncc-quarantine",
+        action="store_true",
+        help="Quarantine adaptive NCC after repeated low-PSR probes.",
+    )
+    parser.add_argument(
+        "--enable-fallback-budget",
+        action="store_true",
+        help="Bound identity-free deep fallbacks after sustained low-PSR probes.",
+    )
+    parser.add_argument("--fallback-budget-frames", type=int, default=None)
+    parser.add_argument("--fallback-budget-min-frames", type=int, default=None)
+    parser.add_argument("--fallback-budget-start-frame", type=int, default=None)
     parser.add_argument("--early-semantic-recovery", action="store_true")
     parser.add_argument("--subset", default=None)
     parser.add_argument(
@@ -192,14 +271,53 @@ def main() -> None:
         polar_erp_recovery_adaptive_height=bool(args.deep),
         small_target_bootstrap_flow_enabled=not args.disable_small_target_bootstrap_flow,
         deep_fallback_flow_tiny_enabled=not args.disable_small_target_bootstrap_flow,
+        deep_fallback_flow_enabled=not args.disable_deep_fallback_flow,
+        deep_fallback_color_enabled=(
+            bool(args.enable_deep_fallback_color)
+            and not args.disable_deep_fallback_color
+        ),
+        deep_fallback_ncc_before_color_enabled=bool(
+            args.enable_deep_fallback_ncc_before_color
+        ),
+        deep_fallback_flow_use_appearance_score=not args.disable_deep_flow_appearance_score,
         deep_fallback_flow_tiny_compact_enabled=bool(args.enable_compact_fallback_flow),
+        small_target_compact_deep_bootstrap_enabled=bool(args.enable_compact_deep_keep),
+        small_target_compact_deep_keep_enabled=bool(args.enable_compact_deep_keep),
+        deep_fallback_flow_long_thin_enabled=bool(args.enable_long_thin_flow),
+        deep_fallback_flow_long_thin_ncc_full_width=bool(args.long_thin_full_width_ncc),
+        deep_fallback_flow_long_thin_global_ncc_enabled=bool(args.enable_long_thin_global_ncc),
+        deep_fallback_flow_long_thin_global_color_enabled=bool(args.enable_long_thin_global_color),
+        deep_fallback_flow_long_thin_early_global_ncc_enabled=bool(args.enable_long_thin_early_global_ncc),
         compact_target_persistent_deep_probe_enabled=bool(args.enable_compact_persistent_probe),
         compact_target_deep_probe_interval=max(int(args.compact_deep_probe_interval), 0),
         compact_fallback_flow_position_blend=float(np.clip(args.compact_flow_position_blend, 0.0, 1.0)),
         ncc_short_update_identity_gate_enabled=bool(args.enable_ncc_identity_gate),
+        deep_adapter_compact_only=bool(args.deep_adapter_compact_only),
+        ncc_quarantine_enabled=bool(args.enable_ncc_quarantine),
+        fallback_reliability_budget_enabled=bool(args.enable_fallback_budget),
     )
+    if args.fallback_budget_frames is not None:
+        config.fallback_reliability_budget_frames = max(int(args.fallback_budget_frames), 1)
+    if args.fallback_budget_min_frames is not None:
+        config.fallback_reliability_budget_min_frames = max(int(args.fallback_budget_min_frames), 1)
+    if args.fallback_budget_start_frame is not None:
+        config.fallback_reliability_budget_start_frame = max(int(args.fallback_budget_start_frame), 1)
+    if args.compact_deep_keep_max_aspect is not None:
+        config.small_target_compact_deep_keep_max_aspect_ratio = max(
+            float(args.compact_deep_keep_max_aspect), 1.0
+        )
+    if args.deep_probe_interval is not None:
+        config.deep_probe_interval = max(int(args.deep_probe_interval), 1)
     if args.small_target_max_scale_step is not None:
         config.small_target_max_scale_step = float(args.small_target_max_scale_step)
+    if args.deep_adapter_compact_max_aspect is not None:
+        config.deep_adapter_compact_max_aspect_ratio = max(
+            float(args.deep_adapter_compact_max_aspect), 1.0
+        )
+    if args.deep_adapter_compact_min_area is not None:
+        config.deep_adapter_compact_min_init_area = max(
+            float(args.deep_adapter_compact_min_area), 0.0
+        )
     config.early_semantic_recovery_enabled = bool(args.early_semantic_recovery)
     extractor = head = None
     if args.deep:
@@ -208,6 +326,7 @@ def main() -> None:
         from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
         from panosot.models import build_similarity_head
         extractor = DeepFeatureExtractor(FeatureConfig(
+            backbone_name=("mobilenet_v3_small_multiscale" if args.deep_multiscale else "mobilenet_v3_small"),
             device=args.device,
             use_amp=args.device.startswith("cuda"),
             use_channels_last=args.device.startswith("cuda"),

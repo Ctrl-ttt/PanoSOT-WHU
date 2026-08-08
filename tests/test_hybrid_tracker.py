@@ -257,6 +257,48 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertTrue(config.scale_trend_apply_to_handcrafted)
         self.assertGreater(config.scale_trend_handcrafted_max_frames, 0)
 
+    def test_fallback_budget_rejects_unconfirmed_motion_after_expiry(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            fallback_reliability_budget_enabled=True,
+            fallback_reliability_budget_frames=1,
+            fallback_reliability_budget_min_frames=1,
+            fallback_reliability_budget_confirmation_frames=2,
+        ))
+        tracker._deep_mode = True
+        predicted = SphereState(0.0, 0.0, 0.1, 0.1)
+        candidate = SphereState(math.radians(1.0), 0.0, 0.1, 0.1)
+
+        self.assertTrue(tracker._fallback_budget_accepts(
+            predicted, candidate, "flow", deep_verified=False,
+        ))
+        self.assertFalse(tracker._fallback_budget_accepts(
+            predicted, candidate, "flow", deep_verified=False,
+        ))
+        candidate = SphereState(math.radians(2.0), 0.0, 0.1, 0.1)
+        self.assertTrue(tracker._fallback_budget_accepts(
+            predicted, candidate, "flow", deep_verified=False,
+        ))
+        self.assertEqual(tracker.runtime_stats.fallback_budget_rejections, 1)
+
+    def test_deep_verified_frame_replenishes_fallback_budget(self) -> None:
+        tracker = PanoSOTTracker(TrackerConfig(
+            use_deep_features=True,
+            fallback_reliability_budget_frames=1,
+        ))
+        tracker._deep_mode = True
+        state = SphereState(0.0, 0.0, 0.1, 0.1)
+        tracker._fallback_budget_accepts(state, state, "flow", deep_verified=False)
+        self.assertTrue(tracker._fallback_budget_accepts(
+            state, state, "flow", deep_verified=True,
+        ))
+        self.assertEqual(tracker._unverified_fallback_frames, 0)
+
+    def test_deep_fallback_colour_is_disabled_by_default(self) -> None:
+        config = TrackerConfig(use_deep_features=True)
+        self.assertFalse(config.deep_fallback_color_enabled)
+        self.assertTrue(config.handcrafted_color_enabled)
+
     def test_initial_template_update_rate_is_zero(self) -> None:
         handcrafted = PanoSOTTracker()
         deep = PanoSOTTracker(TrackerConfig(use_deep_features=True))
@@ -1279,6 +1321,12 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertIsNone(summary["avg_mean_iou"])
         self.assertEqual(summary["total_elapsed_sec"], 0.0)
         self.assertIsNone(summary["avg_fps"])
+
+    def test_long_thin_early_global_ncc_is_opt_in(self) -> None:
+        config = TrackerConfig()
+        self.assertFalse(config.deep_fallback_flow_long_thin_early_global_ncc_enabled)
+        config.deep_fallback_flow_long_thin_early_global_ncc_enabled = True
+        self.assertTrue(config.deep_fallback_flow_long_thin_early_global_ncc_enabled)
 
 
 if __name__ == "__main__":

@@ -131,11 +131,71 @@ class ResidualTrackingProjection(TrackingProjection):
         return features + self._scale * self._module(features)
 
 
+class MultiScaleMobileNetV3SmallFeatures:
+    """Fuse early spatial detail and late semantic MobileNet features.
+
+    The standard layer-12 feature map is only 4x4 for a 112px template,
+    which quantizes the position of compact/elongated targets.  This wrapper
+    keeps layer 7 at its native resolution and bilinearly upsamples the layer
+    12 semantics before concatenating independently normalized branches.
+    No pretrained feature is discarded and the output remains compatible with
+    the existing depthwise XCorr head.
+    """
+
+    def __init__(self, features: Any, early_layer: int = 7, late_layer: int = 12,
+                 early_weight: float = 0.10) -> None:
+        torch, nn = _require_torch()
+        if early_layer < 0 or late_layer < early_layer:
+            raise ValueError("Expected 0 <= early_layer <= late_layer.")
+        layers = list(features.children())
+        if late_layer >= len(layers):
+            raise ValueError(f"late_layer must be below {len(layers)}, got {late_layer}")
+        self._torch = torch
+        self._nn = nn
+        self._early_layer = int(early_layer)
+        self._late_layer = int(late_layer)
+        self._early_weight = float(early_weight)
+        self._layers = nn.ModuleList(layers[: late_layer + 1])
+
+    def to(self, *args: Any, **kwargs: Any) -> Any:
+        self._layers.to(*args, **kwargs)
+        return self
+
+    def eval(self) -> Any:
+        self._layers.eval()
+        return self
+
+    def parameters(self) -> Any:
+        return self._layers.parameters()
+
+    def __call__(self, tensor: Any) -> Any:
+        torch = self._torch
+        early = None
+        features = tensor
+        for index, layer in enumerate(self._layers):
+            features = layer(features)
+            if index == self._early_layer:
+                early = features
+        if early is None:
+            raise RuntimeError("Multi-scale backbone did not produce early features.")
+        semantic = torch.nn.functional.interpolate(
+            features,
+            size=early.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        # Normalize each branch independently so 576 late channels cannot
+        # swamp the 48 high-resolution channels in the averaged XCorr score.
+        early = torch.nn.functional.normalize(early, p=2, dim=1, eps=1e-6) * self._early_weight
+        semantic = torch.nn.functional.normalize(semantic, p=2, dim=1, eps=1e-6)
+        return torch.cat((early, semantic), dim=1)
+
+
 def build_backbone(name: str, pretrained: bool = True, feature_layer: int | None = 12) -> Any:
     torch, nn = _require_torch()
     normalized_name = name.strip().lower()
 
-    if normalized_name == "mobilenet_v3_small":
+    if normalized_name in {"mobilenet_v3_small", "mobilenet_v3_small_multiscale"}:
         try:
             from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
         except ImportError as exc:
@@ -146,6 +206,8 @@ def build_backbone(name: str, pretrained: bool = True, feature_layer: int | None
         weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
         model = mobilenet_v3_small(weights=weights)
         features = model.features
+        if normalized_name == "mobilenet_v3_small_multiscale":
+            return MultiScaleMobileNetV3SmallFeatures(features, early_layer=7, late_layer=12)
         if feature_layer is None:
             return features
         layers = list(features.children())

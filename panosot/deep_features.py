@@ -73,6 +73,7 @@ class DeepFeatureExtractor:
         self._mean = torch.tensor(config.mean, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
         self._std = torch.tensor(config.std, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
         self.adapter = None
+        self.adapter_enabled = True
         if config.tracking_adapter_path:
             self.load_tracking_adapter(config.tracking_adapter_path)
 
@@ -134,7 +135,7 @@ class DeepFeatureExtractor:
     def _postprocess_features(self, features: Any) -> Any:
         if isinstance(features, (list, tuple)):
             features = features[-1]
-        if self.adapter is not None:
+        if self.adapter is not None and getattr(self, "adapter_enabled", True):
             # Backbone features are produced under inference_mode. Keep the
             # frozen adapter in the same mode; otherwise Conv2d attempts to
             # save backward state for an inference tensor at runtime.
@@ -144,6 +145,10 @@ class DeepFeatureExtractor:
         if self.config.normalize_features:
             features = self._torch.nn.functional.normalize(features, p=2, dim=1, eps=1e-6)
         return features
+
+    def set_tracking_adapter_enabled(self, enabled: bool) -> None:
+        """Enable/disable the optional adapter for the current sequence."""
+        self.adapter_enabled = bool(enabled)
 
     def preprocess_patch(
         self,
