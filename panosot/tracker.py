@@ -462,8 +462,8 @@ class TrackerConfig:
     # Estimate horizontal growth from the validated foreground flow.  This is
     # restricted to the compact elongated regime and prevents rapid-approach
     # sequences from collapsing to the minimum box size.
-    deep_fallback_flow_long_thin_scale_enabled: bool = False
-    deep_fallback_flow_long_thin_height_scale_enabled: bool = False
+    deep_fallback_flow_long_thin_scale_enabled: bool = True
+    deep_fallback_flow_long_thin_height_scale_enabled: bool = True
     deep_fallback_flow_long_thin_scale_min: float = 0.85
     deep_fallback_flow_long_thin_scale_max: float = 1.35
     # Appearance probes on tiny elongated objects systematically underestimate
@@ -635,7 +635,12 @@ class TrackerConfig:
     # A 20x39 initialized target can become nearly square during a fast
     # approach.  Keep the optical-flow branch active for this bounded window
     # rather than dropping it as soon as the current aspect changes.
+    # Keep temporal protection through the first sustained-motion segment;
+    # 40 frames is too short for 360VOTS trajectories that cross the ERP seam.
     handcrafted_long_thin_flow_active_frames: int = 40
+    handcrafted_long_thin_flow_min_template_score: float = 0.045
+    handcrafted_long_thin_flow_motion_max_ratio: float = 3.0
+    handcrafted_long_thin_flow_motion_min_ratio: float = 0.05
     handcrafted_long_thin_growth_search_enabled: bool = True
     handcrafted_long_thin_growth_search_frames: int = 40
     handcrafted_long_thin_growth_scale_factors: tuple[float, ...] = (
@@ -659,6 +664,14 @@ class TrackerConfig:
     handcrafted_long_thin_low_score_gate_score: float = 0.38
     handcrafted_long_thin_low_score_gate_max_lon_deg: float = 3.5
     handcrafted_long_thin_low_score_gate_max_lat_deg: float = 3.0
+    # A failed thin-target LK step must not let the generic local search
+    # invent a new vertical position. Hold the temporal prediction instead;
+    # the next validated flow step can correct it.
+    handcrafted_long_thin_hold_on_flow_failure: bool = True
+    handcrafted_long_thin_hold_max_failure_frames: int = 4
+    handcrafted_long_thin_max_vertical_step_deg: float = 1.0
+    handcrafted_long_thin_predict_on_flow_failure: bool = True
+    handcrafted_long_thin_predict_max_failure_frames: int = 12
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -2075,7 +2088,54 @@ class PanoSOTTracker:
         trust = self._state_trust(score, handcrafted_result)
         self._last_state_trust = trust
         if not self._deep_mode or handcrafted_result:
+            if (
+                self._small_target_bootstrap_long_thin_handcrafted()
+                and self.config.handcrafted_long_thin_hold_on_flow_failure
+                and not self._last_flow_reliable
+                and self._hand_state is not None
+            ):
+                # Keep both axes on the motion prediction after a failed LK
+                # step. The generic branch below would otherwise admit a
+                # background candidate with a large vertical displacement.
+                held = (
+                    self._held_reliable_velocity()
+                    if self._long_thin_flow_failure_streak > 0
+                    else None
+                )
+                hold_lon = predicted.lon
+                hold_lat = predicted.lat
+                if held is not None and self.state is not None:
+                    hold_lon = float(wrap_lon(self.state.lon + held[0]))
+                    hold_lat = float(clamp_lat(self.state.lat + held[1]))
+                candidate = SphereState(
+                    lon=hold_lon,
+                    lat=hold_lat,
+                    equatorial_width=candidate.equatorial_width,
+                    angular_height=candidate.angular_height,
+                )
+                self._last_state_trust = 1.0
+                return candidate
             if trust >= 0.999:
+                if (
+                    self._small_target_bootstrap_long_thin_handcrafted()
+                    and self.config.handcrafted_long_thin_hold_on_flow_failure
+                    and not self._last_flow_reliable
+                    and self.state is not None
+                ):
+                    # Failed thin-target LK must not inject a large vertical
+                    # correction through the generic handcrafted guard.
+                    max_lat = math.radians(
+                        max(float(self.config.handcrafted_long_thin_max_vertical_step_deg), 0.25)
+                    )
+                    lat_delta = float(np.clip(
+                        candidate.lat - predicted.lat, -max_lat, max_lat,
+                    ))
+                    candidate = SphereState(
+                        lon=candidate.lon,
+                        lat=float(clamp_lat(predicted.lat + lat_delta)),
+                        equatorial_width=candidate.equatorial_width,
+                        angular_height=candidate.angular_height,
+                    )
                 return candidate
             if self.lost_frames >= 2 and not self._last_flow_reliable and not self._last_color_reliable:
                 trust = min(trust, 0.20)
@@ -2194,6 +2254,9 @@ class PanoSOTTracker:
         self.velocity[:] = 0.0
         self._hand_velocity[:] = 0.0
         self._hand_state = erp_bbox_to_state(init_bbox_xywh, w, h)
+        self._long_thin_flow_failure_streak = 0
+        self._low_quality_velocity_frames = 0
+        self._reliable_velocity_history.clear()
         frame_gray = self._handcrafted_gray(frame, assume_normalized=True)
         self._previous_frame_gray = frame_gray if self.config.handcrafted_flow_enabled else None
         self._last_flow_reliable = False
@@ -2712,6 +2775,14 @@ class PanoSOTTracker:
         factor = max(floor, decay ** frames)
         return (self._reliable_velocity * factor).astype(np.float32, copy=False)
 
+    def _held_hand_velocity(self) -> np.ndarray | None:
+        """Use the handcrafted anchor velocity for thin-target recovery."""
+        if not np.all(np.isfinite(self._hand_velocity)):
+            return None
+        if float(np.linalg.norm(self._hand_velocity)) <= 1e-5:
+            return None
+        return self._hand_velocity.astype(np.float32, copy=True)
+
     def _state_to_output_bbox(self, state: SphereState, image_width: int, image_height: int) -> np.ndarray:
         bbox = state_to_erp_bbox(state, image_width, image_height)
         if self._init_bbox_width_px is None or self._init_bbox_height_px is None:
@@ -2866,10 +2937,14 @@ class PanoSOTTracker:
         )
 
         flow_reliable = False
+        raw_flow_reliable = False
+        prediction_from_held_velocity = False
         color_reliable = False
         ncc_reliable = False
         handcrafted_result = False
         fallback_source = ""
+        best_state = predicted
+        best_score = 0.0
         # Set when an otherwise plausible handcrafted fallback is rejected
         # because its identity-free reliability budget is exhausted.  In that
         # case the current state must be held; using ``predicted`` would still
@@ -2898,9 +2973,11 @@ class PanoSOTTracker:
                     and self._previous_frame_gray is not None
                 )
                 if tiny_flow or long_thin_flow:
+                    long_thin_flow_failed = False
                     flow_state, flow_reliable = self._predict_with_optical_flow(
                         frame, self.state, current_gray=frame_gray,
                     )
+                    raw_flow_reliable = bool(flow_reliable)
                     if flow_reliable and long_thin_flow:
                         reference = self._hand_velocity if np.any(
                             np.abs(self._hand_velocity) > 1e-5
@@ -2910,16 +2987,22 @@ class PanoSOTTracker:
                         if abs(ref_lon) > 1e-5:
                             ratio = abs(measured) / max(abs(ref_lon), 1e-6)
                             if (
-                                ratio > 3.0
-                                or (measured * ref_lon < 0.0 and abs(measured) > math.radians(0.75))
+                                ratio > float(self.config.handcrafted_long_thin_flow_motion_max_ratio)
+                                or (measured * ref_lon < 0.0 and abs(measured) > math.radians(0.25))
                             ):
                                 flow_reliable = False
+                                raw_flow_reliable = False
                                 self._last_flow_reliable = False
                                 self._last_flow_reject_reason = f"motion_gate:{ratio:.2f}"
                     if flow_reliable:
                         flow_score = self._score_state_handcrafted(frame, flow_state)
                         min_flow_score = (
-                            float(self.config.handcrafted_flow_template_score)
+                            float(
+                                min(
+                                    self.config.handcrafted_flow_template_score,
+                                    self.config.handcrafted_long_thin_flow_min_template_score,
+                                )
+                            )
                             if long_thin_flow else float(self.config.handcrafted_ncc_reliable_score)
                         )
                         if flow_score >= min_flow_score:
@@ -2931,10 +3014,43 @@ class PanoSOTTracker:
                             self.runtime_stats.fallback_accepts += 1
                         else:
                             flow_reliable = False
-                if (not tiny_flow and not long_thin_flow) or not flow_reliable:
+                            raw_flow_reliable = False
+                    if long_thin_flow:
+                        long_thin_flow_failed = not flow_reliable
+                        self._long_thin_flow_failure_streak = (
+                            0 if flow_reliable else self._long_thin_flow_failure_streak + 1
+                        )
+                    if (
+                        long_thin_flow
+                        and long_thin_flow_failed
+                        and self.config.handcrafted_long_thin_predict_on_flow_failure
+                        and self._reliable_velocity_history
+                        and self._long_thin_flow_failure_streak
+                            <= max(int(self.config.handcrafted_long_thin_predict_max_failure_frames), 1)
+                    ):
+                        held = self._held_reliable_velocity()
+                        if held is None:
+                            held = self._held_hand_velocity()
+                        if held is not None:
+                            best_state = SphereState(
+                                lon=float(wrap_lon(self.state.lon + held[0])),
+                                lat=float(clamp_lat(self.state.lat + held[1])),
+                                equatorial_width=self.state.equatorial_width,
+                                angular_height=self.state.angular_height,
+                            )
+                            prediction_from_held_velocity = True
+                            handcrafted_result = True
+                            fallback_source = "flow_hold"
+                            best_score = float(self.config.handcrafted_high_confidence)
+                if (
+                    (not tiny_flow and not long_thin_flow)
+                    or (not flow_reliable and not long_thin_flow)
+                ):
                     ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame, gray=frame_gray)
                 else:
-                    ncc_state, ncc_score, ncc_reliable = best_state, best_score, False
+                    ncc_state = best_state if "best_state" in locals() else predicted
+                    ncc_score = best_score if "best_score" in locals() else 0.0
+                    ncc_reliable = False
                 if ncc_reliable:
                     best_state = ncc_state
                     best_score = self._handcrafted_confidence(ncc_score, "ncc")
@@ -2952,7 +3068,50 @@ class PanoSOTTracker:
                             best_state, best_score = local_state, local_score
                             self.runtime_stats.fallback_local_search_results += 1
                 else:
-                    best_state, best_score = self._local_search(frame, predicted)
+                    # In the elongated thin regime, a failed LK estimate is
+                    # an identity failure, not an invitation for NCC/local
+                    # search to choose a nearby background edge. Keep the
+                    # motion prediction for a short bounded streak and let
+                    # the next reliable foreground flow update recover it.
+                    if prediction_from_held_velocity:
+                        # The bounded historical-velocity prediction above is
+                        # already the selected identity-preserving result.
+                        # Do not overwrite it with the stale one-step
+                        # prediction merely because NCC was intentionally
+                        # skipped for this failure frame.
+                        pass
+                    elif (
+                        long_thin_flow
+                        and self.config.handcrafted_long_thin_hold_on_flow_failure
+                        and not flow_reliable
+                        and not prediction_from_held_velocity
+                    ):
+                        held = self._held_reliable_velocity()
+                        if held is None:
+                            held = self._held_hand_velocity()
+                        if (
+                            self.config.handcrafted_long_thin_predict_on_flow_failure
+                            and held is not None
+                            and self._long_thin_flow_failure_streak
+                                <= max(int(self.config.handcrafted_long_thin_predict_max_failure_frames), 1)
+                        ):
+                            best_state = SphereState(
+                                lon=float(wrap_lon(predicted.lon + held[0] - self.velocity[0])),
+                                lat=float(clamp_lat(predicted.lat + held[1] - self.velocity[1])),
+                                equatorial_width=predicted.equatorial_width,
+                                angular_height=predicted.angular_height,
+                            )
+                            best_score = float(self.config.handcrafted_high_confidence)
+                            handcrafted_result = True
+                            fallback_source = "flow"
+                            prediction_from_held_velocity = True
+                            long_thin_flow_failed = True
+                        else:
+                            best_state, best_score = predicted, 0.0
+                    elif long_thin_flow and long_thin_flow_failed:
+                        best_state, best_score = predicted, 0.0
+                    else:
+                        best_state, best_score = self._local_search(frame, predicted)
             else:
                 frame_gray = self._handcrafted_gray(frame, assume_normalized=True)
                 flow_state, flow_reliable = self._predict_with_optical_flow(
@@ -3380,7 +3539,11 @@ class PanoSOTTracker:
                             # loss/relocalization state machine handle it.
                             best_state = predicted
                             best_score = deep_score_before_fallback
-        long_thin_recovery = self._predict_long_thin_recovery(frame, predicted)
+        long_thin_recovery = (
+            None
+            if prediction_from_held_velocity
+            else self._predict_long_thin_recovery(frame, predicted)
+        )
         if (
             long_thin_recovery is not None
             and (
@@ -3393,6 +3556,11 @@ class PanoSOTTracker:
             fallback_source = "long_thin_recovery"
             flow_reliable = False
             self.runtime_stats.fallback_local_search_results += 1
+
+        # A held LK prediction is already temporally anchored.  Do not run
+        # the generic long-thin recovery search on the same frame; its broad
+        # appearance window can replace a valid extrapolation with a stale
+        # background edge.
 
         if self._deep_mode and handcrafted_result and fallback_source == "ncc":
             if self._ncc_last_score < self.config.handcrafted_ncc_low_score_commit_threshold:
@@ -4201,7 +4369,7 @@ class PanoSOTTracker:
             self.config.handcrafted_long_thin_low_score_gate_enabled
             and not self._deep_mode
             and self._small_target_bootstrap_long_thin_handcrafted()
-            and fallback_source not in {"flow", "long_thin_recovery"}
+            and fallback_source not in {"flow", "flow_hold", "long_thin_recovery"}
             and best_score < float(self.config.handcrafted_long_thin_low_score_gate_score)
             and self.state is not None
         ):
@@ -4308,7 +4476,7 @@ class PanoSOTTracker:
                 self._small_target_bootstrap_long_thin_handcrafted()
                 or fallback_source == "long_thin_recovery"
             )
-            and fallback_source in {"flow", "long_thin_recovery", "ncc", "spherical_ncc"}
+            and fallback_source in {"flow", "flow_hold", "long_thin_recovery", "ncc", "spherical_ncc"}
         ):
             self._accept_handcrafted_fallback(best_state)
 
@@ -6802,26 +6970,26 @@ class PanoSOTTracker:
                 self._long_thin_flow_failure_streak = (
                     0 if flow_reliable else self._long_thin_flow_failure_streak + 1
                 )
-                forced_global = (
-                    not flow_reliable
-                    and self.config.deep_fallback_flow_long_thin_global_ncc_enabled
-                    and self._long_thin_flow_failure_streak
-                        >= max(int(self.config.deep_fallback_flow_long_thin_global_ncc_loss_trigger), 2)
+            forced_global = (
+                not flow_reliable
+                and self.config.deep_fallback_flow_long_thin_global_ncc_enabled
+                and self._long_thin_flow_failure_streak
+                    >= max(int(self.config.deep_fallback_flow_long_thin_global_ncc_loss_trigger), 2)
+            )
+            if forced_global:
+                global_state, global_score, global_reliable = self._predict_with_global_long_thin_ncc(
+                    frame,
+                    self._hand_state or predicted,
+                    gray=gray,
+                    force=True,
                 )
-                if forced_global:
-                    global_state, global_score, global_reliable = self._predict_with_global_long_thin_ncc(
-                        frame,
-                        self._hand_state or predicted,
-                        gray=gray,
-                        force=True,
-                    )
-                    if global_reliable:
-                        self.runtime_stats.fallback_ncc_results += 1
-                        self._ncc_bbox = self._state_to_output_bbox(
-                            global_state, self.frame_shape[1], self.frame_shape[0],
-                        ).astype(np.float32)
-                        self._long_thin_flow_failure_streak = 0
-                        return global_state, self._handcrafted_confidence(global_score, "ncc"), "ncc"
+                if global_reliable:
+                    self.runtime_stats.fallback_ncc_results += 1
+                    self._ncc_bbox = self._state_to_output_bbox(
+                        global_state, self.frame_shape[1], self.frame_shape[0],
+                    ).astype(np.float32)
+                    self._long_thin_flow_failure_streak = 0
+                    return global_state, self._handcrafted_confidence(global_score, "ncc"), "ncc"
             if flow_reliable:
                 self.runtime_stats.fallback_flow_results += 1
                 flow_score = self._score_state_handcrafted(frame, flow_state)
@@ -6964,7 +7132,11 @@ class PanoSOTTracker:
                         angular_height=flow_anchor.angular_height,
                     )
                     self.runtime_stats.fallback_flow_results += 1
-                    return predicted_flow, self.config.handcrafted_high_confidence, "flow"
+                    # This is a bounded prediction, not a new optical-flow
+                    # observation.  The caller uses the source label for
+                    # appearance arbitration but must not reset its failure
+                    # streak or append this delta to reliable history.
+                    return predicted_flow, self.config.handcrafted_high_confidence, "flow_hold"
         if self._color_hue is None and not (
             long_thin_flow and self.config.deep_fallback_flow_long_thin_disable_ncc
         ):
