@@ -641,6 +641,10 @@ class TrackerConfig:
     handcrafted_long_thin_flow_min_template_score: float = 0.045
     handcrafted_long_thin_flow_motion_max_ratio: float = 3.0
     handcrafted_long_thin_flow_motion_min_ratio: float = 0.05
+    handcrafted_long_thin_velocity_max_step_deg: float = 8.0
+    handcrafted_long_thin_reverse_motion_gate_enabled: bool = True
+    handcrafted_long_thin_reverse_motion_min_deg: float = 0.75
+    handcrafted_long_thin_flow_position_blend: float = 0.35
     handcrafted_long_thin_growth_search_enabled: bool = True
     handcrafted_long_thin_growth_search_frames: int = 40
     handcrafted_long_thin_growth_scale_factors: tuple[float, ...] = (
@@ -672,6 +676,11 @@ class TrackerConfig:
     handcrafted_long_thin_max_vertical_step_deg: float = 1.0
     handcrafted_long_thin_predict_on_flow_failure: bool = True
     handcrafted_long_thin_predict_max_failure_frames: int = 12
+    # Bound color/NCC recovery jumps in the elongated-target regime.
+    handcrafted_long_thin_color_max_jump_deg: float = 18.0
+    handcrafted_long_thin_color_min_fill_ratio: float = 0.12
+    handcrafted_long_thin_flow_min_motion_px: float = 0.75
+    handcrafted_long_thin_flow_max_motion_px: float = 180.0
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -2052,6 +2061,15 @@ class PanoSOTTracker:
         psr_factor = 0.25 + 0.75 * psr_factor
         return trust * psr_factor
 
+    def _long_thin_flow_score_floor(self) -> float:
+        """Return the minimum appearance score for a thin-flow result."""
+        return float(
+            min(
+                self.config.handcrafted_flow_template_score,
+                self.config.handcrafted_long_thin_flow_min_template_score,
+            )
+        )
+
     def _blend_state_position(
         self,
         anchor: SphereState,
@@ -2994,18 +3012,47 @@ class PanoSOTTracker:
                                 raw_flow_reliable = False
                                 self._last_flow_reliable = False
                                 self._last_flow_reject_reason = f"motion_gate:{ratio:.2f}"
+                    # LK can remain geometrically consistent after the target
+                    # has reversed, especially when the thin target is only a
+                    # small fraction of the ROI.  A weak appearance check is
+                    # not identity evidence; reject that observation and use
+                    # bounded temporal recovery instead of integrating its
+                    # stale direction.
+                    if (
+                        flow_reliable
+                        and long_thin_flow
+                        and self._last_flow_inlier_ratio < 0.60
+                        and self._last_flow_spread > 5.0
+                    ):
+                        flow_reliable = False
+                        raw_flow_reliable = False
+                        self._last_flow_reliable = False
+                        self._last_flow_reject_reason = "thin_weak_consensus"
+                    if flow_reliable and long_thin_flow and self.config.handcrafted_long_thin_reverse_motion_gate_enabled:
+                        reference = self._held_hand_velocity()
+                        measured = float(lon_distance(flow_state.lon, self.state.lon))
+                        if (
+                            reference is not None
+                            and abs(float(reference[0])) >= math.radians(0.25)
+                            and measured * float(reference[0]) < 0.0
+                            and abs(math.degrees(measured)) >= float(self.config.handcrafted_long_thin_reverse_motion_min_deg)
+                        ):
+                            flow_reliable = False
+                            self._last_flow_reliable = False
+                            self._last_flow_reject_reason = "reverse_motion"
                     if flow_reliable:
                         flow_score = self._score_state_handcrafted(frame, flow_state)
                         min_flow_score = (
-                            float(
-                                min(
-                                    self.config.handcrafted_flow_template_score,
-                                    self.config.handcrafted_long_thin_flow_min_template_score,
-                                )
-                            )
+                            self._long_thin_flow_score_floor()
                             if long_thin_flow else float(self.config.handcrafted_ncc_reliable_score)
                         )
                         if flow_score >= min_flow_score:
+                            if long_thin_flow:
+                                flow_state = self._blend_state_position(
+                                    self.state,
+                                    flow_state,
+                                    float(np.clip(self.config.handcrafted_long_thin_flow_position_blend, 0.0, 1.0)),
+                                )
                             best_state = flow_state
                             best_score = max(flow_score, self.config.handcrafted_high_confidence)
                             handcrafted_result = True
@@ -3044,13 +3091,24 @@ class PanoSOTTracker:
                             best_score = float(self.config.handcrafted_high_confidence)
                 if (
                     (not tiny_flow and not long_thin_flow)
-                    or (not flow_reliable and not long_thin_flow)
+                    or long_thin_flow
                 ):
                     ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame, gray=frame_gray)
                 else:
                     ncc_state = best_state if "best_state" in locals() else predicted
                     ncc_score = best_score if "best_score" in locals() else 0.0
                     ncc_reliable = False
+                if ncc_reliable:
+                    if long_thin_flow:
+                        ncc_jump_deg = abs(math.degrees(lon_distance(ncc_state.lon, self.state.lon)))
+                        if ncc_jump_deg > float(self.config.handcrafted_long_thin_color_max_jump_deg):
+                            ncc_reliable = False
+                            self._last_flow_reject_reason = f"ncc_jump:{ncc_jump_deg:.2f}"
+                        elif handcrafted_result and best_score >= 0.55 and ncc_score < best_score + 0.03:
+                            # Preserve a strong LK observation; let NCC take
+                            # over only when it provides a materially stronger
+                            # appearance match during reversal/recovery.
+                            ncc_reliable = False
                 if ncc_reliable:
                     best_state = ncc_state
                     best_score = self._handcrafted_confidence(ncc_score, "ncc")
@@ -3114,24 +3172,65 @@ class PanoSOTTracker:
                         best_state, best_score = self._local_search(frame, predicted)
             else:
                 frame_gray = self._handcrafted_gray(frame, assume_normalized=True)
+                long_thin_flow = bool(
+                    self._handcrafted_long_thin_flow_active()
+                    and self._previous_frame_gray is not None
+                )
                 flow_state, flow_reliable = self._predict_with_optical_flow(
                     frame, self.state, current_gray=frame_gray,
                 )
+                raw_flow_reliable = bool(flow_reliable)
+                if flow_reliable and long_thin_flow:
+                    reference = self._held_hand_velocity()
+                    measured = float(lon_distance(flow_state.lon, self.state.lon))
+                    if (
+                        reference is not None
+                        and abs(float(reference[0])) >= math.radians(0.25)
+                        and measured * float(reference[0]) < 0.0
+                        and abs(math.degrees(measured)) >= float(self.config.handcrafted_long_thin_reverse_motion_min_deg)
+                    ):
+                        flow_reliable = False
+                        self._last_flow_reliable = False
+                        self._last_flow_reject_reason = "reverse_motion"
+                if (
+                    flow_reliable
+                    and long_thin_flow
+                    and self._last_flow_inlier_ratio < 0.60
+                    and self._last_flow_spread > 5.0
+                ):
+                    flow_reliable = False
+                    self._last_flow_reliable = False
+                    self._last_flow_reject_reason = "thin_weak_consensus"
                 if flow_reliable and abs(math.degrees(lon_distance(
                     flow_state.lon, self._hand_state.lon if self._hand_state is not None else predicted.lon,
                 ))) <= float(self.config.deep_fallback_flow_long_thin_preprobe_max_lon_jump_deg):
                     flow_score = self._score_state_handcrafted(frame, flow_state)
-                    best_state = flow_state
-                    best_score = max(flow_score, self.config.handcrafted_high_confidence)
-                    handcrafted_result = True
-                    fallback_source = "flow"
-                    self.runtime_stats.fallback_flow_results += 1
-                    self.runtime_stats.fallback_accepts += 1
+                    min_flow_score = self._long_thin_flow_score_floor() if long_thin_flow else float(self.config.handcrafted_flow_template_score)
+                    if flow_score >= min_flow_score:
+                        if long_thin_flow:
+                            flow_state = self._blend_state_position(
+                                self.state, flow_state,
+                                float(np.clip(self.config.handcrafted_long_thin_flow_position_blend, 0.0, 1.0)),
+                            )
+                        best_state = flow_state
+                        best_score = max(flow_score, self.config.handcrafted_high_confidence)
+                        handcrafted_result = True
+                        fallback_source = "flow"
+                        self.runtime_stats.fallback_flow_results += 1
+                        self.runtime_stats.fallback_accepts += 1
+                    else:
+                        flow_reliable = False
+                        raw_flow_reliable = False
                 else:
                     color_state, color_reliable = self._predict_with_color(frame, predicted)
                     if color_reliable:
-                        best_state = color_state
-                        best_score = self.config.handcrafted_high_confidence
+                        if long_thin_flow:
+                            jump = abs(math.degrees(lon_distance(color_state.lon, self.state.lon)))
+                            if jump > float(self.config.handcrafted_long_thin_color_max_jump_deg):
+                                color_reliable = False
+                        if color_reliable:
+                            best_state = color_state
+                            best_score = self.config.handcrafted_high_confidence
                     else:
                         best_state, best_score = self._local_search(frame, predicted)
         else:
@@ -6010,6 +6109,9 @@ class PanoSOTTracker:
                 float(padding),
                 max(float(self.config.deep_fallback_flow_long_thin_padding), 0.05),
             )
+            # Fast elongated-target motion needs a larger LK pyramid/search
+            # context than the nominal 31px window.  Keep the ordinary path
+            # unchanged and only widen this dedicated regime.
         x0 = int(math.floor(x - padding * width))
         y0 = max(0, int(math.floor(y - padding * height)))
         x1 = int(math.ceil(x + (1.0 + padding) * width))
@@ -6071,6 +6173,9 @@ class PanoSOTTracker:
             return state, False
 
         lk_args = {
+            # Keep the proven LK settings for all regimes.  A wider window
+            # lets static ERP background corners dominate elongated targets
+            # and caused a measurable regression on 0096.
             "winSize": (31, 31),
             "maxLevel": 4,
             "criteria": (
@@ -6192,14 +6297,30 @@ class PanoSOTTracker:
                 -max_lat_step * image_height / math.pi,
                 max_lat_step * image_height / math.pi,
             ))
-            if abs(float(median_delta[0])) < float(
-                self.config.deep_fallback_flow_long_thin_min_motion_px
-            ):
+            min_motion_px = (
+                float(self.config.deep_fallback_flow_long_thin_min_motion_px)
+                if self._deep_mode
+                else float(self.config.handcrafted_long_thin_flow_min_motion_px)
+            )
+            if abs(float(median_delta[0])) < min_motion_px:
                 # A zero-motion LK consensus while the temporal anchor is
                 # moving is background consensus, not a valid target
                 # observation. Reject it so velocity is not collapsed.
                 self._last_flow_reject_reason = f"min_motion:{float(median_delta[0]):.3f}"
                 return state, False
+            max_motion_px = (
+                max(float(self.config.deep_fallback_flow_long_thin_min_motion_px) * 40.0, 180.0)
+                if self._deep_mode
+                else float(self.config.handcrafted_long_thin_flow_max_motion_px)
+            )
+            median_delta[0] = float(np.clip(median_delta[0], -max_motion_px, max_motion_px))
+            max_step = math.radians(max(float(self.config.handcrafted_long_thin_velocity_max_step_deg), 0.5))
+            measured_lon = float(median_delta[0]) / image_width * 2.0 * math.pi
+            if abs(measured_lon) > max_step:
+                median_delta[0] = float(
+                    np.clip(median_delta[0], -max_step * image_width / (2.0 * math.pi),
+                            max_step * image_width / (2.0 * math.pi))
+                )
         scale_x = 1.0
         scale_y = 1.0
         if (
@@ -6310,7 +6431,14 @@ class PanoSOTTracker:
         # Large-object flow can be geometrically consistent on background
         # regions. Reject implausibly large frame-to-frame jumps relative to
         # the projected target size; global relocalization can handle those.
-        max_motion_px = max(0.75 * target_short_px, 24.0)
+        # Very elongated targets can translate by more than their short side
+        # between ERP frames.  The old short-side cap rejected valid 40--60px
+        # motion in sequences such as 0075/0113, causing the tracker to hold
+        # the initial position indefinitely.  Use the dominant target extent
+        # only in the dedicated long-thin regime; ordinary targets retain the
+        # conservative short-side gate.
+        motion_extent = max(width, height) if long_thin_flow else target_short_px
+        max_motion_px = max(1.10 * motion_extent, 24.0)
         if float(np.linalg.norm(median_delta)) > max_motion_px:
             self._last_flow_reject_reason = f"jump:{float(np.linalg.norm(median_delta)):.2f}>{max_motion_px:.2f}"
             return state, False
