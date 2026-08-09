@@ -415,7 +415,9 @@ class TrackerConfig:
     # default; callers can still disable it for ablations.
     deep_fallback_flow_long_thin_enabled: bool = True
     deep_fallback_flow_long_thin_max_aspect_ratio: float = 6.0
-    deep_fallback_flow_long_thin_min_aspect_ratio: float = 2.5
+    # Include moderately elongated 20x39-style targets (aspect ~= 1.95),
+    # while still excluding near-square compact targets such as 0012.
+    deep_fallback_flow_long_thin_min_aspect_ratio: float = 1.90
     deep_fallback_flow_long_thin_max_init_short_pixels: float = 32.0
     deep_fallback_flow_long_thin_padding: float = 0.05
     deep_fallback_flow_long_thin_position_blend: float = 0.35
@@ -445,6 +447,18 @@ class TrackerConfig:
     deep_fallback_flow_long_thin_velocity_hold_min_ratio: float = 0.55
     deep_fallback_flow_long_thin_max_vertical_step_px: float = 8.0
     deep_fallback_flow_long_thin_max_lat_step_deg: float = 1.5
+    # Low-PSR deep peaks are not identity evidence for tiny elongated
+    # targets.  A peak that leaves the independently tracked handcrafted
+    # anchor by more than this bounded distance is treated as a background
+    # proposal; its scale may still be retained by the fallback arbitration.
+    deep_long_thin_low_psr_position_gate_enabled: bool = True
+    deep_long_thin_low_psr_max_anchor_gap_deg: float = 9.0
+    deep_long_thin_low_psr_max_anchor_lat_gap_deg: float = 5.0
+    deep_long_thin_low_psr_min_frame: int = 1
+    deep_long_thin_identity_gate_max_aspect_ratio: float = 3.0
+    deep_long_thin_early_relocalize_max_anchor_gap_deg: float = 12.0
+    deep_long_thin_early_relocalize_max_anchor_lat_gap_deg: float = 7.0
+    deep_long_thin_early_relocalize_end_frame: int = 40
     # Estimate horizontal growth from the validated foreground flow.  This is
     # restricted to the compact elongated regime and prevents rapid-approach
     # sequences from collapsing to the minimum box size.
@@ -630,6 +644,21 @@ class TrackerConfig:
     handcrafted_long_thin_scale_enabled: bool = True
     handcrafted_long_thin_scale_min: float = 0.98
     handcrafted_long_thin_scale_max: float = 1.60
+    handcrafted_long_thin_recovery_enabled: bool = True
+    handcrafted_long_thin_recovery_interval: int = 12
+    handcrafted_long_thin_recovery_min_frame: int = 20
+    handcrafted_long_thin_recovery_score: float = 0.24
+    handcrafted_long_thin_recovery_search_factor: float = 6.0
+    handcrafted_long_thin_recovery_max_jump_deg: float = 20.0
+    handcrafted_long_thin_recovery_direction_tolerance_deg: float = 70.0
+    handcrafted_long_thin_recovery_scale_min: float = 0.75
+    handcrafted_long_thin_recovery_scale_max: float = 2.5
+    handcrafted_long_thin_recovery_use_color: bool = False
+    handcrafted_long_thin_recovery_color_weight: float = 0.45
+    handcrafted_long_thin_low_score_gate_enabled: bool = True
+    handcrafted_long_thin_low_score_gate_score: float = 0.38
+    handcrafted_long_thin_low_score_gate_max_lon_deg: float = 3.5
+    handcrafted_long_thin_low_score_gate_max_lat_deg: float = 3.0
 
     # --- 小目标保护参数 ---
     small_target_threshold: float = 0.02
@@ -963,6 +992,7 @@ class PanoSOTTracker:
         # --- 手工模式独立状态（P1：不受深度漂移污染）---
         self._hand_state: SphereState | None = None
         self._hand_velocity = np.zeros(2, dtype=np.float32)
+        self._last_long_thin_recovery_frame = -10**9
         self._debug_recorder: TrackerDebugRecorder | None = None
         if self.config.debug_dir:
             self._debug_recorder = TrackerDebugRecorder(
@@ -1444,6 +1474,49 @@ class PanoSOTTracker:
             angular_height=hand_state.angular_height,
         )
 
+    def _long_thin_anchor_position_gate(
+        self,
+        candidate: SphereState,
+        *,
+        psr: float | None = None,
+    ) -> bool:
+        """Reject low-PSR proposals that have left the temporal thin-target anchor.
+
+        The long-thin fallback deliberately tolerates weak appearance scores,
+        but it must not accept a deep/background peak hundreds of pixels away
+        from the last independently validated motion.  This gate is limited
+        to the initialized elongated regime and therefore leaves compact and
+        ordinary targets unchanged.
+        """
+        if (
+            not self._deep_mode
+            or not self.config.deep_long_thin_low_psr_position_gate_enabled
+            or not self._small_target_bootstrap_long_thin()
+            or self._hand_state is None
+            or self._frame_count < max(int(self.config.deep_long_thin_low_psr_min_frame), 1)
+        ):
+            return True
+        if self._init_bbox_width_px is not None and self._init_bbox_height_px is not None:
+            short = min(float(self._init_bbox_width_px), float(self._init_bbox_height_px))
+            aspect = max(float(self._init_bbox_width_px), float(self._init_bbox_height_px)) / max(short, 1e-6)
+            if aspect > float(self.config.deep_long_thin_identity_gate_max_aspect_ratio):
+                return True
+        threshold = float(self.config.deep_fallback_psr_threshold if psr is None else psr)
+        if threshold >= float(self.config.deep_fallback_psr_threshold):
+            return True
+        lon_gap = abs(math.degrees(lon_distance(candidate.lon, self._hand_state.lon)))
+        lat_gap = abs(math.degrees(candidate.lat - self._hand_state.lat))
+        return bool(
+            lon_gap <= float(self.config.deep_long_thin_low_psr_max_anchor_gap_deg)
+            and lat_gap <= float(self.config.deep_long_thin_low_psr_max_anchor_lat_gap_deg)
+        )
+
+    def _update_hand_anchor_from_flow(self, state: SphereState) -> None:
+        """Commit a validated flow observation without trusting its scale."""
+        if self._hand_state is None:
+            return
+        self._accept_handcrafted_fallback(state)
+
     def _confirm_low_psr_fallback(
         self,
         predicted: SphereState,
@@ -1890,6 +1963,7 @@ class PanoSOTTracker:
     def _sync_semantic_recovery(self, frame: np.ndarray, state: SphereState) -> None:
         self.velocity[:] = 0.0
         self._hand_velocity[:] = 0.0
+        self._last_long_thin_recovery_frame = -10**9
         self._hand_state = state
         if self.frame_shape is None:
             return
@@ -2382,6 +2456,89 @@ class PanoSOTTracker:
             and aspect >= float(self.config.handcrafted_long_thin_flow_min_init_aspect_ratio)
         )
 
+    def _predict_long_thin_recovery(
+        self,
+        frame: np.ndarray,
+        predicted: SphereState,
+    ) -> tuple[SphereState, float] | None:
+        """Search a wide, motion-directed local window for a lost thin target.
+
+        This is deliberately handcrafted-only and rate-limited. It searches
+        around the independent temporal anchor, not the possibly contaminated
+        deep/local state, and keeps the candidate scale bounded relative to the
+        current state.
+        """
+        if (
+            self._deep_mode
+            or not self.config.handcrafted_long_thin_recovery_enabled
+            or not self._small_target_bootstrap_long_thin_handcrafted()
+            or self._frame_count < max(int(self.config.handcrafted_long_thin_recovery_min_frame), 1)
+            or self._frame_count - self._last_long_thin_recovery_frame
+                < max(int(self.config.handcrafted_long_thin_recovery_interval), 1)
+            or self.frame_shape is None
+            or self._hand_state is None
+        ):
+            return None
+        self._last_long_thin_recovery_frame = self._frame_count
+        anchor = self._hand_state
+        reference = self._hand_velocity.copy()
+        if not np.any(np.abs(reference) > 1e-6):
+            reference = self.velocity.copy()
+        fov_x, fov_y = self._handcrafted_match_fov(anchor)
+        factor = max(float(self.config.handcrafted_long_thin_recovery_search_factor), 1.0)
+        lon_step = max(abs(float(reference[0])) * 1.5, math.radians(2.0))
+        lat_step = max(abs(float(reference[1])) * 1.5, math.radians(1.5))
+        offsets_lon = np.linspace(-factor, factor, 9)
+        offsets_lat = np.linspace(-1.5, 1.5, 5)
+        base_w = anchor.equatorial_width
+        base_h = anchor.angular_height
+        best_state = anchor
+        best_score = -1.0
+        for ox in offsets_lon:
+            lon = wrap_lon(anchor.lon + float(ox) * lon_step)
+            for oy in offsets_lat:
+                lat = clamp_lat(anchor.lat + float(oy) * lat_step)
+                for scale in (0.85, 1.0, 1.35, 1.8):
+                    width = float(np.clip(
+                        base_w * scale,
+                        base_w * float(self.config.handcrafted_long_thin_recovery_scale_min),
+                        base_w * float(self.config.handcrafted_long_thin_recovery_scale_max),
+                    ))
+                    height = float(np.clip(
+                        base_h * scale,
+                        base_h * float(self.config.handcrafted_long_thin_recovery_scale_min),
+                        base_h * float(self.config.handcrafted_long_thin_recovery_scale_max),
+                    ))
+                    state = SphereState(lon, lat, width, height)
+                    score = max(
+                        self._score_state_handcrafted(frame, state),
+                        self._score_state_handcrafted_reference(frame, state),
+                    )
+                    if self.config.handcrafted_long_thin_recovery_use_color and self._color_hue is not None:
+                        color_state, color_ok = self._predict_with_color(frame, state)
+                        if color_ok:
+                            color_gap = abs(math.degrees(lon_distance(color_state.lon, state.lon)))
+                            if color_gap <= 8.0:
+                                score = max(
+                                    score,
+                                    (1.0 - float(self.config.handcrafted_long_thin_recovery_color_weight)) * score
+                                    + float(self.config.handcrafted_long_thin_recovery_color_weight) * self.config.handcrafted_high_confidence,
+                                )
+                    direction_penalty = 0.0
+                    if abs(float(reference[0])) > 1e-5:
+                        displacement = float(lon_distance(state.lon, anchor.lon))
+                        if displacement * float(reference[0]) < 0.0:
+                            direction_penalty += 0.08
+                    score -= direction_penalty
+                    if score > best_score:
+                        best_state, best_score = state, float(score)
+        if best_score < float(self.config.handcrafted_long_thin_recovery_score):
+            return None
+        jump = abs(math.degrees(lon_distance(best_state.lon, anchor.lon)))
+        if jump > float(self.config.handcrafted_long_thin_recovery_max_jump_deg):
+            return None
+        return best_state, best_score
+
     def _clamp_state_size(self, state: SphereState) -> SphereState:
         width, height = self._clamp_target_size(state.equatorial_width, state.angular_height)
         return SphereState(
@@ -2744,6 +2901,21 @@ class PanoSOTTracker:
                     flow_state, flow_reliable = self._predict_with_optical_flow(
                         frame, self.state, current_gray=frame_gray,
                     )
+                    if flow_reliable and long_thin_flow:
+                        reference = self._hand_velocity if np.any(
+                            np.abs(self._hand_velocity) > 1e-5
+                        ) else self.velocity
+                        measured = float(lon_distance(flow_state.lon, self.state.lon))
+                        ref_lon = float(reference[0])
+                        if abs(ref_lon) > 1e-5:
+                            ratio = abs(measured) / max(abs(ref_lon), 1e-6)
+                            if (
+                                ratio > 3.0
+                                or (measured * ref_lon < 0.0 and abs(measured) > math.radians(0.75))
+                            ):
+                                flow_reliable = False
+                                self._last_flow_reliable = False
+                                self._last_flow_reject_reason = f"motion_gate:{ratio:.2f}"
                     if flow_reliable:
                         flow_score = self._score_state_handcrafted(frame, flow_state)
                         min_flow_score = (
@@ -2972,6 +3144,25 @@ class PanoSOTTracker:
                 self._last_deep_probe_state = best_state
                 self._last_deep_probe_score = float(best_score)
                 deep_psr = float(self.runtime_stats.last_psr)
+                # A low-PSR deep proposal is not allowed to move an
+                # elongated target away from its independent temporal anchor.
+                # Keep its scale/score for arbitration, but use the predicted
+                # anchor position until a flow/NCC or later high-PSR probe
+                # provides identity evidence.
+                if (
+                    self._small_target_bootstrap_long_thin()
+                    and deep_psr < float(self.config.deep_fallback_psr_threshold)
+                    and self._hand_state is not None
+                    and not self._long_thin_anchor_position_gate(
+                        best_state, psr=deep_psr,
+                    )
+                ):
+                    best_state = SphereState(
+                        lon=self._hand_state.lon,
+                        lat=self._hand_state.lat,
+                        equatorial_width=best_state.equatorial_width,
+                        angular_height=best_state.angular_height,
+                    )
                 self._record_deep_probe_psr(deep_psr)
                 self.runtime_stats.deep_psr_samples += 1
                 self.runtime_stats.deep_psr_sum += deep_psr
@@ -3189,6 +3380,20 @@ class PanoSOTTracker:
                             # loss/relocalization state machine handle it.
                             best_state = predicted
                             best_score = deep_score_before_fallback
+        long_thin_recovery = self._predict_long_thin_recovery(frame, predicted)
+        if (
+            long_thin_recovery is not None
+            and (
+                not handcrafted_result
+                or self.lost_frames > 0
+            )
+        ):
+            best_state, best_score = long_thin_recovery
+            handcrafted_result = True
+            fallback_source = "long_thin_recovery"
+            flow_reliable = False
+            self.runtime_stats.fallback_local_search_results += 1
+
         if self._deep_mode and handcrafted_result and fallback_source == "ncc":
             if self._ncc_last_score < self.config.handcrafted_ncc_low_score_commit_threshold:
                 self._consecutive_low_ncc += 1
@@ -3477,6 +3682,12 @@ class PanoSOTTracker:
             tiny_bootstrap_relocalize = (
                 self.config.tiny_target_bootstrap_relocalize_enabled
                 and self._deep_mode
+                # For elongated tiny targets the global layer-12 peak is
+                # especially prone to selecting a repeated background patch
+                # during rapid approach.  The dedicated long-thin flow/NCC
+                # path is the safer bootstrap cue; defer global recovery
+                # until the normal long-sequence loss guards are active.
+                and not self._small_target_bootstrap_long_thin()
                 and self._init_bbox_width_px is not None
                 and self._init_bbox_height_px is not None
                 and min(self._init_bbox_width_px, self._init_bbox_height_px)
@@ -3580,6 +3791,48 @@ class PanoSOTTracker:
                 large_jump_early,
                 deep_relocalization,
             )
+            # In the compact elongated regime, a sharp global feature peak
+            # can still be a repeated background texture.  Do not teleport
+            # away from the independently validated handcrafted anchor unless
+            # the candidate is within the bounded local gate; a later probe or
+            # temporal flow can recover the target without contaminating the
+            # motion integrator.
+            if (
+                accept_relocalization
+                and deep_relocalization
+                and self._small_target_bootstrap_long_thin()
+                and not self._long_thin_anchor_position_gate(
+                    relocalized, psr=relocalized_psr,
+                )
+            ):
+                accept_relocalization = False
+                self.runtime_stats.relocalization_probe_rejects += 1
+            if (
+                accept_relocalization
+                and deep_relocalization
+                and self._small_target_bootstrap_long_thin()
+                and self._hand_state is not None
+                and (
+                    self._init_bbox_width_px is None
+                    or self._init_bbox_height_px is None
+                    or max(float(self._init_bbox_width_px), float(self._init_bbox_height_px))
+                        / max(min(float(self._init_bbox_width_px), float(self._init_bbox_height_px)), 1e-6)
+                        <= float(self.config.deep_long_thin_identity_gate_max_aspect_ratio)
+                )
+                and self._frame_count <= max(int(self.config.deep_long_thin_early_relocalize_end_frame), 1)
+            ):
+                anchor_lon_gap = abs(math.degrees(lon_distance(
+                    relocalized.lon, self._hand_state.lon,
+                )))
+                anchor_lat_gap = abs(math.degrees(
+                    relocalized.lat - self._hand_state.lat,
+                ))
+                if (
+                    anchor_lon_gap > float(self.config.deep_long_thin_early_relocalize_max_anchor_gap_deg)
+                    or anchor_lat_gap > float(self.config.deep_long_thin_early_relocalize_max_anchor_lat_gap_deg)
+                ):
+                    accept_relocalization = False
+                    self.runtime_stats.relocalization_probe_rejects += 1
             if (
                 not accept_relocalization
                 and deep_relocalization
@@ -3944,6 +4197,28 @@ class PanoSOTTracker:
                     angular_height=best_state.angular_height,
                 )
                 self.velocity[:] *= 0.25
+        if (
+            self.config.handcrafted_long_thin_low_score_gate_enabled
+            and not self._deep_mode
+            and self._small_target_bootstrap_long_thin_handcrafted()
+            and fallback_source not in {"flow", "long_thin_recovery"}
+            and best_score < float(self.config.handcrafted_long_thin_low_score_gate_score)
+            and self.state is not None
+        ):
+            jump_lon_deg = abs(math.degrees(lon_distance(best_state.lon, predicted.lon)))
+            jump_lat_deg = abs(math.degrees(best_state.lat - predicted.lat))
+            if (
+                jump_lon_deg > float(self.config.handcrafted_long_thin_low_score_gate_max_lon_deg)
+                or jump_lat_deg > float(self.config.handcrafted_long_thin_low_score_gate_max_lat_deg)
+            ):
+                best_state = SphereState(
+                    lon=predicted.lon,
+                    lat=predicted.lat,
+                    equatorial_width=best_state.equatorial_width,
+                    angular_height=best_state.angular_height,
+                )
+                self.velocity *= 0.5
+                self._last_local_jump_gated = True
         if fallback_budget_blocked and self.state is not None:
             # Freeze both the output and the motion integrator.  Otherwise a
             # low-confidence prediction (or the held reliable velocity) would
@@ -4022,6 +4297,20 @@ class PanoSOTTracker:
         self._record_scale_history(best_state, best_score, handcrafted_result)
         if semantic_recovery:
             self._sync_semantic_recovery(frame, best_state)
+
+        # Keep the independent handcrafted anchor synchronized outside deep
+        # mode as well. Otherwise long-thin recovery remains near the initial
+        # frame even after accepted optical-flow motion.
+        if (
+            not self._deep_mode
+            and handcrafted_result
+            and (
+                self._small_target_bootstrap_long_thin_handcrafted()
+                or fallback_source == "long_thin_recovery"
+            )
+            and fallback_source in {"flow", "long_thin_recovery", "ncc", "spherical_ncc"}
+        ):
+            self._accept_handcrafted_fallback(best_state)
 
         # P1 fix: 深度模式后台维护手工独立状态，避免完全失活
         anchor_sync = handcrafted_result and (
@@ -5453,6 +5742,17 @@ class PanoSOTTracker:
         )
         return self._score_patch(patch)
 
+    def _score_state_handcrafted_reference(self, frame: np.ndarray, state: SphereState) -> float:
+        """Score against the immutable initialization template only."""
+        if not self._templates:
+            return self._score_state_handcrafted(frame, state)
+        fov_x, fov_y = self._handcrafted_match_fov(state)
+        patch = tangent_patch(
+            frame, state.lon, state.lat, fov_x, fov_y,
+            self.config.template_size, self.config.template_size,
+        )
+        return float(np.mean(np.sum(self._descriptors[0] * patch_descriptor(patch), axis=1)))
+
     def _predict_with_optical_flow(
         self,
         frame: np.ndarray,
@@ -6418,7 +6718,16 @@ class PanoSOTTracker:
             and self._previous_frame_gray is not None
         )
 
-        if long_thin_flow and not self.config.deep_fallback_flow_long_thin_disable_ncc:
+        if (
+            long_thin_flow
+            and not self.config.deep_fallback_flow_long_thin_disable_ncc
+            and not (
+                self._deep_mode
+                and self.runtime_stats.last_psr < float(self.config.deep_fallback_psr_threshold)
+                and self._hand_state is not None
+                and self._low_quality_velocity_frames >= 2
+            )
+        ):
             global_recovery_due = (
                 self._long_thin_flow_failure_streak
                 >= max(int(self.config.deep_fallback_flow_long_thin_global_ncc_loss_trigger), 2)
