@@ -318,6 +318,14 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertEqual(handcrafted._template_update_rate("init", True), 0.0)
         self.assertEqual(deep._template_update_rate("init", True), 0.0)
 
+    def test_handcrafted_identity_guards_default_to_safe_ordering(self) -> None:
+        config = TrackerConfig()
+
+        self.assertTrue(config.handcrafted_flow_before_color_enabled)
+        self.assertTrue(config.handcrafted_ncc_before_color_enabled)
+        self.assertTrue(config.handcrafted_color_preserve_scale_enabled)
+        self.assertTrue(config.ncc_short_update_identity_gate_enabled)
+
     def test_low_confidence_deep_state_freezes_scale_after_position_guard(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))
         tracker._deep_mode = True

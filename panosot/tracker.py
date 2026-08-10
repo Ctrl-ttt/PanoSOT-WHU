@@ -266,6 +266,50 @@ class TrackerConfig:
     fallback_reliability_budget_confirmation_frames: int = 2
     fallback_reliability_budget_max_lon_step_deg: float = 5.0
     fallback_reliability_budget_max_lat_step_deg: float = 3.0
+    # A low-PSR optical-flow/NCC chain has no persistent identity evidence.
+    # Give long, initially thin targets a much shorter independent-motion
+    # budget than generic small targets.  Once that budget is spent, only a
+    # repeated, small displacement can advance the track; this prevents a
+    # background LK cluster from being integrated for hundreds of frames.
+    long_thin_identity_budget_enabled: bool = True
+    long_thin_identity_budget_start_frame: int = 4
+    long_thin_identity_budget_frames: int = 5
+    long_thin_identity_budget_after_low_probes: int = 2
+    long_thin_identity_budget_min_frames: int = 2
+    long_thin_identity_confirmation_frames: int = 2
+    long_thin_identity_max_lon_step_deg: float = 4.0
+    long_thin_identity_max_lat_step_deg: float = 2.5
+    # An NCC peak is allowed to replenish the budget only when the immutable
+    # initialization template still sees a strong response.  This is the
+    # identity escape hatch after a temporary freeze; adaptive short-template
+    # peaks alone never qualify.
+    long_thin_identity_ncc_rescue_enabled: bool = True
+    long_thin_identity_ncc_rescue_min_score: float = 0.78
+    long_thin_identity_ncc_rescue_min_initial_score: float = 0.66
+    long_thin_identity_anchor_score_enabled: bool = True
+    long_thin_identity_anchor_score_min: float = 0.56
+    long_thin_identity_anchor_score_margin: float = 0.05
+    long_thin_motion_extent_ratio: float = 0.75
+    long_thin_motion_reference_ratio: float = 1.45
+    long_thin_motion_history_ratio: float = 1.45
+    long_thin_recovery_probe_enabled: bool = False
+    long_thin_recovery_probe_interval: int = 8
+    long_thin_recovery_probe_min_lost_frames: int = 2
+    long_thin_recovery_probe_min_score: float = 0.62
+    long_thin_recovery_probe_min_psr: float = 2.0
+    long_thin_recovery_probe_max_jump_deg: float = 35.0
+    # When the deep probe and the identity-free LK/NCC fallback disagree,
+    # retain the deep position only if it is a plausible continuation of the
+    # established motion.  This fixes the common frame-4 handoff failure in
+    # long 360VOTS sequences without changing compact/healthy targets.
+    long_thin_probe_arbitration_enabled: bool = False
+    long_thin_probe_arbitration_min_score: float = 0.44
+    long_thin_probe_arbitration_min_psr: float = 1.05
+    long_thin_probe_arbitration_min_motion_ratio: float = 0.18
+    long_thin_probe_arbitration_max_motion_ratio: float = 2.20
+    long_thin_probe_arbitration_min_gap_px: float = 10.0
+    long_thin_probe_arbitration_blend: float = 0.78
+    long_thin_flow_position_blend_override: float = 0.0
     deep_ncc_scale_collapse_ratio: float = 0.55
     deep_probe_ncc_disagreement_lon_deg: float = 12.0
     deep_probe_ncc_disagreement_lat_deg: float = 8.0
@@ -422,6 +466,10 @@ class TrackerConfig:
     deep_fallback_flow_long_thin_padding: float = 0.05
     deep_fallback_flow_long_thin_position_blend: float = 0.35
     deep_fallback_flow_long_thin_disable_ncc: bool = False
+    # LK is the only temporally grounded cue for tiny elongated targets;
+    # probe it before NCC so a strong but stale correlation peak cannot steal
+    # the track during fast approach or direction changes.
+    deep_fallback_flow_long_thin_prefer_flow: bool = False
     deep_fallback_flow_long_thin_protect_position: bool = False
     deep_fallback_flow_long_thin_protect_frames: int = 20
     deep_fallback_flow_long_thin_relocalize_direction_gate: bool = False
@@ -544,6 +592,23 @@ class TrackerConfig:
     handcrafted_flow_small_target_scale_max: float = 5.00
     handcrafted_flow_template_score: float = 0.08
     handcrafted_color_enabled: bool = True
+    # Color segmentation is a useful recovery cue, but it has no temporal
+    # identity and can lock onto a much larger background component.  Keep
+    # optical flow/NCC ahead of color in the regular handcrafted path.
+    handcrafted_flow_before_color_enabled: bool = True
+    handcrafted_ncc_before_color_enabled: bool = True
+    # Connected components are poor scale estimators in cluttered ERP
+    # frames. Preserve the last trusted dimensions when color is used as a
+    # fallback; temporal/NCC branches remain responsible for scale updates.
+    handcrafted_color_preserve_scale_enabled: bool = True
+    handcrafted_color_max_jump_ratio: float = 2.0
+    handcrafted_color_max_area_ratio: float = 3.0
+    # A short NCC template is allowed to adapt only after the immutable
+    # initialization template corroborates its peak. This prevents a single
+    # background response from becoming self-reinforcing on cluttered 360VOT
+    # sequences while retaining the adaptive model for confirmed appearance
+    # changes.
+    ncc_short_update_identity_gate_enabled: bool = True
     handcrafted_color_hue_tolerance: float = 12.0
     handcrafted_color_min_saturation: int = 90
     handcrafted_color_min_value: int = 35
@@ -584,7 +649,7 @@ class TrackerConfig:
     handcrafted_ncc_parallel_workers: int = 4
     handcrafted_ncc_update_rate: float = 0.10
     handcrafted_ncc_update_score: float = 0.55
-    ncc_short_update_identity_gate_enabled: bool = False
+    # Kept enabled by default; duplicate legacy declaration removed.
     ncc_short_update_min_initial_score_gap: float = 0.08
     handcrafted_ncc_reliable_score: float = 0.35
     small_target_ncc_local_rescue_enabled: bool = True
@@ -948,6 +1013,11 @@ class PanoSOTTracker:
         self._last_verified_fallback: SphereState | None = None
         self._last_verified_fallback_source = ""
         self._verified_fallback_streak = 0
+        self._long_thin_identity_unverified_frames = 0
+        self._long_thin_identity_candidate: SphereState | None = None
+        self._long_thin_identity_candidate_source = ""
+        self._long_thin_identity_candidate_streak = 0
+        self._long_thin_recovery_probe_last_frame = -10**9
         self.num_templates = self.config.num_templates
 
 # --- 三模板类型标记 ---
@@ -993,6 +1063,11 @@ class PanoSOTTracker:
         self._last_verified_fallback = None
         self._last_verified_fallback_source = ""
         self._verified_fallback_streak = 0
+        self._long_thin_identity_unverified_frames = 0
+        self._long_thin_identity_candidate = None
+        self._long_thin_identity_candidate_source = ""
+        self._long_thin_identity_candidate_streak = 0
+        self._long_thin_recovery_probe_last_frame = -10**9
         self._last_deep_probe_state: SphereState | None = None
         self._last_deep_probe_score: float = 0.0
         self.runtime_stats = TrackerRuntimeStats()
@@ -1682,6 +1757,223 @@ class PanoSOTTracker:
         self.runtime_stats.fallback_budget_rejections += 1
         return False
 
+    def _long_thin_identity_budget_accepts(
+        self,
+        predicted: SphereState,
+        candidate: SphereState,
+        source: str,
+        *,
+        deep_verified: bool,
+    ) -> bool:
+        """Gate prolonged low-PSR fallback motion for elongated targets.
+
+        LK and NCC are useful local measurements, but after repeated
+        low-PSR deep probes they are not enough to establish identity.  This
+        deliberately narrow gate keeps the first few measurements responsive
+        (important for rapid motion), then asks for a repeated small motion
+        before allowing a background trajectory to keep advancing.
+        """
+        active = (
+            self._deep_mode
+            and self.config.long_thin_identity_budget_enabled
+            and self._small_target_bootstrap_long_thin()
+            and source in {"flow", "ncc", "color", "flow_hold"}
+            and self._frame_count >= max(
+                int(self.config.long_thin_identity_budget_start_frame), 1,
+            )
+        )
+        if not active:
+            return True
+        if deep_verified:
+            self._long_thin_identity_unverified_frames = 0
+            self._long_thin_identity_candidate = None
+            self._long_thin_identity_candidate_source = ""
+            self._long_thin_identity_candidate_streak = 0
+            return True
+
+        self._long_thin_identity_unverified_frames += 1
+        budget = max(int(self.config.long_thin_identity_budget_frames), 1)
+        if self._consecutive_low_deep_probes >= max(
+            int(self.config.long_thin_identity_budget_after_low_probes), 1,
+        ):
+            budget = min(
+                budget,
+                max(int(self.config.long_thin_identity_budget_min_frames), 1),
+            )
+        if self._long_thin_identity_unverified_frames <= budget:
+            return True
+
+        if (
+            source == "ncc"
+            and self.config.long_thin_identity_ncc_rescue_enabled
+            and self._ncc_last_score >= float(self.config.long_thin_identity_ncc_rescue_min_score)
+            and self.runtime_stats.ncc_initial_best_score
+                >= float(self.config.long_thin_identity_ncc_rescue_min_initial_score)
+        ):
+            self._long_thin_identity_unverified_frames = 0
+            self._long_thin_identity_candidate = None
+            self._long_thin_identity_candidate_source = ""
+            self._long_thin_identity_candidate_streak = 0
+            return True
+
+        max_lon = float(self.config.long_thin_identity_max_lon_step_deg)
+        max_lat = float(self.config.long_thin_identity_max_lat_step_deg)
+        small_step = (
+            abs(math.degrees(lon_distance(candidate.lon, predicted.lon))) <= max_lon
+            and abs(math.degrees(candidate.lat - predicted.lat)) <= max_lat
+        )
+        previous = self._long_thin_identity_candidate
+        consistent = (
+            previous is not None
+            and source == self._long_thin_identity_candidate_source
+            and abs(math.degrees(lon_distance(candidate.lon, previous.lon))) <= max_lon
+            and abs(math.degrees(candidate.lat - previous.lat)) <= max_lat
+        )
+        self._long_thin_identity_candidate_streak = (
+            self._long_thin_identity_candidate_streak + 1
+            if small_step and consistent else 1
+        )
+        self._long_thin_identity_candidate = candidate
+        self._long_thin_identity_candidate_source = source
+        required = max(int(self.config.long_thin_identity_confirmation_frames), 1)
+        if self._long_thin_identity_candidate_streak >= required:
+            return True
+        self.runtime_stats.fallback_budget_rejections += 1
+        return False
+
+    def _long_thin_anchor_score_accepts(
+        self,
+        frame: np.ndarray,
+        candidate: SphereState,
+        source: str,
+    ) -> bool:
+        """Require immutable appearance support before accepting a recovery.
+
+        The anchor is evaluated only for the small elongated deep branch and
+        only when a candidate has already exceeded its fallback budget.  It
+        is intentionally independent of the adaptive NCC template.
+        """
+        if not (
+            self._deep_mode
+            and self.config.long_thin_identity_anchor_score_enabled
+            and self._small_target_bootstrap_long_thin()
+            and source in {"flow", "ncc", "color", "flow_hold"}
+            and self._long_thin_identity_unverified_frames
+                > max(int(self.config.long_thin_identity_budget_frames), 1)
+        ):
+            return True
+        candidate_score = float(self._score_state_handcrafted_reference(frame, candidate))
+        anchor = self._hand_state or self.state
+        if anchor is None:
+            return False
+        anchor_score = float(self._score_state_handcrafted_reference(frame, anchor))
+        return bool(
+            candidate_score >= float(self.config.long_thin_identity_anchor_score_min)
+            and candidate_score >= anchor_score - float(self.config.long_thin_identity_anchor_score_margin)
+        )
+
+    def _long_thin_recovery_probe(
+        self,
+        frame: np.ndarray,
+        predicted: SphereState,
+    ) -> tuple[SphereState, float, float] | None:
+        """Recover a lost elongated target from an immutable deep template.
+
+        The normal relocalizer is intentionally conservative because a global
+        MobileNet peak can be a background repeat.  This probe is restricted
+        to an already-lost small elongated target and must beat both a high
+        correlation-score and PSR threshold before its normal jump checks
+        can accept it.
+        """
+        if not (
+            self._deep_mode
+            and self.config.long_thin_recovery_probe_enabled
+            and self._small_target_bootstrap_long_thin()
+            and self._frame_count - self._long_thin_recovery_probe_last_frame
+                >= max(int(self.config.long_thin_recovery_probe_interval), 1)
+            and max(self.lost_frames, self._occlusion_frames)
+                >= max(int(self.config.long_thin_recovery_probe_min_lost_frames), 1)
+        ):
+            return None
+        self._long_thin_recovery_probe_last_frame = self._frame_count
+        candidate, score, psr = self._global_relocalize(
+            frame, predicted, use_deep=True,
+        )
+        if (
+            score < float(self.config.long_thin_recovery_probe_min_score)
+            or psr < float(self.config.long_thin_recovery_probe_min_psr)
+        ):
+            return None
+        jump = abs(math.degrees(lon_distance(candidate.lon, predicted.lon)))
+        if jump > float(self.config.long_thin_recovery_probe_max_jump_deg):
+            return None
+        return candidate, float(score), float(psr)
+
+    def _arbitrate_long_thin_probe(
+        self,
+        frame: np.ndarray,
+        predicted: SphereState,
+        probe: SphereState,
+        probe_score: float,
+        fallback: SphereState,
+        fallback_score: float,
+    ) -> tuple[SphereState, float, bool]:
+        """Choose between a low-PSR deep proposal and LK/NCC fallback.
+
+        The fallback is identity-free and can jump to a coherent background
+        edge.  Conversely, a low-PSR deep peak can be a distractor.  A deep
+        proposal is therefore admitted only when it is spatially separated
+        from the fallback, keeps the established direction (or is a measured
+        reversal), and has a bounded step relative to recent velocity.  The
+        returned blend preserves sub-pixel temporal smoothness.
+        """
+        if not (
+            self._deep_mode
+            and self.config.long_thin_probe_arbitration_enabled
+            and self._small_target_bootstrap_long_thin()
+            and self.frame_shape is not None
+        ):
+            return fallback, float(fallback_score), False
+        psr = float(self.runtime_stats.last_psr)
+        if float(probe_score) < float(self.config.long_thin_probe_arbitration_min_score):
+            return fallback, float(fallback_score), False
+        if psr < float(self.config.long_thin_probe_arbitration_min_psr):
+            return fallback, float(fallback_score), False
+        h, w = self.frame_shape
+        gap_px = abs(float(lon_distance(probe.lon, fallback.lon))) / (2.0 * math.pi) * float(w)
+        if gap_px < float(self.config.long_thin_probe_arbitration_min_gap_px):
+            return fallback, float(fallback_score), False
+        reference = self._held_reliable_velocity()
+        if reference is None:
+            reference = self._held_hand_velocity()
+        if reference is None:
+            reference = self.velocity
+        ref_px = abs(float(reference[0])) / (2.0 * math.pi) * float(w)
+        probe_step_px = abs(float(lon_distance(probe.lon, self.state.lon))) / (2.0 * math.pi) * float(w) if self.state is not None else 0.0
+        fallback_step_px = abs(float(lon_distance(fallback.lon, self.state.lon))) / (2.0 * math.pi) * float(w) if self.state is not None else 0.0
+        if ref_px < 4.0 and self.state is not None and fallback_step_px >= 4.0:
+            probe_delta = float(lon_distance(probe.lon, self.state.lon))
+            fallback_delta = float(lon_distance(fallback.lon, self.state.lon))
+            # During bootstrap the measured fallback establishes the only
+            # trustworthy direction.  A deep peak moving the other way (or
+            # barely moving while LK reports a real displacement) is a
+            # background response, not an early recovery cue.
+            if probe_delta * fallback_delta <= 0.0 or probe_step_px < 0.45 * fallback_step_px:
+                return fallback, float(fallback_score), False
+        if ref_px >= 4.0:
+            ratio = probe_step_px / max(ref_px, 1e-6)
+            if ratio < float(self.config.long_thin_probe_arbitration_min_motion_ratio) or ratio > float(self.config.long_thin_probe_arbitration_max_motion_ratio):
+                return fallback, float(fallback_score), False
+            direction = float(lon_distance(probe.lon, self.state.lon)) if self.state is not None else 0.0
+            if abs(direction) > math.radians(1.0) and direction * float(reference[0]) < 0.0:
+                # Direction reversals are valid only when the deep peak is
+                # materially stronger than the identity-free fallback.
+                if float(probe_score) < float(fallback_score) + 0.04:
+                    return fallback, float(fallback_score), False
+        blend = float(np.clip(self.config.long_thin_probe_arbitration_blend, 0.0, 1.0))
+        chosen = self._blend_state_position(fallback, probe, blend)
+        return chosen, max(float(probe_score), float(fallback_score)), True
+
     def _semantic_descriptor(self, feature: Any) -> Any:
         torch = self.deep_extractor._torch
         descriptor = feature.float().mean(dim=(2, 3))
@@ -1719,7 +2011,7 @@ class PanoSOTTracker:
             and self.runtime_stats.deep_psr_samples > 0
             and self.runtime_stats.last_psr <= float(self.config.deep_semantic_long_thin_recovery_psr_threshold)
             and self._frame_count - self._last_semantic_proposal_frame
-                >= max(int(self.config.deep_semantic_long_thin_recovery_interval), 1)
+            >= max(int(self.config.deep_semantic_long_thin_recovery_interval), 1)
         )
         return (
             self._deep_mode
@@ -2023,6 +2315,10 @@ class PanoSOTTracker:
     def _sync_semantic_recovery(self, frame: np.ndarray, state: SphereState) -> None:
         self.velocity[:] = 0.0
         self._hand_velocity[:] = 0.0
+        self._long_thin_identity_unverified_frames = 0
+        self._long_thin_identity_candidate = None
+        self._long_thin_identity_candidate_source = ""
+        self._long_thin_identity_candidate_streak = 0
         self._last_long_thin_recovery_frame = -10**9
         self._hand_state = state
         if self.frame_shape is None:
@@ -2169,10 +2465,18 @@ class PanoSOTTracker:
                     reference_px = min(reference_px, history_reference * 1.35)
         bbox = self._state_to_output_bbox(anchor, image_width, image_height)
         dominant_extent = max(float(bbox[2]), float(bbox[3]))
+        history_speed_px = 0.0
+        if self._reliable_velocity_history:
+            history_speed_px = float(np.median(np.asarray(
+                [abs(float(v[0])) * image_width / (2.0 * math.pi)
+                 for v in self._reliable_velocity_history[-6:]],
+                dtype=np.float64,
+            )))
         max_step_px = max(
             24.0,
-            0.75 * dominant_extent,
-            2.0 * reference_px,
+            float(self.config.long_thin_motion_extent_ratio) * dominant_extent,
+            float(self.config.long_thin_motion_reference_ratio) * reference_px,
+            float(self.config.long_thin_motion_history_ratio) * history_speed_px,
         )
         max_step = max_step_px * (2.0 * math.pi) / max(float(image_width), 1.0)
         if abs(delta) <= max_step:
@@ -3172,7 +3476,14 @@ class PanoSOTTracker:
         preprobe_accepted = False
         frame_gray: np.ndarray | None = None
         if not self._deep_mode:
-            if self._color_hue is None:
+            # A color model is not an identity model.  When explicitly
+            # enabled, run the temporal handcrafted branch even if a hue was
+            # initialized; color remains a recovery cue below.
+            if (
+                self._color_hue is None
+                or self.config.handcrafted_flow_before_color_enabled
+                or self.config.handcrafted_ncc_before_color_enabled
+            ):
                 frame_gray = self._handcrafted_gray(frame, assume_normalized=True)
                 tiny_flow = bool(
                     self.config.handcrafted_tiny_flow_enabled
@@ -3217,6 +3528,7 @@ class PanoSOTTracker:
                     # not identity evidence; reject that observation and use
                     # bounded temporal recovery instead of integrating its
                     # stale direction.
+                    probe_arbitrated = False
                     if (
                         flow_reliable
                         and long_thin_flow
@@ -3292,7 +3604,8 @@ class PanoSOTTracker:
                             fallback_source = "flow_hold"
                             best_score = float(self.config.handcrafted_high_confidence)
                 if (
-                    (not tiny_flow and not long_thin_flow)
+                    self.config.handcrafted_ncc_before_color_enabled
+                    or (not tiny_flow and not long_thin_flow)
                     or long_thin_flow
                 ):
                     ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame, gray=frame_gray)
@@ -3455,6 +3768,29 @@ class PanoSOTTracker:
                         best_state, best_score = predicted, 0.0
                     else:
                         best_state, best_score = self._local_search(frame, predicted)
+                # Color is a recovery cue only.  It must run after temporal
+                # flow/NCC so a saturated background component cannot bypass
+                # the identity-preserving measurements above.
+                if (
+                    not handcrafted_result
+                    and self.config.handcrafted_color_enabled
+                    and self._color_hue is not None
+                ):
+                    color_state, color_reliable = self._predict_with_color(
+                        frame, predicted,
+                    )
+                    if color_reliable:
+                        color_score = self._score_state_handcrafted(frame, color_state)
+                        if color_score >= float(self.config.handcrafted_flow_template_score):
+                            best_state = color_state
+                            best_score = max(
+                                color_score,
+                                float(self.config.handcrafted_flow_template_score),
+                            )
+                            handcrafted_result = True
+                            fallback_source = "color"
+                            self.runtime_stats.fallback_color_results += 1
+                            self.runtime_stats.fallback_accepts += 1
             else:
                 frame_gray = self._handcrafted_gray(frame, assume_normalized=True)
                 long_thin_flow = bool(
@@ -3732,6 +4068,15 @@ class PanoSOTTracker:
                     )
                     if fallback_plausible else True
                 )
+                budget_ok = bool(
+                    budget_ok
+                    and self._long_thin_identity_budget_accepts(
+                        predicted, hand_state, fallback_source, deep_verified=False,
+                    )
+                    and self._long_thin_anchor_score_accepts(
+                        frame, hand_state, fallback_source,
+                    )
+                )
                 if (
                     fallback_plausible
                     and budget_ok
@@ -3752,6 +4097,12 @@ class PanoSOTTracker:
              else:
                 self._last_deep_probe_frame = self._frame_count
                 best_state, best_score = self._local_search(frame, predicted)
+                # Preserve the raw deep proposal before the long-thin
+                # low-PSR anchor gate rewrites its position.  Arbitration
+                # below needs to compare the actual deep hypothesis with the
+                # identity-free fallback, not the already-clamped anchor.
+                raw_deep_probe_state = best_state
+                raw_deep_probe_score = float(best_score)
                 self._last_deep_probe_state = best_state
                 self._last_deep_probe_score = float(best_score)
                 deep_psr = float(self.runtime_stats.last_psr)
@@ -3774,6 +4125,8 @@ class PanoSOTTracker:
                         equatorial_width=best_state.equatorial_width,
                         angular_height=best_state.angular_height,
                     )
+                    self._last_deep_probe_state = raw_deep_probe_state
+                    self._last_deep_probe_score = raw_deep_probe_score
                 self._record_deep_probe_psr(deep_psr)
                 self.runtime_stats.deep_psr_samples += 1
                 self.runtime_stats.deep_psr_sum += deep_psr
@@ -3874,8 +4227,42 @@ class PanoSOTTracker:
                     fallback_confirmed = self._confirm_low_psr_fallback(
                         predicted, hand_state, fallback_source,
                     )
+                    probe_arbitrated = False
+                    # A deep probe is especially valuable in the first
+                    # frames of a long-thin sequence, but only when it is a
+                    # plausible continuation of the motion.  Arbitrate the
+                    # two independent hypotheses before the generic fallback
+                    # budget freezes an already-drifting track.
+                    if (
+                        fallback_confirmed
+                        and fallback_source in {"flow", "ncc"}
+                        and self._last_deep_probe_state is not None
+                        and self._small_target_bootstrap_long_thin()
+                    ):
+                        arb_state, arb_score, arb_ok = self._arbitrate_long_thin_probe(
+                            frame,
+                            predicted,
+                            self._last_deep_probe_state,
+                            self._last_deep_probe_score,
+                            hand_state,
+                            hand_score,
+                        )
+                        if arb_ok:
+                            best_state, best_score = arb_state, arb_score
+                            # This is a measured fusion of the deep proposal
+                            # and the fallback; pass it through the measured
+                            # observation guard so low-PSR holding does not
+                            # erase the recovered motion.
+                            handcrafted_result = True
+                            fallback_source = "long_thin_probe"
+                            flow_reliable = False
+                            self.runtime_stats.fallback_accepts += 1
+                            self._last_ncc_reliable = False
+                            hand_state = arb_state
+                            hand_score = arb_score
+                            probe_arbitrated = True
                     fused_result = None
-                    if fallback_confirmed and fallback_source == "ncc":
+                    if not probe_arbitrated and fallback_confirmed and fallback_source == "ncc":
                         fused_result = self._fuse_deep_ncc_candidates(
                             self._last_deep_probe_state,
                             deep_score_before_fallback,
@@ -3883,7 +4270,9 @@ class PanoSOTTracker:
                             hand_state,
                             hand_score,
                         )
-                    if fused_result is not None:
+                    if probe_arbitrated:
+                        pass
+                    elif fused_result is not None:
                         best_state, best_score = fused_result
                         handcrafted_result = True
                         self.runtime_stats.fallback_accepts += 1
@@ -3949,6 +4338,18 @@ class PanoSOTTracker:
                             )
                             if fallback_plausible else True
                         )
+                        budget_ok = bool(
+                            budget_ok
+                            and self._long_thin_identity_budget_accepts(
+                                predicted,
+                                hand_state,
+                                fallback_source,
+                                deep_verified=not psr_low,
+                            )
+                            and self._long_thin_anchor_score_accepts(
+                                frame, hand_state, fallback_source,
+                            )
+                        )
                         if (
                             fallback_plausible
                             and budget_ok
@@ -3996,6 +4397,19 @@ class PanoSOTTracker:
             if prediction_from_held_velocity
             else self._predict_long_thin_recovery(frame, predicted)
         )
+        deep_long_thin_recovery = self._long_thin_recovery_probe(
+            frame, predicted,
+        )
+        if deep_long_thin_recovery is not None:
+            recovered_state, recovered_score, recovered_psr = deep_long_thin_recovery
+            best_state = recovered_state
+            best_score = recovered_score
+            handcrafted_result = False
+            fallback_source = ""
+            semantic_recovery = True
+            self.runtime_stats.last_psr = recovered_psr
+            self.runtime_stats.relocalization_accepts += 1
+            self._sync_semantic_recovery(frame, best_state)
         # A direction reversal is the characteristic failure mode of the
         # elongated 360VOTS sequences.  Run the bounded anchor search before
         # the broad recovery search and only replace an LK/NCC result when the
@@ -4782,7 +5196,7 @@ class PanoSOTTracker:
         if (
             self.config.deep_fallback_flow_long_thin_preserve_scale
             and self._small_target_bootstrap_long_thin()
-            and fallback_source in {"flow", "ncc", "color", "long_thin_reversal", "spherical_ncc"}
+            and fallback_source in {"flow", "ncc", "color", "long_thin_reversal", "long_thin_probe", "spherical_ncc"}
             and self.state is not None
         ):
             min_step = max(float(self.config.deep_fallback_flow_long_thin_min_scale_step), 0.5)
@@ -5011,7 +5425,7 @@ class PanoSOTTracker:
                 self._small_target_bootstrap_long_thin_handcrafted()
                 or fallback_source == "long_thin_recovery"
             )
-            and fallback_source in {"flow", "flow_hold", "long_thin_recovery", "long_thin_reversal", "ncc", "spherical_ncc", "color"}
+            and fallback_source in {"flow", "flow_hold", "long_thin_recovery", "long_thin_reversal", "long_thin_probe", "ncc", "spherical_ncc", "color"}
         ):
             self._accept_handcrafted_fallback(best_state)
 
@@ -5025,6 +5439,29 @@ class PanoSOTTracker:
             # handcrafted anchor; keeping the old anchor causes long-term
             # fallback drift in deep mode.
             self._accept_handcrafted_fallback(best_state)
+        elif (
+            self._deep_mode
+            and self._hand_state is not None
+            and self._small_target_bootstrap_long_thin()
+            and not handcrafted_result
+            and self._last_deep_probe_state is not None
+            and self._last_deep_probe_score >= float(self.config.long_thin_probe_arbitration_min_score)
+            and self.runtime_stats.last_psr >= float(self.config.long_thin_probe_arbitration_min_psr)
+        ):
+            # A qualified deep probe may recover the visible state after an
+            # NCC fallback is rejected.  Re-anchor the independent motion
+            # model here; otherwise the next fallback starts from the stale
+            # pre-recovery location and reintroduces long-sequence drift.
+            self._hand_velocity[0] = lon_distance(best_state.lon, self._hand_state.lon)
+            self._hand_velocity[1] = best_state.lat - self._hand_state.lat
+            self._hand_state = best_state
+        elif self._deep_mode and self._hand_state is not None and fallback_budget_blocked:
+            # The identity budget intentionally froze this frame.  Do not
+            # extrapolate the independent anchor with stale velocity while
+            # the visible state is held; that would silently move the next
+            # recovery gate away from the last accepted target identity.
+            self._hand_state = self.state
+            self._hand_velocity[:] = 0.0
         elif self._deep_mode and self._hand_state is not None:
             # 深度可信时（高分数 + 高PSR），手工速度跟随深度
             deep_reliable = (
@@ -5940,6 +6377,13 @@ class PanoSOTTracker:
             and self._frame_count <= max(int(self.config.small_target_bootstrap_frames), 0)
         ):
             allow_short_update = False
+        # Long-thin targets are highly ambiguous in ERP space; once a local
+        # matcher drifts, adapting its short template makes the error
+        # self-reinforcing for the remainder of a long sequence.  Keep the
+        # immutable initialization template as the only NCC appearance model
+        # for this narrowly scoped branch.
+        if self._small_target_bootstrap_long_thin():
+            allow_short_update = False
         if (
             self.config.ncc_short_update_identity_gate_enabled
             and best_source_name == "short"
@@ -6471,9 +6915,31 @@ class PanoSOTTracker:
         if best_box is None:
             return anchor, False
 
+        # Connected components can be many target widths away in a busy
+        # panorama. Reject such identity-free jumps before they influence
+        # the state or the color anchor.
+        candidate_center = best_box[:2] + 0.5 * best_box[2:4]
+        jump_x = abs(float(self._wrapped_pixel_delta(
+            candidate_center[0], center_x, float(image_width),
+        )))
+        jump_y = abs(float(candidate_center[1] - center_y))
+        max_jump_ratio = max(float(self.config.handcrafted_color_max_jump_ratio), 0.1)
+        if (
+            jump_x > max_jump_ratio * max(previous_box[2], 1.0)
+            or jump_y > max_jump_ratio * max(previous_box[3], 1.0)
+            or float(best_box[2] * best_box[3])
+                > float(previous_area) * max(float(self.config.handcrafted_color_max_area_ratio), 1.0)
+        ):
+            self._last_color_reliable = False
+            return anchor, False
+
         max_scale = max(float(self.config.handcrafted_color_max_scale_step), 1.01)
-        width = float(np.clip(best_box[2], previous_box[2] / max_scale, previous_box[2] * max_scale))
-        height = float(np.clip(best_box[3], previous_box[3] / max_scale, previous_box[3] * max_scale))
+        if self.config.handcrafted_color_preserve_scale_enabled:
+            width = float(previous_box[2])
+            height = float(previous_box[3])
+        else:
+            width = float(np.clip(best_box[2], previous_box[2] / max_scale, previous_box[2] * max_scale))
+            height = float(np.clip(best_box[3], previous_box[3] / max_scale, previous_box[3] * max_scale))
         best_box[0] += 0.5 * (best_box[2] - width)
         best_box[1] += 0.5 * (best_box[3] - height)
         best_box[2] = width
@@ -7590,6 +8056,11 @@ class PanoSOTTracker:
             long_thin_flow
             and self.config.handcrafted_ncc_enabled
             and not self.config.deep_fallback_flow_long_thin_disable_ncc
+            and not (
+                self.config.deep_fallback_flow_long_thin_prefer_flow
+                and self._previous_frame_gray is not None
+            )
+            and (not self._deep_mode or self._ncc_last_score >= self.config.deep_fallback_anchor_ncc_min_score)
         ):
             old_factor = self.config.handcrafted_ncc_search_factor
             try:
@@ -7702,7 +8173,11 @@ class PanoSOTTracker:
                         1.0 if (
                             self.config.deep_fallback_flow_long_thin_protect_position
                             and self._frame_count <= max(int(self.config.deep_fallback_flow_long_thin_protect_frames), 0)
-                        ) else self.config.deep_fallback_flow_long_thin_position_blend,
+                        ) else (
+                            self.config.long_thin_flow_position_blend_override
+                            if self.config.long_thin_flow_position_blend_override > 0.0
+                            else self.config.deep_fallback_flow_long_thin_position_blend
+                        ),
                         0.0,
                         1.0,
                     ))
@@ -7903,6 +8378,14 @@ class PanoSOTTracker:
             if is_small
             else self.config.deep_search_enlarge
         )
+        # Long-thin targets need a wider first-stage search than the generic
+        # compact-target window.  Their inter-frame displacement can exceed
+        # several target widths before the appearance model has warmed up.
+        if self._small_target_bootstrap_long_thin():
+            search_enlarge = min(
+                max(float(search_enlarge) * 1.65, float(search_enlarge)),
+                math.radians(150.0),
+            )
 
         scale_factors = (
             self.config.small_target_deep_scale_factors
