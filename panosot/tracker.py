@@ -277,7 +277,7 @@ class TrackerConfig:
     long_thin_identity_budget_after_low_probes: int = 2
     long_thin_identity_budget_min_frames: int = 2
     long_thin_identity_confirmation_frames: int = 2
-    long_thin_identity_max_lon_step_deg: float = 4.0
+    long_thin_identity_max_lon_step_deg: float = 12.0
     long_thin_identity_max_lat_step_deg: float = 2.5
     # An NCC peak is allowed to replenish the budget only when the immutable
     # initialization template still sees a strong response.  This is the
