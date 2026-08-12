@@ -372,6 +372,11 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="每序列最多处理帧数（0 表示全部）。",
     )
+    parser.add_argument(
+        "--deep-relocalize-anchor-verify",
+        action="store_true",
+        help="P2: 重定位候选与独立手工锚交叉验证，拒绝远离可信锚位置的高分假阳性（治 0027 帧40 / 0057）。",
+    )
     return parser.parse_args()
 
 
@@ -511,6 +516,7 @@ def main() -> None:
         ),
         deep_ncc_jump_requires_direction_reversal=args.deep_ncc_jump_reversal_only,
         deep_ncc_jump_min_abs_lat_deg=args.deep_ncc_jump_min_abs_lat_deg,
+        deep_relocalize_hand_anchor_verify_enabled=args.deep_relocalize_anchor_verify,
     )
 
     deep_extractor = None

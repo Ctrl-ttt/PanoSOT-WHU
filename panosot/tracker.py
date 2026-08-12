@@ -249,6 +249,19 @@ class TrackerConfig:
     deep_relocalize_persistent_low_probe_count: int = 3
     deep_relocalize_consistency_deg: float = 8.0
     deep_relocalize_consistency_attempts: int = 2
+    # P2: 重定位身份一致性校验（治 0027 帧40 / 0057 背景假阳性）。
+    # 全局重定位候选只在自身 score/PSR 上被验证，可能选中背景高响应区域；
+    # 当 NCC/flow 手工锚仍可信（分数不低）且候选远离锚位置时，拒绝该候选，
+    # 避免跳错后永久丢失。
+    deep_relocalize_hand_anchor_verify_enabled: bool = False
+    deep_relocalize_hand_anchor_max_lon_gap_deg: float = 25.0
+    deep_relocalize_hand_anchor_max_lat_gap_deg: float = 15.0
+    deep_relocalize_hand_anchor_min_ncc_score: float = 0.45
+    # 锚可信度的距离信号：手工锚与当前可见状态经度差不超过该值即认为
+    # 锚仍在跟踪同一目标（deep 高 PSR 模式下 NCC/flow 分数信号常不可用）。
+    deep_relocalize_hand_anchor_max_state_lon_gap_deg: float = 25.0
+    # 拒绝候选的例外：最近本地 deep 探针支持该位置。
+    deep_relocalize_hand_anchor_allow_probe_support: bool = True
     small_target_warmup_hold_enabled: bool = True
     relocalize_use_longterm_anchor: bool = True
     relocalize_reset_min_psr: float = 2.50
@@ -875,6 +888,10 @@ class TrackerRuntimeStats:
     relocalization_score_rejects: int = 0
     relocalization_jump_rejects: int = 0
     relocalization_probe_rejects: int = 0
+    relocalization_anchor_rejects: int = 0
+    relocalization_anchor_entered: int = 0
+    relocalization_anchor_unreliable: int = 0
+    relocalization_anchor_within_gap: int = 0
     last_relocalization_psr: float = 0.0
     fallback_attempts: int = 0
     fallback_accepts: int = 0
@@ -1125,6 +1142,8 @@ class PanoSOTTracker:
         # --- 手工模式独立状态（P1：不受深度漂移污染）---
         self._hand_state: SphereState | None = None
         self._hand_velocity = np.zeros(2, dtype=np.float32)
+        # P2: 最近一次手工 fallback 的分数（锚可信度），用于重定位身份一致性校验。
+        self._last_hand_anchor_score = 0.0
         self._last_long_thin_recovery_frame = -10**9
         self._long_thin_global_candidate: SphereState | None = None
         self._long_thin_global_candidate_streak = 0
@@ -1188,6 +1207,10 @@ class PanoSOTTracker:
             "relocalization_score_rejects": stats.relocalization_score_rejects,
             "relocalization_jump_rejects": stats.relocalization_jump_rejects,
             "relocalization_probe_rejects": stats.relocalization_probe_rejects,
+            "relocalization_anchor_rejects": stats.relocalization_anchor_rejects,
+            "relocalization_anchor_entered": stats.relocalization_anchor_entered,
+            "relocalization_anchor_unreliable": stats.relocalization_anchor_unreliable,
+            "relocalization_anchor_within_gap": stats.relocalization_anchor_within_gap,
             "last_relocalization_psr": stats.last_relocalization_psr,
             "relocalization_interval": self._current_relocalization_interval(),
             "consecutive_relocalization_rejects": self._consecutive_relocalization_rejects,
@@ -4055,6 +4078,7 @@ class PanoSOTTracker:
                 )
                 flow_reliable = fallback_source == "flow"
                 self.runtime_stats.fallback_hand_score_sum += float(hand_score)
+                self._last_hand_anchor_score = float(hand_score)
                 fallback_confirmed = self._confirm_low_psr_fallback(
                     predicted, hand_state, fallback_source,
                 )
@@ -4189,6 +4213,7 @@ class PanoSOTTracker:
                     )
                     flow_reliable = fallback_source == "flow"
                     self.runtime_stats.fallback_hand_score_sum += float(hand_score)
+                    self._last_hand_anchor_score = float(hand_score)
                     probe_disagrees = self._deep_probe_disagrees_with_ncc(
                         hand_state,
                         fallback_source,
@@ -5050,6 +5075,61 @@ class PanoSOTTracker:
                         # target motion; otherwise keep the temporal anchor.
                         accept_relocalization = False
                         self.runtime_stats.relocalization_probe_rejects += 1
+            if (
+                accept_relocalization
+                and deep_relocalization
+                and self.config.deep_relocalize_hand_anchor_verify_enabled
+                and self._hand_state is not None
+            ):
+                # P2: 独立手工锚交叉验证。全局重定位候选可能只是背景高响应
+                # 假阳性（自身 PSR 高但远离真实目标）。锚可信度的判定：
+                # (a) 手工锚与当前可见状态接近（锚仍在跟踪同一目标），或
+                # (b) 最近手工 fallback 分数不低（NCC/flow 活跃时）。
+                # 锚可信且候选远离锚位置时拒绝该候选，避免跳错后永久丢失；
+                # 最近本地 deep 探针明确支持该位置时放行。
+                anchor_state_lon_gap = abs(math.degrees(lon_distance(
+                    self._hand_state.lon, self.state.lon,
+                )))
+                anchor_reliable = bool(
+                    anchor_state_lon_gap
+                        <= float(self.config.deep_relocalize_hand_anchor_max_state_lon_gap_deg)
+                    or self._last_hand_anchor_score
+                        >= float(self.config.deep_relocalize_hand_anchor_min_ncc_score)
+                )
+                if not anchor_reliable:
+                    self.runtime_stats.relocalization_anchor_unreliable += 1
+                self.runtime_stats.relocalization_anchor_entered += 1
+                if self.config.deep_relocalize_hand_anchor_verify_enabled:
+                    print(
+                        f"[P2gate] fr={self._frame_count} accept={accept_relocalization} "
+                        f"anchor_state_lon={anchor_state_lon_gap:.1f} "
+                        f"hand_score={self._last_hand_anchor_score:.3f} "
+                        f"cand_lon={float(np.degrees(relocalized.lon)):.1f} "
+                        f"cand_lat={float(np.degrees(relocalized.lat)):.1f} "
+                        f"hand_lon={float(np.degrees(self._hand_state.lon)):.1f} "
+                        f"state_lon={float(np.degrees(self.state.lon)):.1f}",
+                        flush=True,
+                    )
+                if anchor_reliable:
+                    anchor_lon_gap = abs(math.degrees(lon_distance(
+                        relocalized.lon, self._hand_state.lon,
+                    )))
+                    anchor_lat_gap = abs(math.degrees(
+                        relocalized.lat - self._hand_state.lat,
+                    ))
+                    if (
+                        anchor_lon_gap > float(self.config.deep_relocalize_hand_anchor_max_lon_gap_deg)
+                        or anchor_lat_gap > float(self.config.deep_relocalize_hand_anchor_max_lat_gap_deg)
+                    ):
+                        probe_support = bool(
+                            self.config.deep_relocalize_hand_anchor_allow_probe_support
+                            and self._recent_deep_probe_supports_jump(relocalized)
+                        )
+                        if not probe_support:
+                            accept_relocalization = False
+                            self.runtime_stats.relocalization_anchor_rejects += 1
+                    else:
+                        self.runtime_stats.relocalization_anchor_within_gap += 1
             if accept_relocalization:
                 preserved_long_thin_velocity = None
                 if (
