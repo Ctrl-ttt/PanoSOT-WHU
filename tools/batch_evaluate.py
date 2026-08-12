@@ -377,6 +377,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="P2: 重定位候选与独立手工锚交叉验证，拒绝远离可信锚位置的高分假阳性（治 0027 帧40 / 0057）。",
     )
+    parser.add_argument(
+        "--deep-fallback-ncc-arbitration",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="P3: deep 低 PSR fallback 时用 NCC 全局观测与 flow 仲裁，打破速度锁定（治 0057 渐进漂移）。默认开启，可用 --no-deep-fallback-ncc-arbitration 关闭。",
+    )
     return parser.parse_args()
 
 
@@ -517,6 +523,11 @@ def main() -> None:
         deep_ncc_jump_requires_direction_reversal=args.deep_ncc_jump_reversal_only,
         deep_ncc_jump_min_abs_lat_deg=args.deep_ncc_jump_min_abs_lat_deg,
         deep_relocalize_hand_anchor_verify_enabled=args.deep_relocalize_anchor_verify,
+        deep_fallback_ncc_arbitration_enabled=(
+            args.deep_fallback_ncc_arbitration
+            if args.deep_fallback_ncc_arbitration is not None
+            else TrackerConfig.deep_fallback_ncc_arbitration_enabled
+        ),
     )
 
     deep_extractor = None

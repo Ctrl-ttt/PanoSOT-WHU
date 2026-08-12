@@ -465,6 +465,17 @@ class TrackerConfig:
     deep_fallback_color_enabled: bool = False
     deep_fallback_color_min_identity_score: float = 0.20
     deep_fallback_ncc_before_color_enabled: bool = False
+    # P3: 0057 渐进漂移抑制。deep 低 PSR fallback 走 flow-first 分支时，
+    # flow 在局部窗口内跟丢（目标加速机动后点取自背景），观测只剩背景
+    # 位移，系统纯靠速度外推永久偏移（"速度锁定"）。开启后把 NCC 作为
+    # 独立全局观测与 flow 仲裁：NCC 分数足够高且其位移与 flow 显著冲突
+    # （方向相反或量级悬殊）时采信 NCC。6 序列消融已验证仅 0057 生效
+    # （+0.2772 AUC）、其余零回归；默认开启，代价为 FPS 约减半。
+    deep_fallback_ncc_arbitration_enabled: bool = True
+    # NCC 参与仲裁的最低分数（诊断实测 0057 有效帧 NCC score 0.62-0.79）。
+    deep_fallback_ncc_arbitration_min_score: float = 0.45
+    # NCC 与 flow 位移冲突判定的最小角度差（度）。
+    deep_fallback_ncc_arbitration_min_delta_deg: float = 5.0
     deep_fallback_flow_use_appearance_score: bool = True
     deep_fallback_flow_appearance_compact_only: bool = True
     # Long-thin targets are a dominant failure mode in 360VOTS (for example
@@ -900,6 +911,8 @@ class TrackerRuntimeStats:
     fallback_confident_wrong_triggers: int = 0
     fallback_flow_results: int = 0
     fallback_ncc_results: int = 0
+    ncc_arbitration_attempts: int = 0
+    ncc_arbitration_accepts: int = 0
     fallback_color_results: int = 0
     fallback_local_search_results: int = 0
     ncc_flow_disagreement_rejects: int = 0
@@ -1221,6 +1234,8 @@ class PanoSOTTracker:
             "fallback_confident_wrong_triggers": stats.fallback_confident_wrong_triggers,
             "fallback_flow_results": stats.fallback_flow_results,
             "fallback_ncc_results": stats.fallback_ncc_results,
+            "ncc_arbitration_attempts": stats.ncc_arbitration_attempts,
+            "ncc_arbitration_accepts": stats.ncc_arbitration_accepts,
             "fallback_color_results": stats.fallback_color_results,
             "fallback_local_search_results": stats.fallback_local_search_results,
             "ncc_flow_disagreement_rejects": stats.ncc_flow_disagreement_rejects,
@@ -8404,12 +8419,41 @@ class PanoSOTTracker:
                         self._last_deep_probe_state,
                         float(np.clip(self.config.deep_fallback_flow_probe_blend, 0.0, 1.0)),
                     )
+                if (
+                    self.config.deep_fallback_ncc_arbitration_enabled
+                    and self.config.handcrafted_ncc_enabled
+                ):
+                    ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame, gray=gray)
+                    if ncc_reliable:
+                        self.runtime_stats.ncc_arbitration_attempts += 1
+                        flow_anchor_state = self._hand_state or self.state
+                        if (
+                            flow_anchor_state is not None
+                            and ncc_score >= float(self.config.deep_fallback_ncc_arbitration_min_score)
+                        ):
+                            ncc_delta = float(lon_distance(ncc_state.lon, flow_anchor_state.lon))
+                            flow_delta = float(lon_distance(flow_state.lon, flow_anchor_state.lon))
+                            min_delta_deg = float(self.config.deep_fallback_ncc_arbitration_min_delta_deg)
+                            conflict = (
+                                abs(math.degrees(ncc_delta)) >= min_delta_deg
+                                and ncc_delta * flow_delta < 0.0
+                            ) or (
+                                abs(math.degrees(ncc_delta) - math.degrees(flow_delta))
+                                >= min_delta_deg
+                            )
+                            if conflict:
+                                self.runtime_stats.ncc_arbitration_accepts += 1
+                                self.runtime_stats.fallback_ncc_results += 1
+                                return ncc_state, self._handcrafted_confidence(ncc_score, "ncc"), "ncc"
                 return flow_state, (
                     float(flow_score)
                     if use_flow_appearance
                     else self._handcrafted_confidence(flow_score, "flow")
                 ), "flow"
-            if self.config.deep_fallback_ncc_before_color_enabled:
+            if (
+                self.config.deep_fallback_ncc_before_color_enabled
+                or self.config.deep_fallback_ncc_arbitration_enabled
+            ):
                 ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame, gray=gray)
                 if ncc_reliable:
                     self.runtime_stats.fallback_ncc_results += 1
