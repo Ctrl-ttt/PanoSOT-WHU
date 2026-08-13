@@ -153,6 +153,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="device (auto / cpu / cuda)")
     parser.add_argument("--backbone", default="mobilenet_v3_small", help="deep backbone")
     parser.add_argument("--max-frames", type=int, default=0, help="maximum frames; 0 means all")
+    parser.add_argument(
+        "--tiny-probe-growth-guard",
+        action="store_true",
+        help="P4: enable the tiny_probe_growth guard for diagnosis.",
+    )
     return parser.parse_args()
 
 
@@ -184,6 +189,7 @@ def analyze_one(
     device: str = "auto",
     backbone: str = "mobilenet_v3_small",
     max_frames: int = 0,
+    tiny_probe_growth_guard: bool = False,
 ) -> dict:
     seq_name = seq_dir.name
     image_dir = seq_dir / "image"
@@ -213,6 +219,7 @@ def analyze_one(
         deep_template_enlarge=4.0,
         confirmation_frames=2,
         update_quality_threshold=0.65,
+        tiny_probe_growth_guard_enabled=tiny_probe_growth_guard,
     )
     resolved_device = device
     if resolved_device == "auto":
@@ -390,6 +397,7 @@ def main() -> None:
         device=args.device,
         backbone=args.backbone,
         max_frames=args.max_frames,
+        tiny_probe_growth_guard=args.tiny_probe_growth_guard,
     )
 
 

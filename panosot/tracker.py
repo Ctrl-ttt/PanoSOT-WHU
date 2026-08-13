@@ -735,6 +735,14 @@ class TrackerConfig:
     # but elongated 20x39 targets should keep their initialized scale.
     small_target_growth_max_aspect_ratio: float = 1.5
     small_target_growth_max_init_pixels: float = 64.0
+    # P4: tiny_probe_growth 守卫（治 360VOTS 帧1）。极小目标 bootstrap 期，
+    # tiny_probe_growth 用 deep 多尺度提议覆盖 NCC——但 360VOTS 帧1 deep
+    # 提议（0.529 分，158×110 膨胀框）反而是错的，正确 NCC（0.707 分，
+    # 48×33，iou 0.637）仅因 0.72 门槛放行被覆盖，导致 550 帧全丢。
+    # 开启后：NCC 明显强于 deep（差值 > tiny_probe_growth_guard_max_deep_deficit）
+    # 时阻止覆盖，保留 NCC 独立观测。
+    tiny_probe_growth_guard_enabled: bool = True
+    tiny_probe_growth_guard_max_deep_deficit: float = 0.10
     handcrafted_tiny_flow_enabled: bool = False
     handcrafted_tiny_flow_max_init_short_pixels: float = 24.0
     handcrafted_tiny_flow_max_init_aspect_ratio: float = 1.5
@@ -928,6 +936,7 @@ class TrackerRuntimeStats:
     ncc_arbitration_attempts: int = 0
     ncc_arbitration_accepts: int = 0
     deep_probe_ncc_margin_arbitration_accepts: int = 0
+    tiny_probe_growth_guard_blocks: int = 0
     fallback_color_results: int = 0
     fallback_local_search_results: int = 0
     ncc_flow_disagreement_rejects: int = 0
@@ -1252,6 +1261,7 @@ class PanoSOTTracker:
             "ncc_arbitration_attempts": stats.ncc_arbitration_attempts,
             "ncc_arbitration_accepts": stats.ncc_arbitration_accepts,
             "deep_probe_ncc_margin_arbitration_accepts": stats.deep_probe_ncc_margin_arbitration_accepts,
+            "tiny_probe_growth_guard_blocks": stats.tiny_probe_growth_guard_blocks,
             "fallback_color_results": stats.fallback_color_results,
             "fallback_local_search_results": stats.fallback_local_search_results,
             "ncc_flow_disagreement_rejects": stats.ncc_flow_disagreement_rejects,
@@ -4443,25 +4453,46 @@ class PanoSOTTracker:
                         # still near the current prediction.  Holding the
                         # prediction here used to let a bad NCC/colour frame
                         # poison the motion state for many subsequent frames.
+                        # P4: 守卫——已采信的手工观测（handcrafted_result）明显
+                        # 强于 deep 提议时，禁止用更弱的 deep 覆盖（360VOTS 帧1：
+                        # NCC 0.707/48×33/iou 0.637 被 deep 0.529/158×110/iou 0.032
+                        # 的 probe recovery 覆盖，导致 550 帧全丢）。
+                        probe_recovery_guard_blocks = bool(
+                            self.config.tiny_probe_growth_guard_enabled
+                            and handcrafted_result
+                            and self._last_deep_probe_score is not None
+                            and float(self._last_deep_probe_score)
+                                < float(best_score)
+                                    - float(self.config.tiny_probe_growth_guard_max_deep_deficit)
+                        )
                         probe = self._last_deep_probe_state
                         probe_age = self._frame_count - self._last_deep_probe_frame
-                        if not fallback_budget_blocked and not (
-                            fallback_source in {"ncc", "flow"}
-                            and self._small_target_bootstrap_long_thin()
-                        ) and (
-                            probe is not None
-                            and probe_age <= max(int(self.config.deep_probe_interval) * 2, 1)
-                            and self._last_deep_probe_score >= self.config.deep_probe_ncc_min_deep_score
-                            and abs(math.degrees(lon_distance(probe.lon, predicted.lon)))
-                            <= self.config.deep_probe_recovery_max_lon_deg
-                            and abs(math.degrees(probe.lat - predicted.lat))
-                            <= self.config.deep_probe_recovery_max_lat_deg
+                        if (
+                            not fallback_budget_blocked
+                            and not probe_recovery_guard_blocks
+                            and not (
+                                fallback_source in {"ncc", "flow"}
+                                and self._small_target_bootstrap_long_thin()
+                            )
+                            and (
+                                probe is not None
+                                and probe_age <= max(int(self.config.deep_probe_interval) * 2, 1)
+                                and self._last_deep_probe_score >= self.config.deep_probe_ncc_min_deep_score
+                                and abs(math.degrees(lon_distance(probe.lon, predicted.lon)))
+                                <= self.config.deep_probe_recovery_max_lon_deg
+                                and abs(math.degrees(probe.lat - predicted.lat))
+                                <= self.config.deep_probe_recovery_max_lat_deg
+                            )
                         ):
                             best_state = probe
                             best_score = self._last_deep_probe_score
-                        elif not fallback_budget_blocked and not (
-                            fallback_source in {"ncc", "flow"}
-                            and self._small_target_bootstrap_long_thin()
+                        elif (
+                            not fallback_budget_blocked
+                            and not probe_recovery_guard_blocks
+                            and not (
+                                fallback_source in {"ncc", "flow"}
+                                and self._small_target_bootstrap_long_thin()
+                            )
                         ):
                             # Keep the prior motion prediction and let the
                             # loss/relocalization state machine handle it.
@@ -4570,6 +4601,17 @@ class PanoSOTTracker:
                 semantic_recovery = True
                 self._consecutive_low_ncc = 0
 
+        # P4: 守卫条件——NCC 独立观测明显强于 deep 提议（差值超过
+        # tiny_probe_growth_guard_max_deep_deficit）时，禁止 tiny_probe_growth
+        # 用 deep 覆盖 NCC。360VOTS 帧1 deep 提议（0.529 分，158×110 膨胀框）
+        # 远弱于正确 NCC（0.707 分，48×33），若覆盖则 550 帧全丢。
+        growth_guard_blocks = bool(
+            self.config.tiny_probe_growth_guard_enabled
+            and self._last_deep_probe_score is not None
+            and float(self._last_deep_probe_score)
+                < float(best_score) - float(self.config.tiny_probe_growth_guard_max_deep_deficit)
+        )
+
         # During the first frames of a tiny target, NCC can prefer the old
         # 19px appearance even when the deep multi-scale probe has already
         # found the expanding object.  Prefer that independent probe only in
@@ -4594,7 +4636,11 @@ class PanoSOTTracker:
             # growth probe wins this bounded warm-up unless NCC is unusually
             # strong.
             and best_score < 0.72
+            # P4: NCC 独立观测明显强于 deep 提议时，禁止 deep 覆盖（守卫）。
+            and not growth_guard_blocks
         )
+        if growth_guard_blocks:
+            self.runtime_stats.tiny_probe_growth_guard_blocks += 1
         if tiny_probe_growth:
             # Keep all independent trackers on the same identity after the
             # deep probe wins.  Without this synchronization, NCC may retain
@@ -4639,12 +4685,24 @@ class PanoSOTTracker:
         # first few frames.  Reject a large low-PSR jump in that warm-up
         # window; retain the motion prediction while allowing any trusted
         # scale estimate to survive.
+        # P4: warmup-hold 守卫——当已提交的手工观测（handcrafted_result）明显强
+        # 于 deep 提议时，禁止 hold 把位置钉回 motion prediction（360VOTS 帧1：
+        # NCC 位置正确 iou 0.637，hold 钉回 init 位置 iou 0.21，且 velocity 恒 0
+        # 导致后续帧冻结在 init）。
+        warmup_hold_blocks = bool(
+            self.config.tiny_probe_growth_guard_enabled
+            and handcrafted_result
+            and self._last_deep_probe_score is not None
+            and float(self._last_deep_probe_score)
+                < float(best_score) - float(self.config.tiny_probe_growth_guard_max_deep_deficit)
+        )
         if (
             self._deep_mode
             and self.config.small_target_warmup_hold_enabled
             and self._small_target_bootstrap_due(predicted)
             and self._frame_count <= max(int(self.config.small_target_bootstrap_frames), 0)
             and self.runtime_stats.last_psr < self.config.deep_fallback_psr_threshold
+            and not warmup_hold_blocks
             and not (
                 # ERP-NCC is the temporally/appearance-grounded cue for
                 # compact elongated targets.  Do not erase its measured

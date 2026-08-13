@@ -395,6 +395,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="P3b: 深度提议 vs NCC 锚 margin 仲裁——probe 与 NCC 空间冲突时仅小分差不采信 deep，改采信 NCC 锚（治 0027 帧21）。",
     )
+    parser.add_argument(
+        "--tiny-probe-growth-guard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="P4: tiny_probe_growth 守卫——极小目标 bootstrap 期 NCC 独立观测明显强于 deep 提议时，禁止 deep 覆盖 NCC（治 360VOTS 帧1）。",
+    )
     return parser.parse_args()
 
 
@@ -549,6 +555,11 @@ def main() -> None:
             args.deep_probe_ncc_margin_arbitration
             if args.deep_probe_ncc_margin_arbitration is not None
             else TrackerConfig.deep_probe_ncc_margin_arbitration_enabled
+        ),
+        tiny_probe_growth_guard_enabled=(
+            args.tiny_probe_growth_guard
+            if args.tiny_probe_growth_guard is not None
+            else TrackerConfig.tiny_probe_growth_guard_enabled
         ),
     )
 
