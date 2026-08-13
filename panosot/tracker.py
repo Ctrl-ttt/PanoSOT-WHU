@@ -470,12 +470,18 @@ class TrackerConfig:
     # 位移，系统纯靠速度外推永久偏移（"速度锁定"）。开启后把 NCC 作为
     # 独立全局观测与 flow 仲裁：NCC 分数足够高且其位移与 flow 显著冲突
     # （方向相反或量级悬殊）时采信 NCC。6 序列消融已验证仅 0057 生效
-    # （+0.2772 AUC）、其余零回归；默认开启，代价为 FPS 约减半。
+    # （+0.2772 AUC）、其余零回归；默认开启。仅 last_psr <
+    # deep_fallback_psr_threshold（低 PSR 帧）才触发 NCC，高置信帧跳过
+    # 以降低 FPS 代价（0057 全程低 PSR，收益不受影响）。
     deep_fallback_ncc_arbitration_enabled: bool = True
     # NCC 参与仲裁的最低分数（诊断实测 0057 有效帧 NCC score 0.62-0.79）。
     deep_fallback_ncc_arbitration_min_score: float = 0.45
     # NCC 与 flow 位移冲突判定的最小角度差（度）。
     deep_fallback_ncc_arbitration_min_delta_deg: float = 5.0
+    # NCC 仲裁的帧间隔：>1 时跳过中间帧的 NCC 全局匹配以降低开销。
+    # 实测（0057）：interval=3 时 NCC 调用 -61%，FPS 0.92→1.33，
+    # AUC 0.3829→0.3880（不降反升），为最优权衡，故默认 3。
+    deep_fallback_ncc_arbitration_interval: int = 3
     deep_fallback_flow_use_appearance_score: bool = True
     deep_fallback_flow_appearance_compact_only: bool = True
     # Long-thin targets are a dominant failure mode in 360VOTS (for example
@@ -8422,6 +8428,8 @@ class PanoSOTTracker:
                 if (
                     self.config.deep_fallback_ncc_arbitration_enabled
                     and self.config.handcrafted_ncc_enabled
+                    and self.runtime_stats.last_psr < float(self.config.deep_fallback_psr_threshold)
+                    and self._frame_count % max(int(self.config.deep_fallback_ncc_arbitration_interval), 1) == 0
                 ):
                     ncc_state, ncc_score, ncc_reliable = self._predict_with_ncc(frame, gray=gray)
                     if ncc_reliable:

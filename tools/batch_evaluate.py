@@ -383,6 +383,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="P3: deep 低 PSR fallback 时用 NCC 全局观测与 flow 仲裁，打破速度锁定（治 0057 渐进漂移）。默认开启，可用 --no-deep-fallback-ncc-arbitration 关闭。",
     )
+    parser.add_argument(
+        "--deep-fallback-ncc-arbitration-interval",
+        type=int,
+        default=None,
+        help="P3: NCC 仲裁帧间隔，>1 时跳帧降开销（0057 全程低 PSR，间隔采样是有效的速度-精度权衡）。",
+    )
     return parser.parse_args()
 
 
@@ -527,6 +533,11 @@ def main() -> None:
             args.deep_fallback_ncc_arbitration
             if args.deep_fallback_ncc_arbitration is not None
             else TrackerConfig.deep_fallback_ncc_arbitration_enabled
+        ),
+        deep_fallback_ncc_arbitration_interval=(
+            args.deep_fallback_ncc_arbitration_interval
+            if args.deep_fallback_ncc_arbitration_interval is not None
+            else TrackerConfig.deep_fallback_ncc_arbitration_interval
         ),
     )
 
