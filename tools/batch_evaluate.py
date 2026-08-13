@@ -389,6 +389,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="P3: NCC 仲裁帧间隔，>1 时跳帧降开销（0057 全程低 PSR，间隔采样是有效的速度-精度权衡）。",
     )
+    parser.add_argument(
+        "--deep-probe-ncc-margin-arbitration",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="P3b: 深度提议 vs NCC 锚 margin 仲裁——probe 与 NCC 空间冲突时仅小分差不采信 deep，改采信 NCC 锚（治 0027 帧21）。",
+    )
     return parser.parse_args()
 
 
@@ -538,6 +544,11 @@ def main() -> None:
             args.deep_fallback_ncc_arbitration_interval
             if args.deep_fallback_ncc_arbitration_interval is not None
             else TrackerConfig.deep_fallback_ncc_arbitration_interval
+        ),
+        deep_probe_ncc_margin_arbitration_enabled=(
+            args.deep_probe_ncc_margin_arbitration
+            if args.deep_probe_ncc_margin_arbitration is not None
+            else TrackerConfig.deep_probe_ncc_margin_arbitration_enabled
         ),
     )
 

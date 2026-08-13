@@ -328,6 +328,14 @@ class TrackerConfig:
     deep_probe_ncc_disagreement_lat_deg: float = 8.0
     deep_probe_ncc_min_deep_score: float = 0.55
     deep_probe_ncc_override_margin: float = 0.05
+    # P3b: 深度提议 vs NCC 锚 margin 仲裁（治 0027 帧21）。现有 override_margin
+    # 仅 0.05：deep 提议分数略高就压过空间冲突的独立 NCC 锚，而低 PSR 的
+    # deep 峰常是背景假阳性（0027 帧21 deep 0.61 位置错 / NCC 0.49 位置对）。
+    # 开启后：probe_disagrees 时要求 deep 分数高出 NCC 至少
+    # deep_probe_ncc_override_high_margin 才采信 deep，否则采信 NCC 锚。
+    # 6 序列消融：0027 +0.0225 AUC（+28%）、0057 微增，其余零回归，默认开启。
+    deep_probe_ncc_margin_arbitration_enabled: bool = True
+    deep_probe_ncc_override_high_margin: float = 0.20
     deep_probe_recovery_max_lon_deg: float = 14.0
     deep_probe_recovery_max_lat_deg: float = 10.0
     # A global deep peak must remain close to the latest independent probe;
@@ -919,6 +927,7 @@ class TrackerRuntimeStats:
     fallback_ncc_results: int = 0
     ncc_arbitration_attempts: int = 0
     ncc_arbitration_accepts: int = 0
+    deep_probe_ncc_margin_arbitration_accepts: int = 0
     fallback_color_results: int = 0
     fallback_local_search_results: int = 0
     ncc_flow_disagreement_rejects: int = 0
@@ -1242,6 +1251,7 @@ class PanoSOTTracker:
             "fallback_ncc_results": stats.fallback_ncc_results,
             "ncc_arbitration_attempts": stats.ncc_arbitration_attempts,
             "ncc_arbitration_accepts": stats.ncc_arbitration_accepts,
+            "deep_probe_ncc_margin_arbitration_accepts": stats.deep_probe_ncc_margin_arbitration_accepts,
             "fallback_color_results": stats.fallback_color_results,
             "fallback_local_search_results": stats.fallback_local_search_results,
             "ncc_flow_disagreement_rejects": stats.ncc_flow_disagreement_rejects,
@@ -4361,11 +4371,30 @@ class PanoSOTTracker:
                             )
                             best_score = self._last_deep_probe_score
                         else:
-                            best_state, best_score = (
-                                self._last_deep_probe_state,
-                                self._last_deep_probe_score,
+                            margin_arbitrated = bool(
+                                self.config.deep_probe_ncc_margin_arbitration_enabled
+                                and fallback_confirmed
+                                and fallback_source == "ncc"
+                                and hand_state is not None
+                                and self._last_deep_probe_score < float(hand_score)
+                                    + float(self.config.deep_probe_ncc_override_high_margin)
                             )
-                            handcrafted_result = False
+                            if margin_arbitrated:
+                                # The deep proposal conflicts with the
+                                # independent NCC anchor but only beats it by
+                                # a small margin; the low-PSR deep peak is
+                                # usually a background false positive, so keep
+                                # the identity anchor instead.
+                                best_state, best_score = hand_state, hand_score
+                                handcrafted_result = True
+                                self.runtime_stats.fallback_accepts += 1
+                                self.runtime_stats.deep_probe_ncc_margin_arbitration_accepts += 1
+                            else:
+                                best_state, best_score = (
+                                    self._last_deep_probe_state,
+                                    self._last_deep_probe_score,
+                                )
+                                handcrafted_result = False
                     else:
                         fallback_plausible = bool(
                             fallback_confirmed
