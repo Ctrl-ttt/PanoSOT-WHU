@@ -127,7 +127,7 @@ class HybridTrackerTests(unittest.TestCase):
         from panosot.io import load_image
 
         frame = load_image(
-            Path("data/360VOTS_unpacked/0060/image/000000.jpg"),
+            Path("data/360VOTS/image/000000.jpg"),
         )
         tracker = PanoSOTTracker()
         safe = tracker._handcrafted_gray(frame)
