@@ -237,5 +237,11 @@ tmp_*/
 tmp_debug_*/
 tmp_smoke/
 
+# Local diagnostic/scratch files (work-in-progress analysis)
+_*.diff
+_*.py
+_*.txt
+submission_test/
+
 # Streamlit
 .streamlit/secrets.toml
