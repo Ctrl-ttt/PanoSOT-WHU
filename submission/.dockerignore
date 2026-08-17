@@ -1,0 +1,13 @@
+# 构建上下文排除项: 保持镜像最小且避免 __pycache__ 污染(评测双稳态问题)
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.git/
+results/
+data/
+tools/
+docs/
+*.md
+*.json
+.cache/
+.venv/

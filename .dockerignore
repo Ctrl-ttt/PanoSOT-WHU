@@ -1,0 +1,13 @@
+# Build context exclusions: keep the image minimal and avoid __pycache__
+# pollution (causes deterministic-mode flips in evaluation).
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.git/
+results/
+data/
+tools/
+docs/
+.cache/
+.venv/
+submission_test/
