@@ -124,11 +124,15 @@ class HybridTrackerTests(unittest.TestCase):
             tracker._predict_with_ncc(first, gray=gray)
 
     def test_handcrafted_gray_fast_path_matches_safe_path(self) -> None:
-        from panosot.io import load_image
-
-        frame = load_image(
-            Path("data/360VOTS/image/000000.jpg"),
-        )
+        yy, xx = np.mgrid[0:64, 0:96]
+        frame = np.stack(
+            [
+                (xx % 255) / 255.0,
+                (yy % 255) / 255.0,
+                ((xx + yy) % 255) / 255.0,
+            ],
+            axis=-1,
+        ).astype(np.float32)
         tracker = PanoSOTTracker()
         safe = tracker._handcrafted_gray(frame)
         fast = tracker._handcrafted_gray(frame, assume_normalized=True)
@@ -253,6 +257,8 @@ class HybridTrackerTests(unittest.TestCase):
         tracker._frame_count = 25
         tracker._last_deep_probe_frame = 10
         tracker._consecutive_low_deep_probes = 3
+        tracker._init_bbox_width_px = 120.0
+        tracker._init_bbox_height_px = 60.0
         self.assertTrue(tracker._ncc_quarantined())
         self.assertTrue(tracker._deep_probe_due())
 
@@ -277,6 +283,8 @@ class HybridTrackerTests(unittest.TestCase):
             fallback_reliability_budget_confirmation_frames=2,
         ))
         tracker._deep_mode = True
+        tracker._init_bbox_width_px = 120.0
+        tracker._init_bbox_height_px = 60.0
         predicted = SphereState(0.0, 0.0, 0.1, 0.1)
         candidate = SphereState(math.radians(1.0), 0.0, 0.1, 0.1)
 
@@ -325,6 +333,11 @@ class HybridTrackerTests(unittest.TestCase):
         self.assertTrue(config.handcrafted_ncc_before_color_enabled)
         self.assertTrue(config.handcrafted_color_preserve_scale_enabled)
         self.assertTrue(config.ncc_short_update_identity_gate_enabled)
+
+    def test_handcrafted_scale_anchor_defaults_are_conservative(self) -> None:
+        config = TrackerConfig()
+        self.assertEqual(config.handcrafted_ncc_scale_anchor_score, 0.99)
+        self.assertEqual(config.handcrafted_ncc_scale_anchor_min_ratio, 1.0)
 
     def test_low_confidence_deep_state_freezes_scale_after_position_guard(self) -> None:
         tracker = PanoSOTTracker(TrackerConfig(use_deep_features=True))

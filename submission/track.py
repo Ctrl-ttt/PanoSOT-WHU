@@ -1,34 +1,61 @@
 #!/usr/bin/env python3
-"""PanoSOT-WHU 比赛提交入口。
+"""Competition submission entrypoint for PanoSOT-WHU.
 
-评测约定（与官方 demo 完全一致）：
-- 输入: DATASET_DIR(默认 /mnt/dataset), 每序列 {name}/{video.mp4, init.txt(BFoV)}
-- 输出: RESULT_DIR(默认 /mnt/result), 每序列 {name}.txt, 每行 clon,clat,fov_h,fov_v
-- 丢失帧输出 0,0,0,0 占位, 行号与帧号严格对应, 不跳过不留空行
-- 容器启动即自动跑完全部序列, 无需参数, 退出码 0
-
-内部: 在 ERP 平面用 PanoSOT-WHU 混合跟踪器(深度特征 + NCC/光流手工特征),
-仅在读入初始框与写出结果时做 BFoV <-> ERP 像素框转换(公式与官方 demo 一致)。
+The submission uses a conservative router:
+- default to the tuned handcrafted tracker
+- enable the deep tracker only for medium-sized, elongated targets where it
+  was the best local-validation branch
 """
+from __future__ import annotations
+
 import glob
 import os
 import sys
 import time
+from functools import lru_cache
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-if PROJECT_DIR not in sys.path:
-    sys.path.insert(0, PROJECT_DIR)
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR if (SCRIPT_DIR / "panosot").is_dir() else SCRIPT_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
+from panosot.models import build_similarity_head
+from panosot.tracker import PanoSOTTracker, TrackerConfig
 
 DATASET_DIR = os.environ.get("DATASET_DIR", "/mnt/dataset")
 RESULT_DIR = os.environ.get("RESULT_DIR", "/mnt/result")
 WEIGHTS_DIR = os.environ.get("WEIGHTS_DIR", "/app/weights")
 D2R = np.pi / 180.0
+DEEP_ADAPTER_CHECKPOINT = os.path.join(
+    WEIGHTS_DIR, "checkpoints", "local_bfov_adapter_layer12_t4_reg_cpu_1300.pt"
+)
+ISOTROPIC_HANDCRAFTED_SCALE_PAIRS = (
+    (0.85, 0.85),
+    (0.93, 0.93),
+    (1.0, 1.0),
+    (1.08, 1.08),
+    (1.16, 1.16),
+)
+
+# The router is intentionally conservative. On the local validation split it
+# selected only the sequence where the deep branch was clearly superior.
+DEEP_ROUTER_MIN_AREA_PX = 10000.0
+DEEP_ROUTER_MAX_AREA_PX = 24000.0
+DEEP_ROUTER_MIN_SHORT_PX = 80.0
+DEEP_ROUTER_MAX_SHORT_PX = 120.0
+DEEP_ROUTER_MIN_ASPECT = 1.8
+DEEP_ROUTER_TINY_MAX_AREA_PX = 7000.0
+DEEP_ROUTER_TINY_MAX_SHORT_PX = 70.0
+DEEP_ROUTER_TINY_MIN_ASPECT = 1.4
+DEEP_ROUTER_TINY_MAX_ASPECT = 1.9
+DEEP_ROUTER_MAX_ABS_LAT_DEG = 20.0
 
 
-# ---------- BFoV <-> ERP 像素框 转换（与官方 demo 一致） ----------
 def bfov_to_erp_box(clon, clat, fov_h, fov_v, img_w, img_h):
     coslat = max(np.cos(clat * D2R), 1e-6)
     w = (fov_h / coslat) / 360.0 * img_w
@@ -50,7 +77,6 @@ def erp_box_to_bfov(x, y, w, h, img_w, img_h):
     return clon, clat, fov_h, fov_v
 
 
-# ---------- 数据读取（与官方 demo 一致） ----------
 def find_video(seq_dir):
     vids = sorted(glob.glob(os.path.join(seq_dir, "*.mp4")))
     return vids[0] if vids else None
@@ -59,8 +85,8 @@ def find_video(seq_dir):
 def list_sequences(dataset_dir):
     seqlist = os.path.join(dataset_dir, "seqlist.txt")
     if os.path.isfile(seqlist):
-        with open(seqlist) as f:
-            return [ln.strip() for ln in f if ln.strip()]
+        with open(seqlist, encoding="utf-8-sig") as f:
+            return [ln.strip().lstrip("\ufeff") for ln in f if ln.strip().lstrip("\ufeff")]
     return sorted(
         d for d in os.listdir(dataset_dir)
         if os.path.isdir(os.path.join(dataset_dir, d))
@@ -69,53 +95,114 @@ def list_sequences(dataset_dir):
 
 
 def load_init_bfov(seq_dir):
-    with open(os.path.join(seq_dir, "init.txt")) as f:
-        p = f.readline().strip().replace(" ", "").split(",")
-    return [float(v) for v in p[:4]]  # clon, clat, fov_h, fov_v
+    with open(os.path.join(seq_dir, "init.txt"), encoding="utf-8-sig") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            tokens = stripped.replace(",", " ").split()
+            if len(tokens) < 4:
+                break
+            return [float(v) for v in tokens[:4]]
+    raise ValueError(f"No valid init BFoV found in {os.path.join(seq_dir, 'init.txt')}")
 
 
-# ---------- tracker ----------
-def make_tracker():
-    import torch
+def _should_use_deep_box(box_xywh: np.ndarray, clat_deg: float) -> bool:
+    x, y, w, h = [float(v) for v in np.asarray(box_xywh).reshape(4)]
+    if not np.all(np.isfinite([x, y, w, h])) or w <= 0.0 or h <= 0.0:
+        return False
+    short_side = min(w, h)
+    long_side = max(w, h)
+    area = w * h
+    aspect = long_side / max(short_side, 1e-6)
+    medium_elongated = (
+        area >= DEEP_ROUTER_MIN_AREA_PX
+        and area <= DEEP_ROUTER_MAX_AREA_PX
+        and short_side >= DEEP_ROUTER_MIN_SHORT_PX
+        and short_side <= DEEP_ROUTER_MAX_SHORT_PX
+        and aspect >= DEEP_ROUTER_MIN_ASPECT
+        and h >= w
+        and abs(float(clat_deg)) <= DEEP_ROUTER_MAX_ABS_LAT_DEG
+    )
+    tiny_moderate_aspect = (
+        area <= DEEP_ROUTER_TINY_MAX_AREA_PX
+        and short_side <= DEEP_ROUTER_TINY_MAX_SHORT_PX
+        and aspect >= DEEP_ROUTER_TINY_MIN_ASPECT
+        and aspect <= DEEP_ROUTER_TINY_MAX_ASPECT
+        and abs(float(clat_deg)) <= DEEP_ROUTER_MAX_ABS_LAT_DEG
+    )
+    return medium_elongated or tiny_moderate_aspect
 
-    from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
-    from panosot.models import build_similarity_head
-    from panosot.tracker import PanoSOTTracker, TrackerConfig
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def should_use_deep(init_bfov, img_w, img_h):
+    box = np.asarray(bfov_to_erp_box(*init_bfov, img_w, img_h), dtype=np.float32)
+    return _should_use_deep_box(box, float(init_bfov[1]))
+
+
+def _tracker_config(use_deep: bool, device: str) -> TrackerConfig:
     config = TrackerConfig()
-    # The competition submission must use the tuned deep tracker.  The
-    # tracker constructor defaults to handcrafted mode for backwards
-    # compatibility, and leaving this unset silently disables the whole
-    # MobileNet/XCorr pipeline (and all of its long-sequence drift guards).
-    config.use_deep_features = True
-    # These are the settings validated by the local 360VOTS tuning runs:
-    # faster confirmation/adaptation improves early localization while the
-    # independent initial-template anchor prevents the EMA chain from
-    # reinforcing a wrong match later in a long sequence.
-    config.deep_confirmation_frames = 2
-    config.deep_update_quality_threshold = 0.65
-    config.deep_template_update_ema = 0.08
-    config.deep_template_update_background = 0.02
-    config.deep_motion_momentum = 0.5
+    config.use_deep_features = bool(use_deep)
     config.device = device
+
+    if use_deep:
+        config.deep_confirmation_frames = 2
+        config.deep_update_quality_threshold = 0.65
+        config.deep_template_update_ema = 0.08
+        config.deep_template_update_background = 0.02
+        config.deep_motion_momentum = 0.5
+    else:
+        config.confirmation_frames = 2
+        config.update_quality_threshold = 0.65
+        config.handcrafted_ncc_scale_pairs = ISOTROPIC_HANDCRAFTED_SCALE_PAIRS
+        config.handcrafted_ncc_flow_every_frame = True
+        config.handcrafted_ncc_search_factor = 5.0
+    return config
+
+
+@lru_cache(maxsize=2)
+def _shared_deep_components(device: str) -> tuple[DeepFeatureExtractor, object]:
     feat_config = FeatureConfig(
-        backbone_name=config.backbone_name,
+        backbone_name="mobilenet_v3_small",
         device=device,
         use_amp=(device == "cuda"),
-        feature_layer=config.deep_feature_layer,
-        normalize_features=config.normalize_deep_features,
-        template_size=config.deep_template_size,
-        coarse_search_size=config.coarse_search_size,
-        refine_search_size=config.refine_search_size,
-        cache_dir=WEIGHTS_DIR,  # 断网环境: 权重已随镜像打包
+        feature_layer=12,
+        normalize_features=False,
+        template_size=112,
+        coarse_search_size=224,
+        refine_search_size=160,
+        cache_dir=WEIGHTS_DIR,
+        tracking_adapter_path=DEEP_ADAPTER_CHECKPOINT,
+        use_channels_last=(device == "cuda"),
+        cudnn_benchmark=(device == "cuda"),
     )
     deep_extractor = DeepFeatureExtractor(feat_config)
     similarity_head = build_similarity_head("depthwise_xcorr")
-    return PanoSOTTracker(
-        config=config,
-        deep_extractor=deep_extractor,
-        similarity_head=similarity_head,
+    return deep_extractor, similarity_head
+
+
+def make_tracker(use_deep: bool):
+    if use_deep:
+        try:
+            import torch
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            config = _tracker_config(True, device)
+            deep_extractor, similarity_head = _shared_deep_components(device)
+            return PanoSOTTracker(
+                config=config,
+                deep_extractor=deep_extractor,
+                similarity_head=similarity_head,
+            ), "deep"
+        except Exception as exc:
+            print(
+                f"[warn] deep tracker unavailable, falling back to handcrafted: {exc}",
+                file=sys.stderr,
+            )
+
+    device = "cpu"
+    config = _tracker_config(False, device)
+    return PanoSOTTracker(config=config, deep_extractor=None, similarity_head=None), (
+        "hand-fallback" if use_deep else "hand"
     )
 
 
@@ -125,21 +212,22 @@ def frame_from_cv(frame_bgr):
 
 
 def track_one_sequence(seq_dir):
-    """返回逐帧 BFoV 列表 [[clon,clat,fov_h,fov_v], ...]。"""
+    """Return per-frame BFoV predictions for one sequence."""
     video = find_video(seq_dir)
     if not video:
-        return []
+        return [], "missing_video"
 
     cap = cv2.VideoCapture(video)
     ok, first = cap.read()
     if not ok or first is None:
         cap.release()
-        return []
+        return [], "missing_first_frame"
 
     h, w = first.shape[:2]
     init_bfov = load_init_bfov(seq_dir)
     x, y, bw, bh = bfov_to_erp_box(*init_bfov, w, h)
     init_box = np.array([x, y, bw, bh], dtype=np.float64)
+    use_deep = should_use_deep(init_bfov, w, h)
 
     def frames():
         yield frame_from_cv(first)
@@ -149,12 +237,10 @@ def track_one_sequence(seq_dir):
                 break
             yield frame_from_cv(frame)
 
-    tracker = make_tracker()
+    tracker, actual_mode = make_tracker(use_deep)
     boxes = tracker.track_sequence(frames(), init_box)
     cap.release()
 
-    # 首帧强制用 init BFoV（erp_bbox_to_state/state_to_erp_bbox 对高纬
-    # 宽扁框非精确互逆，往返会引入像素偏差，首帧对齐 init 保证 IoU=1）。
     results = [list(init_bfov)]
     for box in boxes[1:]:
         if (
@@ -166,11 +252,11 @@ def track_one_sequence(seq_dir):
             results.append([0.0, 0.0, 0.0, 0.0])
         else:
             results.append(list(erp_box_to_bfov(*box, w, h)))
-    return results
+    return results, actual_mode
 
 
 def write_results(path, bfovs):
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for clon, clat, fh, fv in bfovs:
             f.write(f"{clon:.3f},{clat:.3f},{fh:.3f},{fv:.3f}\n")
 
@@ -179,29 +265,29 @@ def main():
     os.makedirs(RESULT_DIR, exist_ok=True)
     seqs = list_sequences(DATASET_DIR)
     if not seqs:
-        print(f"[错误] 在 {DATASET_DIR} 未找到任何序列", file=sys.stderr)
+        print(f"[error] no sequences found in {DATASET_DIR}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[PanoSOT-WHU] 待处理序列 {len(seqs)} 条,数据集={DATASET_DIR}")
+    print(f"[PanoSOT-WHU] processing {len(seqs)} sequences from {DATASET_DIR}")
     total_frames, t0 = 0, time.time()
     for idx, name in enumerate(seqs, 1):
         seq_dir = os.path.join(DATASET_DIR, name)
         ts = time.time()
-        bfovs = track_one_sequence(seq_dir)
+        bfovs, mode = track_one_sequence(seq_dir)
         write_results(os.path.join(RESULT_DIR, f"{name}.txt"), bfovs)
         total_frames += len(bfovs)
         dt = time.time() - ts
         fps = len(bfovs) / dt if dt > 0 else 0
         print(
-            f"  [{idx}/{len(seqs)}] {name}: {len(bfovs)} 帧, "
-            f"{dt:.2f}s ({fps:.1f} FPS)"
+            f"  [{idx}/{len(seqs)}] {name}: {len(bfovs)} frames, "
+            f"mode={mode}, {dt:.2f}s ({fps:.1f} FPS)"
         )
 
     total_dt = time.time() - t0
     avg = total_frames / total_dt if total_dt > 0 else 0
     print(
-        f"[PanoSOT-WHU] 全部完成: {total_frames} 帧 / {total_dt:.2f}s, "
-        f"平均 {avg:.1f} FPS,结果写入 {RESULT_DIR}"
+        f"[PanoSOT-WHU] done: {total_frames} frames / {total_dt:.2f}s, "
+        f"avg {avg:.1f} FPS, results written to {RESULT_DIR}"
     )
 
 

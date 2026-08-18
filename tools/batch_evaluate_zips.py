@@ -179,6 +179,11 @@ def main() -> None:
     parser.add_argument("--adaptive-deep-tiny-max-short-pixels", type=float, default=24.0)
     parser.add_argument("--adaptive-deep-tiny-max-aspect", type=float, default=1.5)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--cache-dir",
+        default=str(PROJECT_ROOT / ".cache" / "torch"),
+        help="Torch model cache directory for deep backbones.",
+    )
     parser.add_argument("--deep-feature-layer", type=int, default=12)
     parser.add_argument(
         "--deep-multiscale",
@@ -449,7 +454,7 @@ def main() -> None:
             use_channels_last=args.device.startswith("cuda"),
             cudnn_benchmark=args.device.startswith("cuda"),
             feature_layer=args.deep_feature_layer,
-            cache_dir=str(PROJECT_ROOT / ".cache" / "torch"),
+            cache_dir=args.cache_dir,
             tracking_adapter_path=(
                 str(args.tracking_adapter) if args.tracking_adapter is not None else None
             ),

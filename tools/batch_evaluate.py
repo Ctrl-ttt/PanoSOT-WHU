@@ -352,6 +352,11 @@ def parse_args() -> argparse.Namespace:
         help="计算设备 (auto / cpu / cuda)。",
     )
     parser.add_argument(
+        "--cache-dir",
+        default=str(Path(__file__).resolve().parents[1] / ".cache" / "torch"),
+        help="Torch model cache directory for deep backbones.",
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help="汇总结果输出路径（CSV）。默认打印到 stdout。",
@@ -583,7 +588,7 @@ def main() -> None:
             template_size=config.deep_template_size,
             coarse_search_size=config.coarse_search_size,
             refine_search_size=config.refine_search_size,
-            cache_dir=str(Path(__file__).resolve().parents[1] / ".cache" / "torch"),
+            cache_dir=args.cache_dir,
             tracking_adapter_path=args.tracking_adapter,
         )
         config.device = resolved_device

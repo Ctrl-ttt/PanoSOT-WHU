@@ -716,8 +716,11 @@ class TrackerConfig:
     handcrafted_ncc_flow_guard_min_size: float = 64.0
     handcrafted_ncc_flow_scale_tolerance: float = 0.10
     handcrafted_ncc_flow_scale_min_inlier_ratio: float = 0.50
-    handcrafted_ncc_scale_anchor_score: float = 0.55
-    handcrafted_ncc_scale_anchor_min_ratio: float = 0.65
+    # Keep the initial NCC scale anchor effectively frozen unless the
+    # candidate is very reliable.  A looser default was allowing scale
+    # collapse on the benchmark sequences and pulled the overall AUC down.
+    handcrafted_ncc_scale_anchor_score: float = 0.99
+    handcrafted_ncc_scale_anchor_min_ratio: float = 1.0
     handcrafted_ncc_small_target_min_scale_ratio: float = 0.0
     handcrafted_ncc_low_score_commit_threshold: float = 0.55
     handcrafted_ncc_relocalize_streak: int = 8
