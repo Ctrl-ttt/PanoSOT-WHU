@@ -279,6 +279,11 @@ class TrackerConfig:
     fallback_reliability_budget_confirmation_frames: int = 2
     fallback_reliability_budget_max_lon_step_deg: float = 5.0
     fallback_reliability_budget_max_lat_step_deg: float = 3.0
+    # Apply the generic fallback budget to medium/large elongated targets,
+    # where identity-free motion is a known long-sequence failure mode. Tiny
+    # targets already have their dedicated compact-target guards and should
+    # not be frozen by this broader budget.
+    fallback_reliability_budget_min_init_short_pixels: float = 48.0
     # A low-PSR optical-flow/NCC chain has no persistent identity evidence.
     # Give long, initially thin targets a much shorter independent-motion
     # budget than generic small targets.  Once that budget is spent, only a
@@ -1365,6 +1370,7 @@ class PanoSOTTracker:
         if (
             self._deep_mode
             and self.config.ncc_quarantine_enabled
+            and self._fallback_identity_drift_regime()
             and self._consecutive_low_deep_probes
                 >= max(int(self.config.ncc_quarantine_after_low_probe_count), 1)
         ):
@@ -1373,7 +1379,15 @@ class PanoSOTTracker:
 
     def _ncc_quarantined(self) -> bool:
         """Return whether adaptive NCC must be treated as a weak proposal."""
-        if not self._deep_mode or not self.config.ncc_quarantine_enabled:
+        if (
+            not self._deep_mode
+            or not self.config.ncc_quarantine_enabled
+            # Adaptive NCC is useful for ordinary compact targets.  Quarantine
+            # is specifically a long-thin identity-drift guard; applying it
+            # globally freezes valid appearance updates and hurts sequences
+            # whose target is not elongated.
+            or not self._fallback_identity_drift_regime()
+        ):
             return False
         return self._consecutive_low_deep_probes >= max(
             int(self.config.ncc_quarantine_after_low_probe_count), 1,
@@ -1771,6 +1785,11 @@ class PanoSOTTracker:
         if (
             not self._deep_mode
             or not self.config.fallback_reliability_budget_enabled
+            # The generic budget is intentionally scoped to the known
+            # long-thin drift regime.  A compact/ordinary target may need
+            # prolonged NCC/flow fallback, and freezing it globally lowers
+            # AUC even when there is no identity-free motion chain.
+            or not self._fallback_identity_drift_regime()
             or source not in {"flow", "ncc", "color"}
             or (
                 int(self.config.fallback_reliability_budget_start_frame) > 0
@@ -1820,6 +1839,22 @@ class PanoSOTTracker:
 
         self.runtime_stats.fallback_budget_rejections += 1
         return False
+
+    def _fallback_identity_drift_regime(self) -> bool:
+        """Whether the generic fallback budget should protect this target."""
+        if not self._deep_mode:
+            return False
+        if self._init_bbox_width_px is None or self._init_bbox_height_px is None:
+            return False
+        width = max(float(self._init_bbox_width_px), 1e-6)
+        height = max(float(self._init_bbox_height_px), 1e-6)
+        short = min(width, height)
+        aspect = max(width, height) / short
+        return bool(
+            short >= float(self.config.fallback_reliability_budget_min_init_short_pixels)
+            and aspect >= 1.5
+            and aspect <= 6.0
+        )
 
     def _long_thin_identity_budget_accepts(
         self,

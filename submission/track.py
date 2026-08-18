@@ -84,6 +84,20 @@ def make_tracker():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config = TrackerConfig()
+    # The competition submission must use the tuned deep tracker.  The
+    # tracker constructor defaults to handcrafted mode for backwards
+    # compatibility, and leaving this unset silently disables the whole
+    # MobileNet/XCorr pipeline (and all of its long-sequence drift guards).
+    config.use_deep_features = True
+    # These are the settings validated by the local 360VOTS tuning runs:
+    # faster confirmation/adaptation improves early localization while the
+    # independent initial-template anchor prevents the EMA chain from
+    # reinforcing a wrong match later in a long sequence.
+    config.deep_confirmation_frames = 2
+    config.deep_update_quality_threshold = 0.65
+    config.deep_template_update_ema = 0.08
+    config.deep_template_update_background = 0.02
+    config.deep_motion_momentum = 0.5
     config.device = device
     feat_config = FeatureConfig(
         backbone_name=config.backbone_name,
