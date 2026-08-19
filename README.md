@@ -124,3 +124,23 @@ python scripts/evaluate_otb.py --pred pred.txt --gt gt.txt --first-frame sequenc
 3. 在重定位阶段增加全景候选提议器，例如稀疏多尺度扫描或小目标检测头。
 4. 增加遮挡判别与模板库，减少长期更新造成的漂移。
 5. 面向决赛补 `Dockerfile`、批量评测接口和 FPS profiling。
+
+## SiamX360 可选后端
+
+`dev-new` 分支新增了 `SiamX360`：它将
+[360Tracking](https://github.com/HuajianUP/360Tracking) 的 ERP 全景取景思路
+移植到本项目的球面状态机中。它复用本项目的 seam-safe `tangent_patch`、
+深度 XCorr、长期模板与全局重定位，避免原项目 Python 3.7 / PyTorch 1.1 /
+旧 CUDA 算子的运行时冲突。
+
+默认提交行为不变。需要对比新后端时：
+
+```bash
+docker run --rm --gpus all \
+  -e PANOSOT_BACKEND=siamx360 \
+  -v <测试集>:/mnt/dataset:ro -v <输出>:/mnt/result <镜像>
+```
+
+该后端仍使用仓库内已打包的 MobileNet + 本地 BFoV adapter 权重；上游 SiamX
+预训练权重没有随其 GitHub 仓库公开发布，因此不会在构建时联网下载或将不可复现
+的权重引入提交镜像。

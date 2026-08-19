@@ -37,7 +37,12 @@ COPY submission/track.py track.py
 ENV DATASET_DIR=/mnt/dataset \
     RESULT_DIR=/mnt/result \
     WEIGHTS_DIR=/app/weights \
-    TORCH_HOME=/app/weights
+    TORCH_HOME=/app/weights \
+    PANOSOT_BACKEND=pano
+
+# Set PANOSOT_BACKEND=siamx360 at `docker run` time to enable the optional
+# 360Tracking-inspired ERP rectification backend.  The default remains the
+# validated PanoSOT router so existing submissions reproduce unchanged.
 
 # 容器启动即自动跑完全部序列, 无需额外参数
 ENTRYPOINT ["python3", "track.py"]

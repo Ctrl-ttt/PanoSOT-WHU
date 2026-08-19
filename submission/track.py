@@ -30,6 +30,7 @@ from panosot.tracker import PanoSOTTracker, TrackerConfig
 DATASET_DIR = os.environ.get("DATASET_DIR", "/mnt/dataset")
 RESULT_DIR = os.environ.get("RESULT_DIR", "/mnt/result")
 WEIGHTS_DIR = os.environ.get("WEIGHTS_DIR", "/app/weights")
+TRACKER_BACKEND = os.environ.get("PANOSOT_BACKEND", "pano").strip().lower()
 D2R = np.pi / 180.0
 DEEP_ADAPTER_CHECKPOINT = os.path.join(
     WEIGHTS_DIR, "checkpoints", "local_bfov_adapter_layer12_t4_reg_cpu_1300.pt"
@@ -181,6 +182,21 @@ def _shared_deep_components(device: str) -> tuple[DeepFeatureExtractor, object]:
 
 
 def make_tracker(use_deep: bool):
+    if TRACKER_BACKEND in {"siamx", "siamx360", "360tracking"}:
+        try:
+            from panosot.factory import build_tracker
+
+            device = "cuda" if _torch_cuda_available() else "cpu"
+            tracker = build_tracker(
+                backend="siamx360",
+                device=device,
+                cache_dir=WEIGHTS_DIR,
+                tracking_adapter_path=DEEP_ADAPTER_CHECKPOINT,
+            )
+            return tracker, "siamx360"
+        except Exception as exc:
+            print(f"[warn] SiamX360 backend unavailable, falling back: {exc}", file=sys.stderr)
+
     if use_deep:
         try:
             import torch
@@ -204,6 +220,15 @@ def make_tracker(use_deep: bool):
     return PanoSOTTracker(config=config, deep_extractor=None, similarity_head=None), (
         "hand-fallback" if use_deep else "hand"
     )
+
+
+def _torch_cuda_available():
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def frame_from_cv(frame_bgr):
