@@ -5,9 +5,16 @@ import unittest
 import numpy as np
 
 from submission.track import _should_use_deep_box, should_use_deep
+from tools.convert_train_dataset import bfov_to_pixel_boxes
 
 
 class SubmissionRouterTests(unittest.TestCase):
+    def test_bfov_conversion_expands_horizontal_extent_at_latitude(self) -> None:
+        equator = bfov_to_pixel_boxes(np.array([[0.0, 0.0, 20.0, 10.0]]), 3600, 1800)
+        high_lat = bfov_to_pixel_boxes(np.array([[0.0, 60.0, 20.0, 10.0]]), 3600, 1800)
+        self.assertAlmostEqual(float(equator[0, 2]), 200.0, places=4)
+        self.assertAlmostEqual(float(high_lat[0, 2]), 400.0, places=4)
+
     def test_routes_medium_tall_targets_to_deep(self) -> None:
         self.assertTrue(should_use_deep([0.0, 0.0, 21.0, 51.0], 1440, 720))
         self.assertTrue(

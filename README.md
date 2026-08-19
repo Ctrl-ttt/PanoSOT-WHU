@@ -144,3 +144,34 @@ docker run --rm --gpus all \
 该后端仍使用仓库内已打包的 MobileNet + 本地 BFoV adapter 权重；上游 SiamX
 预训练权重没有随其 GitHub 仓库公开发布，因此不会在构建时联网下载或将不可复现
 的权重引入提交镜像。
+
+## 本地 BFoV 数据集训练与验证
+
+`dev-new` 提供一键训练/验证脚本：
+
+```powershell
+$PY = "D:\PanoSOT\PanoSOT-WHU\.venv\Scripts\python.exe"
+& $PY tools\train_ys_panotracking.py `
+  --dataset "D:\PanoSOT\PanoSOT-WHU\data\ys_panotracking_train" `
+  --output-root "D:\PanoSOT\PanoSOT-WHU\results\ys_panotracking" `
+  --epochs 5 `
+  --batch-size 8 `
+  --max-samples 5000 `
+  --max-per-sequence 80 `
+  --delta 1 `
+  --sample-step 3 `
+  --device cuda
+```
+
+脚本会按序列做确定性留出验证，默认启用外观增强和特征保持正则，并比较
+adapter 前后的 AUC、成功率、mIoU 和 FPS。困难负样本和空间负样本仅应在
+留出集确认有收益后添加 `--hard-negatives` 或 `--spatial-negatives`。
+训练输出的 adapter 位于
+`results\ys_panotracking\ys_local_bfov_adapter.pt`，提交前复制到
+`submission\weights\checkpoints\`，再用 `--tracking-adapter` 或 Docker 提交入口加载。
+
+验证标签转换统一使用球面 ERP 几何：高纬度目标的 ERP 横向宽度会按
+`1 / cos(latitude)` 扩展，避免训练标签、验证标签和运行时输出不一致。
+
+原始压缩包可保留在 `D:\ys_panotracking_train.zip`；训练使用已经解压的
+`data\ys_panotracking_train`，不会修改原始 zip。

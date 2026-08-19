@@ -57,8 +57,15 @@ def bfov_to_pixel_boxes(boxes: np.ndarray, width: float, height: float) -> np.nd
     fov_v = boxes[:, 3]
     cx = (clon + 180.0) / 360.0 * width
     cy = (90.0 - clat) / 180.0 * height
-    w = fov_h / 360.0 * width
+    # In ERP, a fixed spherical horizontal FoV occupies more pixels as the
+    # target approaches either pole.  Keep this conversion identical to the
+    # runtime submission and local-BFoV training code; the old conversion
+    # omitted 1/cos(latitude), producing systematically narrow validation
+    # boxes for high-latitude targets.
+    cos_lat = np.maximum(np.cos(np.deg2rad(clat)), 1e-6)
+    w = fov_h / cos_lat / 360.0 * width
     h = fov_v / 180.0 * height
+    w = np.minimum(w, width)
     out = np.empty_like(boxes)
     out[:, 0] = cx - 0.5 * w
     out[:, 1] = cy - 0.5 * h
