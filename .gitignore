@@ -247,3 +247,4 @@ submission_test/
 .streamlit/secrets.toml
 /train
 .venv-cuda/
+.tmp-pip/
