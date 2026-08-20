@@ -26,6 +26,48 @@ class SphereState:
     angular_height: float
 
 
+def bfov_to_erp_bbox(
+    clon: float,
+    clat: float,
+    fov_h: float,
+    fov_v: float,
+    image_width: int,
+    image_height: int,
+) -> np.ndarray:
+    """Convert a BFoV box to an ERP ``x, y, w, h`` box.
+
+    The horizontal ERP width grows with latitude because a fixed spherical
+    horizontal FoV spans more pixels away from the equator.
+    """
+    cos_lat = max(math.cos(math.radians(float(clat))), 1e-6)
+    width = float(fov_h) / cos_lat / 360.0 * float(image_width)
+    height = float(fov_v) / 180.0 * float(image_height)
+    cx = ((float(clon) + 180.0) % 360.0) / 360.0 * float(image_width)
+    cy = (90.0 - float(clat)) / 180.0 * float(image_height)
+    x = float((cx - 0.5 * width) % float(image_width))
+    y = float(np.clip(cy - 0.5 * height, 0.0, float(image_height) - height))
+    return np.asarray([x, y, width, height], dtype=np.float32)
+
+
+def erp_bbox_to_bfov(
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    image_width: int,
+    image_height: int,
+) -> np.ndarray:
+    """Convert an ERP ``x, y, w, h`` box to BFoV degrees."""
+    cx = float(x) + 0.5 * float(w)
+    cy = float(y) + 0.5 * float(h)
+    clon = ((cx / float(image_width) - 0.5) * 360.0 + 180.0) % 360.0 - 180.0
+    clat = (0.5 - cy / float(image_height)) * 180.0
+    fov_v = float(np.clip(float(h) / float(image_height) * 180.0, 1e-3, 179.0))
+    cos_lat = max(math.cos(math.radians(clat)), 1e-6)
+    fov_h = float(np.clip((float(w) / float(image_width) * 360.0) * cos_lat, 1e-3, 179.0))
+    return np.asarray([clon, clat, fov_h, fov_v], dtype=np.float32)
+
+
 def wrap_lon(lon: float | np.ndarray) -> float | np.ndarray:
     """Wrap longitude to [-pi, pi)."""
     return (lon + PI) % TWO_PI - PI

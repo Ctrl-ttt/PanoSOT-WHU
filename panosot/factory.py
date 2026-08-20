@@ -12,8 +12,26 @@ def build_tracker(
     use_deep_features: bool = False,
     backbone_name: str = "mobilenet_v3_small",
     device: str = "auto",
+    backend: str = "hybrid",
     **kwargs: Any,
-) -> PanoSOTTracker:
+) -> Any:
+    """Build a tracker.
+
+    backend="hybrid" keeps the legacy handcrafted + MobileNet depthwise-xcorr
+    pipeline.  backend="ostrack" builds the tangent-plane frontend + OSTrack
+    single-stream ViT backend and accepts the extra keys variant, weights_path
+    (default "auto": project cache with optional download), allow_download and
+    tracker_kwargs.
+    """
+    if backend in {"ostrack", "ostrack_tangent"}:
+        from .ostrack_tracker import build_ostrack_tracker
+
+        ostrack_kwargs: dict[str, Any] = {"device": device}
+        for key in ("variant", "weights_path", "cache_dir", "allow_download", "tracker_kwargs"):
+            if key in kwargs:
+                ostrack_kwargs[key] = kwargs.pop(key)
+        return build_ostrack_tracker(**ostrack_kwargs)
+
     cache_dir = kwargs.pop("cache_dir", None)
     tracking_adapter_path = kwargs.pop("tracking_adapter_path", None)
     if cache_dir is None:

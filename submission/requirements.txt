@@ -5,3 +5,4 @@ torchvision==0.23.0+cu129
 opencv-contrib-python-headless==4.11.0.86
 numpy==1.26.4
 Pillow==10.4.0
+safetensors>=0.4

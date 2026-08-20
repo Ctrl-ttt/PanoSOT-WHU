@@ -246,3 +246,4 @@ submission_test/
 # Streamlit
 .streamlit/secrets.toml
 /train
+.venv-cuda/
