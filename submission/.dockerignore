@@ -11,3 +11,5 @@ docs/
 *.json
 .cache/
 .venv/
+.venv-cuda/
+.tmp-pip/

@@ -248,3 +248,7 @@ submission_test/
 /train
 .venv-cuda/
 .tmp-pip/
+
+# OSTrack-384 weights are 354 MB (> GitHub 100 MB limit).  Fetch them before
+# docker build with:  python tools/fetch_ostrack_weights.py
+submission/weights/checkpoints/OSTrack_*.safetensors

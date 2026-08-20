@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Competition submission entrypoint for PanoSOT-WHU.
 
-The submission uses a conservative router:
-- default to the tuned handcrafted tracker
-- enable the deep tracker only for medium-sized, elongated targets where it
-  was the best local-validation branch
+The submission uses the tangent-plane frontend + OSTrack-384 single-stream
+ViT backend (panosot/ostrack_tracker.py) for every sequence.  If that backend
+cannot be built (missing weights / torch import failure), it falls back to
+the tuned handcrafted tracker with a loud warning so the container never
+crashes on a partial environment.
 """
 from __future__ import annotations
 
@@ -24,16 +25,17 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from panosot.deep_features import DeepFeatureExtractor, FeatureConfig
+from panosot.geometry import bfov_to_erp_bbox, erp_bbox_to_bfov
 from panosot.models import build_similarity_head
 from panosot.tracker import PanoSOTTracker, TrackerConfig
 
 DATASET_DIR = os.environ.get("DATASET_DIR", "/mnt/dataset")
 RESULT_DIR = os.environ.get("RESULT_DIR", "/mnt/result")
 WEIGHTS_DIR = os.environ.get("WEIGHTS_DIR", "/app/weights")
-D2R = np.pi / 180.0
 DEEP_ADAPTER_CHECKPOINT = os.path.join(
     WEIGHTS_DIR, "checkpoints", "local_bfov_adapter_layer12_t4_reg_cpu_1300.pt"
 )
+OSTRACK_WEIGHTS_NAME = "OSTrack_vitb_384_mae_ce_32x4_ep300.safetensors"
 ISOTROPIC_HANDCRAFTED_SCALE_PAIRS = (
     (0.85, 0.85),
     (0.93, 0.93),
@@ -42,39 +44,20 @@ ISOTROPIC_HANDCRAFTED_SCALE_PAIRS = (
     (1.16, 1.16),
 )
 
-# The router is intentionally conservative. On the local validation split it
-# selected only the sequence where the deep branch was clearly superior.
+# The router is intentionally conservative.  Full-train checks showed that
+# seq_0003 and the larger elongated seq_0050/0060 are better left to the
+# handcrafted branch, while seq_0019/0001/0002 still benefit from deep.
 DEEP_ROUTER_MIN_AREA_PX = 10000.0
-DEEP_ROUTER_MAX_AREA_PX = 24000.0
+DEEP_ROUTER_MAX_AREA_PX = 18300.0
 DEEP_ROUTER_MIN_SHORT_PX = 80.0
 DEEP_ROUTER_MAX_SHORT_PX = 120.0
 DEEP_ROUTER_MIN_ASPECT = 1.8
+DEEP_ROUTER_TINY_MIN_AREA_PX = 4500.0
 DEEP_ROUTER_TINY_MAX_AREA_PX = 7000.0
 DEEP_ROUTER_TINY_MAX_SHORT_PX = 70.0
 DEEP_ROUTER_TINY_MIN_ASPECT = 1.4
 DEEP_ROUTER_TINY_MAX_ASPECT = 1.9
 DEEP_ROUTER_MAX_ABS_LAT_DEG = 20.0
-
-
-def bfov_to_erp_box(clon, clat, fov_h, fov_v, img_w, img_h):
-    coslat = max(np.cos(clat * D2R), 1e-6)
-    w = (fov_h / coslat) / 360.0 * img_w
-    h = fov_v / 180.0 * img_h
-    cx = (clon / 360.0 + 0.5) * img_w
-    cy = (0.5 - clat / 180.0) * img_h
-    return cx - w / 2.0, cy - h / 2.0, w, h
-
-
-def erp_box_to_bfov(x, y, w, h, img_w, img_h):
-    cx = x + w / 2.0
-    cy = y + h / 2.0
-    clon = (cx / img_w - 0.5) * 360.0
-    clon = ((clon + 180.0) % 360.0) - 180.0
-    clat = (0.5 - cy / img_h) * 180.0
-    fov_v = float(np.clip(h / img_h * 180.0, 1e-3, 179.0))
-    coslat = max(np.cos(clat * D2R), 1e-6)
-    fov_h = float(np.clip((w / img_w * 360.0) * coslat, 1e-3, 179.0))
-    return clon, clat, fov_h, fov_v
 
 
 def find_video(seq_dir):
@@ -125,7 +108,8 @@ def _should_use_deep_box(box_xywh: np.ndarray, clat_deg: float) -> bool:
         and abs(float(clat_deg)) <= DEEP_ROUTER_MAX_ABS_LAT_DEG
     )
     tiny_moderate_aspect = (
-        area <= DEEP_ROUTER_TINY_MAX_AREA_PX
+        area >= DEEP_ROUTER_TINY_MIN_AREA_PX
+        and area <= DEEP_ROUTER_TINY_MAX_AREA_PX
         and short_side <= DEEP_ROUTER_TINY_MAX_SHORT_PX
         and aspect >= DEEP_ROUTER_TINY_MIN_ASPECT
         and aspect <= DEEP_ROUTER_TINY_MAX_ASPECT
@@ -135,7 +119,7 @@ def _should_use_deep_box(box_xywh: np.ndarray, clat_deg: float) -> bool:
 
 
 def should_use_deep(init_bfov, img_w, img_h):
-    box = np.asarray(bfov_to_erp_box(*init_bfov, img_w, img_h), dtype=np.float32)
+    box = np.asarray(bfov_to_erp_bbox(*init_bfov, img_w, img_h), dtype=np.float32)
     return _should_use_deep_box(box, float(init_bfov[1]))
 
 
@@ -206,6 +190,54 @@ def make_tracker(use_deep: bool):
     )
 
 
+def resolve_ostrack_weights() -> str | None:
+    """Locate the packed OSTrack checkpoint (offline, in priority order)."""
+    candidates = [
+        os.path.join(WEIGHTS_DIR, "checkpoints", OSTRACK_WEIGHTS_NAME),
+        os.path.join(WEIGHTS_DIR, OSTRACK_WEIGHTS_NAME),
+        os.path.join(PROJECT_DIR, ".cache", "ostrack", OSTRACK_WEIGHTS_NAME),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+@lru_cache(maxsize=1)
+def _shared_ostrack_tracker():
+    """Build one OSTrack tracker; reuse it across sequences (state resets per
+    sequence in initialize())."""
+    from panosot.ostrack_tracker import build_ostrack_tracker
+
+    weights = resolve_ostrack_weights()
+    if weights is None:
+        raise RuntimeError(
+            f"OSTrack weights not found (looked under {WEIGHTS_DIR} "
+            f"and {os.path.join(PROJECT_DIR, '.cache', 'ostrack')})"
+        )
+    return build_ostrack_tracker(
+        variant="384",
+        weights_path=weights,
+        device="auto",
+        cache_dir=WEIGHTS_DIR,
+        allow_download=False,
+        tracker_kwargs={"relocalize_enabled": True},
+    )
+
+
+def make_ostrack_tracker():
+    """Return (tracker, mode) for the OSTrack backend with a handcrafted fallback."""
+    try:
+        return _shared_ostrack_tracker(), "ostrack"
+    except Exception as exc:
+        print(
+            f"[warn] OSTrack backend unavailable, falling back to handcrafted: {exc}",
+            file=sys.stderr,
+        )
+    tracker, _ = make_tracker(False)
+    return tracker, "hand-fallback"
+
+
 def frame_from_cv(frame_bgr):
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     return rgb.astype(np.float32) / 255.0
@@ -225,9 +257,8 @@ def track_one_sequence(seq_dir):
 
     h, w = first.shape[:2]
     init_bfov = load_init_bfov(seq_dir)
-    x, y, bw, bh = bfov_to_erp_box(*init_bfov, w, h)
+    x, y, bw, bh = bfov_to_erp_bbox(*init_bfov, w, h)
     init_box = np.array([x, y, bw, bh], dtype=np.float64)
-    use_deep = should_use_deep(init_bfov, w, h)
 
     def frames():
         yield frame_from_cv(first)
@@ -237,7 +268,7 @@ def track_one_sequence(seq_dir):
                 break
             yield frame_from_cv(frame)
 
-    tracker, actual_mode = make_tracker(use_deep)
+    tracker, actual_mode = make_ostrack_tracker()
     boxes = tracker.track_sequence(frames(), init_box)
     cap.release()
 
@@ -251,7 +282,7 @@ def track_one_sequence(seq_dir):
         ):
             results.append([0.0, 0.0, 0.0, 0.0])
         else:
-            results.append(list(erp_box_to_bfov(*box, w, h)))
+            results.append(list(erp_bbox_to_bfov(*box, w, h)))
     return results, actual_mode
 
 
