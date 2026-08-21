@@ -72,6 +72,18 @@ def parse_args() -> argparse.Namespace:
         help="Lost-frame streak required before relocalization triggers.",
     )
     parser.add_argument(
+        "--relocalize-refresh-template",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Refresh the OSTrack template after a successful global recovery.",
+    )
+    parser.add_argument(
+        "--relocalize-apply-size-prior",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply the normal size EMA/prior to global recovery boxes.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Skip sequences already present in the output JSON (crash-safe re-launch).",
@@ -149,6 +161,8 @@ def main() -> None:
         "relocalize_accept_score": args.accept_score,
         "relocalize_trigger_lost_frames": args.trigger_lost_frames,
         "window_influence": args.window_influence,
+        "relocalize_refresh_template": args.relocalize_refresh_template,
+        "relocalize_apply_size_prior": args.relocalize_apply_size_prior,
     }
     tracker = build_tracker(
         backend="ostrack",

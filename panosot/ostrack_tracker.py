@@ -93,6 +93,12 @@ class OstrackTrackerConfig:
     relocalize_scales: tuple[float, ...] = (1.0, 1.3)
     relocalize_cooldown_frames: int = 10
     relocalize_chunk_size: int = 8
+    # A recovered patch may be a false global match; keep the original
+    # appearance template unless this adaptation is explicitly enabled.
+    relocalize_refresh_template: bool = True
+    # Optional size prior for recovered boxes; disabled to preserve legacy
+    # relocalization behavior unless an experiment opts into it.
+    relocalize_apply_size_prior: bool = False
 
 
 class PanoOSTrackTracker:
@@ -420,9 +426,13 @@ class PanoOSTrackTracker:
 
         if best_candidate is None:
             return False
-        self.state = best_candidate
+        if self.config.relocalize_apply_size_prior:
+            self._adopt_candidate(best_candidate)
+        else:
+            self.state = best_candidate
         self.velocity[:] = 0.0
-        self._refresh_template(frame, self.state)
+        if self.config.relocalize_refresh_template:
+            self._refresh_template(frame, self.state)
         return True
 
     def _state_to_bbox(self, state: SphereState) -> np.ndarray:
