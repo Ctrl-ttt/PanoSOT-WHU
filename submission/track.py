@@ -221,7 +221,17 @@ def _shared_ostrack_tracker():
         device="auto",
         cache_dir=WEIGHTS_DIR,
         allow_download=False,
-        tracker_kwargs={"relocalize_enabled": True},
+        # 全量 A/B + 12 序列消融选出的配置（2026-08-21）：
+        #   window_influence=0.257 —— 官方默认窗融合，允许响应峰脱离运动预测，
+        #     显著提升远跳/漂移场景找回（12 序列 +0.035、sim 子集 +0.128）；
+        #   relocalize_accept_score=0.5 —— 比默认 0.30 更稳，11 条敏感序列
+        #     无回退且整体 +0.011；
+        #   relocalize 开启（batch bug 已修）。
+        tracker_kwargs={
+            "relocalize_enabled": True,
+            "relocalize_accept_score": 0.5,
+            "window_influence": 0.257,
+        },
     )
 
 
