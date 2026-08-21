@@ -54,6 +54,24 @@ def parse_args() -> argparse.Namespace:
         help="Disable the expensive grid relocalization (recommended for offline CPU eval).",
     )
     parser.add_argument(
+        "--window-influence",
+        type=float,
+        default=0.257,
+        help="Window penalty influence (submission-tuned default 0.257; legacy 1.0).",
+    )
+    parser.add_argument(
+        "--accept-score",
+        type=float,
+        default=0.5,
+        help="Relocalization acceptance score (submission-tuned default 0.5; legacy 0.30).",
+    )
+    parser.add_argument(
+        "--trigger-lost-frames",
+        type=int,
+        default=5,
+        help="Lost-frame streak required before relocalization triggers.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Skip sequences already present in the output JSON (crash-safe re-launch).",
@@ -126,7 +144,12 @@ def main() -> None:
 
     from panosot.factory import build_tracker
 
-    tracker_kwargs = {"relocalize_enabled": not args.no_relocalize}
+    tracker_kwargs = {
+        "relocalize_enabled": not args.no_relocalize,
+        "relocalize_accept_score": args.accept_score,
+        "relocalize_trigger_lost_frames": args.trigger_lost_frames,
+        "window_influence": args.window_influence,
+    }
     tracker = build_tracker(
         backend="ostrack",
         variant=args.variant,

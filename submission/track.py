@@ -221,16 +221,17 @@ def _shared_ostrack_tracker():
         device="auto",
         cache_dir=WEIGHTS_DIR,
         allow_download=False,
-        # 全量 A/B + 12 序列消融选出的配置（2026-08-21）：
-        #   window_influence=0.257 —— 官方默认窗融合，允许响应峰脱离运动预测，
-        #     显著提升远跳/漂移场景找回（12 序列 +0.035、sim 子集 +0.128）；
-        #   relocalize_accept_score=0.5 —— 比默认 0.30 更稳，11 条敏感序列
-        #     无回退且整体 +0.011；
-        #   relocalize 开启（batch bug 已修）。
+        # 全量 A/B + 敏感序列三配置对比选出的配置（2026-08-22）：
+        #   relocalize_trigger_lost_frames=15 —— 只在长时间丢失后才触发网格重定位，
+        #     避免健康序列被过早的错误跳变破坏（18 条敏感序列 +0.083 vs 无重定位；
+        #     trigger=5 会破坏 sim_0001/0048/0024 等健康序列）；
+        #   window_influence=1.0 + accept_score=0.30 —— 保持纯窗锚定与默认接受门槛
+        #     （全量实测 0.257/0.5 组合为 -0.0094，已回退）。
         tracker_kwargs={
             "relocalize_enabled": True,
-            "relocalize_accept_score": 0.5,
-            "window_influence": 0.257,
+            "relocalize_trigger_lost_frames": 15,
+            "relocalize_accept_score": 0.30,
+            "window_influence": 1.0,
         },
     )
 
