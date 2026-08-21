@@ -56,3 +56,20 @@
 # A/B 对比
 .venv\Scripts\python.exe tools\_compare_ostrack_hand.py
 ```
+
+## 七、配置调优（2026-08-21，已接入 submission）
+
+12 序列消融（real/sim 各 0001-0006，reloc ON 基线）+ 11 条敏感序列扫描 + real 漂移序列风险验证：
+
+| 配置 | 12 序列 mean AUC | 结论 |
+|---|---|---|
+| reloc ON, win=1.0, accept=0.30（原提交） | 0.5820 | 基线 |
+| + template_update_interval=200 | 0.5210 | 拒绝（模板污染，-0.061） |
+| + window_influence=0.257 | **0.6316** | **采纳（+0.050 vs 基线；sim +0.128 / real -0.029，仅 real_0002 受损）** |
+| + window_influence=0.5 | 0.6147 | 次优 |
+| 输出框宽 ×0.9/0.85 | 0.580/… | 拒绝（序列相关，无全局收益） |
+| relocalize_accept_score=0.5 | 11 条敏感序列 +0.011、零回退 | **采纳**（0.65 开始丢恢复，拒绝） |
+
+- 风险验证（win0.257+accept0.5）：real_0007 0.133→0.410、real_0032 0.083→0.156、real_0013 不变；仅 real_0002 0.741→0.571（消融内已知）。
+- **全量估算 ≈0.51**（0.4873 + 已测 22 条唯一序列 Δ 合计 +3.11 / 130 ≈ +0.024；未测 108 条假定不变——多数健康序列 reloc/win 不触发，成立；未测边界序列存在 ±0.5 不确定性）。精确值需全量 reloc+win0.257 复测（GPU ~11h）。
+- submission 已更新并推送（提交 95861af）：`tracker_kwargs={"relocalize_enabled": True, "relocalize_accept_score": 0.5, "window_influence": 0.257}`。
