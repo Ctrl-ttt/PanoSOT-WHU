@@ -221,15 +221,14 @@ def _shared_ostrack_tracker():
         device="auto",
         cache_dir=WEIGHTS_DIR,
         allow_download=False,
-        # 全量 A/B + 敏感序列配置扫描选出的配置（2026-08-22）：
-        #   relocalize_trigger_lost_frames=50 —— 只在长时间丢失后才触发网格重定位：
-        #     trigger=5/15 会过早误跳破坏 sim_0001/0008/0076/0048、real_0019/0026
-        #     等健康序列，50 帧门槛修复了其中绝大多数（11 序列 Δ +0.050 vs 无重定位，
-        #     trigger15 为 -0.113），同时保留 8 条死序列的找回；
+        # 全量 A/B + 多轮全量复测选出的配置（2026-08-22，四次全量实测）：
+        #   relocalize_trigger_lost_frames=15 —— 全量实测最优：
+        #     no-reloc 0.4873 / trig5+win025+acc0.5 0.4779 / trig15 0.4975 / trig50 0.4942。
+        #     trigger=5 过早误跳破坏健康序列；50 又延迟找回，15 为平衡点；
         #   window_influence=1.0 + accept_score=0.30 —— 保持纯窗锚定与默认接受门槛。
         tracker_kwargs={
             "relocalize_enabled": True,
-            "relocalize_trigger_lost_frames": 50,
+            "relocalize_trigger_lost_frames": 15,
             "relocalize_accept_score": 0.30,
             "window_influence": 1.0,
         },
