@@ -57,19 +57,16 @@
 .venv\Scripts\python.exe tools\_compare_ostrack_hand.py
 ```
 
-## 七、配置调优（2026-08-21，已接入 submission）
+## 七、配置调优（2026-08-21 ~ 08-22，四次全量 130 序列实测）
 
-12 序列消融（real/sim 各 0001-0006，reloc ON 基线）+ 11 条敏感序列扫描 + real 漂移序列风险验证：
+| 配置 | 全量 AUC | SR | mIoU | 判定 |
+|---|---|---|---|---|
+| handcrafted 基线 | 0.1472 | 0.1220 | 0.1439 | — |
+| OSTrack no-reloc（win1.0/acc0.30） | 0.4873 | 0.5688 | 0.4926 | 基线 |
+| trig5 + win0.257 + acc0.5 | 0.4779 | 0.5614 | 0.4834 | 拒绝（win025 破坏健康序列） |
+| **trig15 + win1.0 + acc0.30** | **0.4975** | **0.5839** | **0.5032** | ✅ **采纳（最优）** |
+| trig50 + win1.0 + acc0.30 | 0.4942 | 0.5810 | 0.4997 | 拒绝（找回延迟） |
 
-| 配置 | 12 序列 mean AUC | 结论 |
-|---|---|---|
-| reloc ON, win=1.0, accept=0.30（原提交） | 0.5820 | 基线 |
-| + template_update_interval=200 | 0.5210 | 拒绝（模板污染，-0.061） |
-| + window_influence=0.257 | **0.6316** | **采纳（+0.050 vs 基线；sim +0.128 / real -0.029，仅 real_0002 受损）** |
-| + window_influence=0.5 | 0.6147 | 次优 |
-| 输出框宽 ×0.9/0.85 | 0.580/… | 拒绝（序列相关，无全局收益） |
-| relocalize_accept_score=0.5 | 11 条敏感序列 +0.011、零回退 | **采纳**（0.65 开始丢恢复，拒绝） |
-
-- 风险验证（win0.257+accept0.5）：real_0007 0.133→0.410、real_0032 0.083→0.156、real_0013 不变；仅 real_0002 0.741→0.571（消融内已知）。
-- **全量估算 ≈0.51**（0.4873 + 已测 22 条唯一序列 Δ 合计 +3.11 / 130 ≈ +0.024；未测 108 条假定不变——多数健康序列 reloc/win 不触发，成立；未测边界序列存在 ±0.5 不确定性）。精确值需全量 reloc+win0.257 复测（GPU ~11h）。
-- submission 已更新并推送（提交 95861af）：`tracker_kwargs={"relocalize_enabled": True, "relocalize_accept_score": 0.5, "window_influence": 0.257}`。
+- trig15 分集：real 0.4381（no-reloc 0.4681，-0.030）、sim 0.5311（no-reloc 0.4981，+0.033）——sim 远跳找回收益大于 real 误跳损失。
+- 模板更新（每 200 帧）与输出框宽度校准均测过，无全局收益，拒绝。
+- submission 最终配置：`tracker_kwargs={"relocalize_enabled": True, "relocalize_trigger_lost_frames": 15, "relocalize_accept_score": 0.30, "window_influence": 1.0}`。
