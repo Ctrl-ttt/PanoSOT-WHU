@@ -231,6 +231,9 @@ def _shared_ostrack_tracker():
             "relocalize_trigger_lost_frames": 15,
             "relocalize_accept_score": 0.30,
             "window_influence": 1.0,
+            # Preserve the original appearance template after global recovery;
+            # short-train A/B shows this avoids template contamination.
+            "relocalize_refresh_template": False,
         },
     )
 
