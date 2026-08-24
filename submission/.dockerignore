@@ -13,3 +13,7 @@ docs/
 .venv/
 .venv-cuda/
 .tmp-pip/
+train/
+tmp_*/
+train_real/
+train_sim/
