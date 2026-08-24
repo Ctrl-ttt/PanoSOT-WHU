@@ -66,7 +66,9 @@
 | trig5 + win0.257 + acc0.5 | 0.4779 | 0.5614 | 0.4834 | 拒绝（win025 破坏健康序列） |
 | **trig15 + win1.0 + acc0.30** | **0.4975** | **0.5839** | **0.5032** | ✅ **采纳（最优）** |
 | trig50 + win1.0 + acc0.30 | 0.4942 | 0.5810 | 0.4997 | 拒绝（找回延迟） |
+| **合并（trig15+refreshFalse，队友60356d5）** | **0.5458** | **0.6431** | **0.5525** | ✅ **最终采纳** |
 
 - trig15 分集：real 0.4381（no-reloc 0.4681，-0.030）、sim 0.5311（no-reloc 0.4981，+0.033）——sim 远跳找回收益大于 real 误跳损失。
+- **合并配置分集：real 0.4592 / sim 0.5949**——恢复后保留原外观模板（refresh_template=False）避免模板污染，全量再 +0.048。
 - 模板更新（每 200 帧）与输出框宽度校准均测过，无全局收益，拒绝。
-- submission 最终配置：`tracker_kwargs={"relocalize_enabled": True, "relocalize_trigger_lost_frames": 15, "relocalize_accept_score": 0.30, "window_influence": 1.0}`。
+- submission 最终配置：`tracker_kwargs={"relocalize_enabled": True, "relocalize_trigger_lost_frames": 15, "relocalize_accept_score": 0.30, "window_influence": 1.0, "relocalize_refresh_template": False}`。
